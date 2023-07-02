@@ -1,0 +1,127 @@
+---
+title: "S1 vs Topographic Slope Exploration"
+author: "J. Bruce Bell"
+date: "`r Sys.Date()`"
+---
+
+Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Imports
+```{r echo=FALSE}
+library(knitr)
+library(tidyr)
+library(lubridate)
+library(scales)
+library(ggthemes)
+library(ggtext)
+library(stringr)
+library(dplyr)
+library(ggplot2)
+library(data.table)
+library(tibble)
+library(sf)
+library(tidyquant)
+library(purrr)
+library(ggpubr)
+```
+
+```{r}
+#working directory
+setwd("/Users/brbell01/Google Drive/PHD/CUNY/Research/R/Phenology/raw/s1/1ha/second_run/")
+wd <- getwd()
+```
+
+Import processed Sentinel-1 data tables
+```{r}
+#Parameters to be altered
+foresttype <-  "Seasonal Semi-deciduous Forest"  # "Seasonal Semi-deciduous Forest"  ; "Broadleaf Evergreen"
+studyarea <- "REBIO Sooretama, ES" #  "PE Rio Doce, MG"  # "REBIO Mata Escura, MG"  # ; "PNH Monte Pascoal, BA" ; "REBIO Sooretama, ES"
+studyarea_list <- c("sooretama" , "rio_doce" , "mata_escura" , "monte_pascoal")
+band.list <- c("VH", "VV", "RVI")
+
+#import
+masterdata_list <- vector(mode = "list", length = 0)
+
+for (band in band.list) {
+indexdata <- slope_table <- data.frame(matrix(nrow=0, ncol=2)) ; names(slope_table) <- c("Hectare_ID", "value")
+for (studyarea_base in studyarea_list) {
+      table <- read.csv(paste0(wd, "/", studyarea_base, "_s1_1ha_", band, "_processed.csv"))
+      table <- table[,!names(table) %in% c("X")] %>% mutate(date = ymd(date))
+      table <- table %>% filter(date < as.Date('2017-01-01')) %>% gather("Hectare_ID", value, -date) %>% filter(!grepl('sd', Hectare_ID)) %>% group_by(Hectare_ID) %>% summarize(mean(value, na.rm=TRUE), sd(value,na.rm=TRUE)) %>% mutate(site_name = studyarea_base)
+      names(table)[2] <- "value"  ; names(table)[3] <- "sd"
+      indexdata <- rbind(indexdata, table)
+      indexdata <- indexdata %>% mutate(Hectare_ID = Hectare_ID %>% gsub("[^0-9.]", "", .))
+}
+masterdata_list[[band]] <- indexdata 
+}
+
+
+```
+
+```{r}
+#define function for parsing the nested geojson strings
+geojson_to_df <- function(str) {
+              str %>% 
+              str_remove_all('\\"') %>% 
+              str_remove_all(" ") %>% 
+              str_remove_all("\\]") %>% 
+              str_remove_all("\\[") -> tab
+              return(read.table(text=tab, sep = ","))
+}     
+```
+
+Import slope data
+```{r}
+#import
+slope_table <- data.frame(matrix(nrow=0, ncol=3)) ; names(slope_table) <- c("Hectare_ID", "slope_mean", "site_name")
+
+for (studyarea_base in studyarea_list) {
+studyarea_slopes <- read.csv(paste0("/Users/brbell01/Google Drive/PHD/CUNY/Research/Data/Raster/STRM/plot_means/", studyarea_base, "_Hectare_means.csv"))
+
+#process slope_list
+studyarea_slopes <- lapply(studyarea_slopes,geojson_to_df)
+studyarea_slopes <- data.frame(cbind(studyarea_slopes$Hectare_ID$V1, studyarea_slopes$mean$V1, studyarea_base))
+names(studyarea_slopes) <- c("Hectare_ID", "slope_mean", "site_name")
+slope_table <- rbind(slope_table, studyarea_slopes)
+slope_table$slope_mean <- slope_table$slope_mean %>% as.numeric()
+}
+
+```
+
+Plots
+```{r}
+# Choose Index 
+index_data <- masterdata_list$VV
+#join table 
+data <- left_join(index_data, slope_table, by=c("Hectare_ID","site_name"))
+
+index_data <- index_data %>% select(-value)
+index_data <- index_data %>% mutate(VV_sd = sd)
+data <- data %>% mutate(VH_sd = sd)
+data <- left_join(data, index_data, by=c("Hectare_ID","site_name"))
+
+data <- data %>% select(-c(sd.x, sd.y, label, value))
+
+write.csv(data, file = "S1_vs_slope.csv")
+
+ggplot(data = data, aes(x=slope_mean, y=sd, color = site_name)) +
+  geom_point() +
+  geom_text(data=subset(data, sd > 1.2),
+            aes(label=Hectare_ID), size = 2.5, position = position_nudge(y = -0.07)) +
+  ylab("Variance (sd) in VH index value ") +
+  geom_smooth(method = "lm", se = FALSE,formula = y ~ x) +
+  stat_cor(aes(label = paste(..rr.label..)), # add R^2 value
+           r.accuracy = 0.001,
+           label.x = 25) +
+  stat_regline_equation(aes(label = ..eq.label..), # add equation to linear regression
+                        label.x = 15) +
+  theme_pubr()
+```
+Save Plot
+```{r}
+ggsave("S1_VH_vs_topographic_slope.png", units="in", width=7, height=7, dpi=300, device = 'png')
+```
+
