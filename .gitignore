@@ -47,3 +47,11 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+#macos files
+**/.DS_Store
+
+#Dont commit data
+data/*
+
+
