@@ -1,0 +1,3 @@
+"","Seas.","Start.t.","End.t.","Length","Base.val.","Peak.t.","Peak.val.","Ampl.","L.deriv.","R.deriv.","L.integral","S.integral","Start.val.","End.val.","season_start_date","season_end_date","peak_date","length_days","phase_peak","season_half_date","phase_seas","season_ensemble_date","phase_ensemble"
+"1",1,67.17,124.5,57.3,0.6711,85.85,0.8939,0.2228,0.03327,0.04505,47.79,8.199,0.7958,0.7868,2019-12-06,2020-09-17,2020-03-08,286,432,2020-04-27,482,2019-12-31,-1
+"2",2,140.2,197.5,57.32,0.6632,158.9,0.8824,0.2192,0.03319,0.04577,47.24,8.108,0.7844,0.7812,2020-12-05,2021-09-18,2021-03-08,287,431,2021-04-28,482,2020-12-31,-1

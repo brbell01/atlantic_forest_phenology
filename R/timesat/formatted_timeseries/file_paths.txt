@@ -1,0 +1,26 @@
+C:\Users\Ana Carnaval\Desktop\timesat33\data\AF\formatted_timeseries\third_run\S2\mata_escura_s2_1ha_EVI2_processed.txt
+C:\Users\Ana Carnaval\Desktop\timesat33\data\AF\formatted_timeseries\third_run\S2\mata_escura_s2_1ha_EVI_processed.txt
+C:\Users\Ana Carnaval\Desktop\timesat33\data\AF\formatted_timeseries\third_run\S2\mata_escura_s2_1ha_NDVI_processed.txt
+C:\Users\Ana Carnaval\Desktop\timesat33\data\AF\formatted_timeseries\third_run\S2\monte_pascoal_s2_1ha_EVI2_processed.txt
+C:\Users\Ana Carnaval\Desktop\timesat33\data\AF\formatted_timeseries\third_run\S2\monte_pascoal_s2_1ha_EVI_processed.txt
+C:\Users\Ana Carnaval\Desktop\timesat33\data\AF\formatted_timeseries\third_run\S2\monte_pascoal_s2_1ha_NDVI_processed.txt
+C:\Users\Ana Carnaval\Desktop\timesat33\data\AF\formatted_timeseries\third_run\S2\rio_doce_s2_1ha_EVI2_processed.txt
+C:\Users\Ana Carnaval\Desktop\timesat33\data\AF\formatted_timeseries\third_run\S2\rio_doce_s2_1ha_EVI_processed.txt
+C:\Users\Ana Carnaval\Desktop\timesat33\data\AF\formatted_timeseries\third_run\S2\rio_doce_s2_1ha_NDVI_processed.txt
+C:\Users\Ana Carnaval\Desktop\timesat33\data\AF\formatted_timeseries\third_run\S2\sooretama_s2_1ha_EVI2_processed.txt
+C:\Users\Ana Carnaval\Desktop\timesat33\data\AF\formatted_timeseries\third_run\S2\sooretama_s2_1ha_EVI_processed.txt
+C:\Users\Ana Carnaval\Desktop\timesat33\data\AF\formatted_timeseries\third_run\S2\sooretama_s2_1ha_NDVI_processed.txt
+
+
+C:\Users\Ana Carnaval\Desktop\timesat33\data\AF\formatted_timeseries\third_run\S1\mata_escura_RVI_processed.txt
+C:\Users\Ana Carnaval\Desktop\timesat33\data\AF\formatted_timeseries\third_run\S1\mata_escura_VH_processed.txt
+C:\Users\Ana Carnaval\Desktop\timesat33\data\AF\formatted_timeseries\third_run\S1\mata_escura_VV_processed.txt
+C:\Users\Ana Carnaval\Desktop\timesat33\data\AF\formatted_timeseries\third_run\S1\monte_pascoal_RVI_processed.txt
+C:\Users\Ana Carnaval\Desktop\timesat33\data\AF\formatted_timeseries\third_run\S1\monte_pascoal_VH_processed.txt
+C:\Users\Ana Carnaval\Desktop\timesat33\data\AF\formatted_timeseries\third_run\S1\monte_pascoal_VV_processed.txt
+C:\Users\Ana Carnaval\Desktop\timesat33\data\AF\formatted_timeseries\third_run\S1\rio_doce_RVI_processed.txt
+C:\Users\Ana Carnaval\Desktop\timesat33\data\AF\formatted_timeseries\third_run\S1\rio_doce_VH_processed.txt
+C:\Users\Ana Carnaval\Desktop\timesat33\data\AF\formatted_timeseries\third_run\S1\rio_doce_VV_processed.txt
+C:\Users\Ana Carnaval\Desktop\timesat33\data\AF\formatted_timeseries\third_run\S1\sooretama_RVI_processed.txt
+C:\Users\Ana Carnaval\Desktop\timesat33\data\AF\formatted_timeseries\third_run\S1\sooretama_VH_processed.txt
+C:\Users\Ana Carnaval\Desktop\timesat33\data\AF\formatted_timeseries\third_run\S1\sooretama_VV_processed.txt

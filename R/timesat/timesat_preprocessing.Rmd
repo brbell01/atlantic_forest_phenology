@@ -1,0 +1,97 @@
+---
+title: "Timesat software preprocessing"
+author: "J. Bruce Bell"
+date: "`r Sys.Date()`"
+---
+
+Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Imports
+```{r echo=FALSE}
+library(knitr)
+library(tidyr)
+library(lubridate)
+library(clock)
+library(stringr)
+library(dplyr)
+library(data.table)
+library(tibble)
+library(purrr)
+library(magrittr)
+```
+
+```{r}
+#working directory
+setwd("/Users/brbell01/Google Drive/PHD/CUNY/Research/R/Phenology/timesat/")
+wd <- getwd()
+```
+
+Import processed Sentinel-1 data tables
+```{r}
+#Parameters to be altered
+input_file <- 'mata_escura_s2_1ha_EVI_harmonic.csv'
+input_folder <-  "/raw_timeseries/"
+output_folder <- "/formatted_timeseries/"
+index_name <- "EVI"
+
+#------------------------------------------------------
+table <- read.csv(paste0(wd, input_folder, input_file))
+names(table)[1] <- "Date"
+names(table)[2] <- index_name
+
+table <- table %>% mutate(Date = date_parse(Date, format = "%B %d, %Y"))
+table <- table[,1:2]
+```
+
+batch read
+```{r}
+tables <- dir(wd, full.names = T, pattern = "csv") %>% map(read.csv, header=T)
+for (i in 1:length(tables)) {names(tables[[i]])[1] <- "Date"}
+```
+
+Process data
+```{r}
+nts <- 1 # number of time series to be processed
+int <- 5 # Sentinel-2 repeat interval (days) # int <- 12 #  Sentinel-1 repeat interval (days)
+nptperyear <- floor(365/int)  #  number of samples per year
+
+#pad dates to year beginning and end, and fill
+#table <- rbind(c(paste0(year(min(table$Date)),"-01-01"), NA, NA),table)  #beginning
+#table[nrow(table) + 1,] = c(paste0(year(max(table$Date)),"-12-31"), NA, NA)   #end
+
+#fill in missing data with a value
+table <- table %>% pad %>% fill_by_value(index_name) %>% data.table()
+table[is.na(table)] <- -999 
+table <- table[,mean(EVI),by = Date]   #collapse duplicate dates (from 2 overlapping image samples) using mean
+table <- table[Date >= as.Date("2019-01-01")]
+
+#table <- table %>% complete(Date = seq.Date(min(Date), max(Date), by="day")) %>% mutate(VH = as.double(VH)) 
+#table$Date %>% diff() %>% divide_by(int) %>% subtract(1) -> missingvals
+#missingindex <- data.frame(position = which(missingvals > 0), values = missingvals[missingvals > 0] %>% as.integer)
+
+
+# number of years in the time series
+nyear <- year(max(table$Date))-year(min(table$Date))+1  
+
+# define header
+header <- as.character(c(year(max(table$Date))-year(min(table$Date))+1,nptperyear,nts))
+```
+
+
+
+write out ASCII file
+```{r}
+file <- paste0(wd, output_folder, substr(input_file,1,nchar(input_file)-4), ".txt")
+cat(header,"\n",file=file) 
+series1 <- table[,2]
+write.table(series1, file=file, row.names=FALSE, col.names=FALSE, sep=" ",
+               append=TRUE, quote=FALSE)
+
+
+#write.csv(table, paste0(wd, output_folder, substr(input_file,1,nchar(input_file)-4), ".txt"))
+```
+
+

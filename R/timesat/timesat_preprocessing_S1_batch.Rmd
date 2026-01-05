@@ -1,0 +1,96 @@
+---
+title: "Timesat software preprocessing"
+author: "J. Bruce Bell"
+date: "`r Sys.Date()`"
+---
+
+Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Imports
+```{r echo=FALSE}
+library(knitr)
+library(tidyr)
+library(lubridate)
+library(clock)
+library(stringr)
+library(dplyr)
+library(data.table)
+library(tibble)
+library(purrr)
+library(magrittr)
+library(padr)
+```
+
+```{r}
+#working directory
+setwd("/Users/brbell01/Google Drive/PHD/CUNY/Research/R/Phenology/timesat/")
+wd <- getwd()
+```
+
+Import processed data tables
+```{r}
+#Parameters to be altered
+input_folder <-  "/raw_timeseries/third_run/"
+output_folder <- "/formatted_timeseries/third_run/"
+satellite <- "S2"  #  "S2"
+```
+
+batch read
+```{r}
+tables <- dir(paste0(wd, input_folder, satellite), full.names = T, pattern = "csv") %>% map(read.csv, header=T)
+for (i in 1:length(tables)) {
+  names(tables[[i]])[1] <- "Date"
+  tables[[i]] <- tables[[i]] %>% mutate(Date = date_parse(Date, format = "%b %d, %Y"))
+  tables[[i]]$Date <- as.Date(tables[[i]]$Date)
+  }
+```
+
+Process data
+```{r}
+nts <- 1 # number of time series to be processed (must always be 1 because I can't get timesat to work with           # more than 1 per file)
+int <- 5 # Sentinel-2 repeat interval (days)  #  int <- 12 # Sentinel-1 repeat interval (days)
+nptperyear <- floor(365/int)  #  number of samples per year
+
+#pad dates to year beginning and end, and fill
+#table <- rbind(c(paste0(year(min(table$Date)),"-01-01"), NA, NA),table)  #beginning
+#table[nrow(table) + 1,] = c(paste0(year(max(table$Date)),"-12-31"), NA, NA)   #end
+
+formattedtables <- list()
+for (i in 1:length(tables)) {
+    #pad values
+    table <- tables[[i]] %>% thicken(paste0(int, " days")) %>% select(-Date) %>%
+                   rename_at(ncol(.), ~"Date") %>% mutate(Date = Date+1) %>% 
+                   pad() %>% fill_by_value(index_name) %>% data.table()
+    #merge duplicate dates
+    table <- table %>% group_by(Date) %>% summarise_all(mean, na.rm = T)
+    #fill in missing data with a value
+    table[is.na(table)] <- -999 
+    table <- table %>% filter(Date >= "2019-01-01")
+    # append to the formatted list of tables
+    formattedtables[[i]] <- table
+}
+```
+
+
+write out ASCII files
+```{r}
+filebase <- dir(paste0(wd, input_folder, satellite), full.names = F, pattern = "csv") %>% substring(1,nchar(.)-23) %>%
+             sub('_s2_1ha_', '_', .)
+for (i in 1:length(formattedtables)) {
+    # number of years in the time series
+    nyear <- year(max(formattedtables[[i]]$Date))-year(min(formattedtables[[i]]$Date))+1  
+    # define header
+    header <- as.character(c(nyear,nptperyear,nts))
+    file <- paste0(wd, output_folder, satellite, '/', filebase[i], '_processed.txt')
+    cat(header,"\n",file=file)
+    write.table(formattedtables[[i]][2], file=file, row.names=FALSE, col.names=FALSE, sep=" ",
+        append=TRUE, quote=FALSE)
+}
+
+# write.csv(table, paste0(wd, output_folder, substr(input_file,1,nchar(input_file)-4), ".txt"))
+```
+
+

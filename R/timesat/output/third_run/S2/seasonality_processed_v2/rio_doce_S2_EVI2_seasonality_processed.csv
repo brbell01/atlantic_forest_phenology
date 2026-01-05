@@ -1,0 +1,4 @@
+,Seas.,Start.t.,End.t.,Length,Base.val.,Peak.t.,Peak.val.,Ampl.,L.deriv.,R.deriv.,L.integral,S.integral,Start.val.,End.val.,season_start_date,season_end_date,peak_date,length_days,phase_peak,season_half_date,phase_seas,season_ensemble_date,phase_ensemble
+1,1,62.26,97.73,35.47,0.3438,74.25,0.6049,0.2611,0.01252,0.006246,19.66,6.936,0.4702,0.4722,11/11/19,5/7/20,1/10/20,177,374,2/8/20,403,11/25/19,388.5
+2,2,135.3,170.7,35.47,0.3457,147.2,0.6077,0.262,0.01248,0.006314,19.74,6.954,0.4734,0.4733,11/10/20,5/7/21,1/9/21,177,373,2/7/21,402,11/24/20,387.5
+,,,,,,,,0.26155,,,,,,,,,,,,,,,

@@ -1,0 +1,4 @@
+STL trend:                                                                                                                                                                   
+Seas.  Start t.      End t.     Length     Base val.      Peak t.      Peak val.     Ampl.      L.deriv.      R.deriv.   L.integral   S.integral   Start val.   End val.     
+  1        45.79        94.18        48.39       0.4629        70.05       0.6580       0.1950      0.02251      0.01447        31.90        8.294       0.5998       0.5997 
+  2        118.8        167.2        48.39       0.4602        143.0       0.6536       0.1934      0.02243      0.01452        31.71        8.240       0.5978       0.5948 
