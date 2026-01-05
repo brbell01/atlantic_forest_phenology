@@ -1,0 +1,34 @@
+/* 
+ * Shared Constants
+ *
+ * Inspired by https://medium.com/google-earth/making-it-easier-to-reuse-code-with-earth-engine-script-modules-2e93f49abb13
+ */
+
+
+// Added temporarily, might want to remove if we want to keep this flexible.
+exports.STUDY_START_DATE = '2019-01-01'; //Sentinel-2 Surface reflectance data available only beginning in 2019 for our study region.
+exports.STUDY_END_DATE = '2022-01-01';
+
+// S1 
+exports.VH_NAME = 'VH'
+exports.VV_NAME = 'VV'
+exports.VHVVratio_NAME = 'VHVV_ratio'
+exports.RVI_NAME = 'RVI'
+
+
+// S2 Vegetation Indices
+exports.NDVI_NAME = 'NDVI';
+exports.NDVI_MEAN_NAME = exports.NDVI_NAME + '_mean';
+exports.S2_BLUE_BAND = 'B2';
+exports.S2_RED_BAND = 'B4';
+exports.S2_NIR_BAND = 'B8';
+exports.EVI_NAME = 'EVI';
+exports.EVI2_NAME = 'EVI2'
+exports.EVI_MEAN_NAME = exports.EVI_NAME + '_mean';
+
+
+// Land-use/land-cover (LULC) forest pixel value from Mapbiomas 
+// lulc classfication
+
+exports.FOREST_PIXEL_VALUE = 3
+exports.FOREST_DATA_SOURCE = "MapBiomas - LandCover 2019"

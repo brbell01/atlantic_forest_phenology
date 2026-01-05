@@ -1,0 +1,51 @@
+//Import study areas
+var AREA_NAME =  "REBIO Mata Escura, MG" // "PNH Monte Pascoal, BA", // "REBIO Sooretama, ES" ; "PE Rio Doce, MG", "REBIO Mata Escura, MG"
+var Park = ee.FeatureCollection("projects/af-phenology/assets/Parks/REBIO_Mata_Escura");
+var roi = Park.geometry()
+
+
+//Import IMERG data
+var windowDays = 1
+var startDate = ee.Date('2016-01-01')
+var stopDate = ee.Date('2022-01-01')
+
+var rainfall = ee.ImageCollection('NASA/GPM_L3/IMERG_V06')
+  .filterBounds(roi)
+  .filterDate(startDate, stopDate)
+  .select('precipitationCal')
+
+var numberOfDays = stopDate.difference(startDate, 'days')
+var rainfallAggregates = ee.ImageCollection(
+  ee.List.sequence(0, numberOfDays.subtract(1), windowDays)
+    .map(function (dayOffset) {
+      var date = startDate.advance(ee.Number(dayOffset), 'days')
+      return rainfall
+        .filterDate(date, date.advance(14, 'days'))
+        .sum()
+        .set('system:time_start', date.millis())
+    })
+)
+
+// Display a time-series chart cumulative precip values
+var chart = ui.Chart.image.series({
+  imageCollection: rainfallAggregates,
+  region: roi,
+  reducer: ee.Reducer.median(),
+  scale: 100,
+  xProperty: 'system:time_start' 
+})
+.setOptions({
+title: 'IMERG ' + windowDays + '-day Cumulative Precip. over ' + AREA_NAME,
+legend: {position: 'none'},
+hAxis: {title: '', format: 'YYYY-MMM-dd'},
+vAxes: {0: {
+      title: "Cum Precip. (mm)",
+      baseline: 0,
+      titleTextStyle: {bold: true, color: 'blue'},
+      viewWindow: { min: 0 }
+    }
+}
+});
+
+
+print(chart)

@@ -1,0 +1,308 @@
+// Linear modeling of time for Sentinel-2 time series
+// Estimate linear trend over time using pt = β0 + β1t + et, where e is a random error.
+// Reference: https://docs.google.com/document/d/1mNIRB90jwLuASO1JYas1kuOXCLbOoy1Z4NlV1qIXM10/edit#
+
+// Image and feature collection imports
+var Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/1_MataEscura_Hectares1"),
+    Park = ee.FeatureCollection("projects/af-phenology/assets/Parks/REBIO_Mata_Escura"),
+    plot1 = Hectares.first(),
+    AOI = plot1.geometry();
+    
+
+// Import helper functions
+var wrapper = require('users/brbell01/AF_Phenology:Sentinel-1/Wrapper'),
+    helper = require('users/brbell01/AF_Phenology:Sentinel-1/Utilities'),
+    helpers = require('users/brbell01/AF_Phenology:Helpers'),
+    constants = require('users/brbell01/AF_Phenology:Constants');
+
+////// Build the Sentinel-1 image collection
+  
+// Define Sentinel-1 Parameters
+var parameter = {//1. Data Selection
+    START_DATE: constants.STUDY_START_DATE, // "2019-01-01",
+    STOP_DATE: constants.STUDY_END_DATE, // "2022-01-01",
+    POLARIZATION:'VVVH',
+    ORBIT: 'DESCENDING',
+    ORBIT_NUMBER: 82, //155
+    GEOMETRY: Hectares.first().geometry(),
+    APPLY_ADDITIONAL_BORDER_NOISE_CORRECTION: true,
+    //3.Speckle filter
+    APPLY_SPECKLE_FILTERING: true,
+    SPECKLE_FILTER_FRAMEWORK: 'MULTI',
+    SPECKLE_FILTER: 'LEE SIGMA',
+    SPECKLE_FILTER_KERNEL_SIZE: 15,
+    SPECKLE_FILTER_NR_OF_IMAGES: 5,
+    //4. Radiometric terrain normalization
+    APPLY_TERRAIN_FLATTENING: true,
+    DEM: ee.Image('USGS/SRTMGL1_003'),
+    TERRAIN_FLATTENING_MODEL: 'VOLUME',
+    TERRAIN_FLATTENING_ADDITIONAL_LAYOVER_SHADOW_BUFFER: 100,
+    //5. Output
+    FORMAT : 'DB',
+    CLIP_TO_ROI: false,
+    SAVE_ASSETS: false,
+    //6. Visualization
+    VIS_BAND_RATIO: 'VHVV_ratio' // or 'RVI'
+}
+
+// Constants
+var AREA_NAME = 'REBIO Mata Escura, MG',
+    BAND_NAME = 'VH' ; // parameter.VIS_BAND_RATIO
+
+//Preprocess the S1 collection
+var s1_preprocess = wrapper.s1_preproc(parameter);
+var s1 = s1_preprocess[0];
+s1_preprocess = s1_preprocess[1];
+
+// Filter to consistent orbit number
+s1_preprocess = s1_preprocess.filter(ee.Filter.eq('relativeOrbitNumber_start', 
+                parameter.ORBIT_NUMBER));
+print("ARD processed S1 collection - single orbit", s1_preprocess);
+
+// Clip the image collection to the plot boundaries, calculate the median statistic
+var s1_preprocess = s1_preprocess.map(function(image){return image.clip(Park)});
+
+// // Select Band
+// var s1_preprocess = s1_preprocess.map(function(image){return image.select(BAND_NAME)});
+
+// Create Bimonthly-index dictionaries, set them
+// for each year add on to it
+
+var START_YEAR = ee.Date(parameter.START_DATE).get('year');
+var STOP_YEAR = ee.Date(parameter.STOP_DATE).advance(-1, 'year').get('year');
+var MONTHS = ee.List.sequence(1, 12);
+var YEARS = ee.List.sequence(START_YEAR,STOP_YEAR);
+
+// Returns a collection of bimonthly medians.
+// Includes property 'date_range' which indicates the start date
+
+var bimonthlyImages = ee.ImageCollection(YEARS.map(function (year) { 
+  return MONTHS.map(function (month) {
+    return helpers.getIndexmonthly(year, month, {}, s1_preprocess);
+  })})
+  .flatten());
+
+print("ARD processed S1 Bi-Monthly Images - Input Collection", bimonthlyImages);
+
+
+//Create the two band constant image collection
+var constantCol = helpers.generateIndexCollection(BAND_NAME, bimonthlyImages, Hectares);
+
+//Rename the bands in the collection
+constantCol = constantCol.map(function (image) {
+            var b1 = image.select("0_constant").rename(BAND_NAME + '_median');
+            var b2 = image.select("1_constant").rename(BAND_NAME + '_sd');
+            return ee.Image.cat(b1, b2);
+});
+
+print('Constant median and st. dev. ' + BAND_NAME + ' collection', constantCol);
+
+//Add the median/sd constant bands to our filtered S2 collection
+var S1withMedian = bimonthlyImages.combine({
+		secondary:constantCol,
+//	overwrite:false,
+});
+
+print('Input S1 collection with constant median and st. dev. ' + BAND_NAME + ' bands', S1withMedian);
+
+////////////////////////////////////////////////////////////////////////////
+//////ESTIMATE SEASONALITY WITH A HARMONIC MODEL////////////////////////////
+////////////////////////////////////////////////////////////////////////////
+
+// Define a function to add year band and constant band
+var addVariables = function(image) {
+  // Compute time in fractional years since the epoch.
+  var date = ee.Date(image.get('system:time_start'));
+  var years = date.difference(ee.Date('1970-01-01'), 'year');
+  // Return the image with the added bands.
+  return image
+    // Add a time band.
+    .addBands(ee.Image(years).rename('t'))
+    .float()
+    // Add a constant band.
+    .addBands(ee.Image.constant(1).rename('constant'));
+};
+
+// map over collection
+var s1withConstants = S1withMedian.map(addVariables);
+print('S1 Collection with year and constant band', s1withConstants);
+
+// List of the independent variable names
+var independents = ee.List(['constant', 't']);
+
+// Name of the dependent variable.
+var dependent = ee.String(BAND_NAME + '_median');
+
+// Compute a linear trend. This will have two bands: 'residuals' and 
+// a 2x1 band called coefficients (columns are for dependent variables).
+var trend = s1withConstants.select(independents.add(dependent))
+    .reduce(ee.Reducer.linearRegression(independents.length(), 1));
+// Map.addLayer(trend, {}, 'trend array image');
+
+// Flatten the coefficients into a 2-band image
+var coefficients = trend.select('coefficients')
+  .arrayProject([0])
+  .arrayFlatten([independents]);
+
+// The coefficients image is a two band image in which each pixel contains values for β0 and β1.   
+// Use the model to "detrend" the original EVI time series:
+
+// Compute a de-trended series.
+var detrended = s1withConstants.map(function(image) {
+  return image.select(dependent).subtract(
+          image.select(independents).multiply(coefficients).reduce('sum'))
+          .rename(dependent)
+          .copyProperties(image, ['system:time_start']);
+});
+
+print('Detrended ' + BAND_NAME + ' collection', detrended);
+
+
+var detrended_view = detrended.map(helper.lin_to_db2)
+
+
+// Plot the detrended results.
+// Define plot geometry
+var detrendedChart = ui.Chart.image.seriesByRegion({
+    imageCollection: detrended_view, 
+    regions: AOI, 
+    reducer: ee.Reducer.median(),
+    band: BAND_NAME + '_median',
+    scale: 30
+    })
+    .setOptions({
+      title: 'Detrended Sentinel-1 ' + BAND_NAME + 
+            ' time series over 1-ha sample plots, (' + AREA_NAME + ')',
+      vAxis: {title: 'S1 ' + BAND_NAME + ' index values'},
+      lineWidth: 1,
+      pointSize: 3,
+      series: {
+        0: {visibleInLegend: false}
+              }
+    });
+print(detrendedChart);
+
+
+// Estimate seasonality with a harmonic model
+// Consider the following linear model, where et is a random error, A is amplitude, ω is frequency, and φ is phase:
+// pt = β0 + β1t + Acos(2πωt - φ) + et 
+//    = β0 + β1t + β2cos(2πωt) + β3sin(2πωt) + et
+// Note that β2 = Acos(φ) and β3 = Asin(φ), implying A = (β22 + β32)½ and φ = atan(β3/β2).  (See Shumway and Stoffer (2017) equations 4.1 - 4.2).  
+// To fit this model to the time series, set ω=1 (one cycle per unit time) and use ordinary least squares regression.
+// The setup for fitting the model is to first add the harmonic variables (the third and fourth terms of equation 2) to the image collection.
+	
+
+// Use these independent variables in the harmonic regression.
+var harmonicIndependents = ee.List(['constant', 't', 'cos', 'sin']);
+
+// Add harmonic terms as new image bands.
+var harmonicS1 = s1withConstants.map(function(image) {
+  var timeRadians = image.select('t').multiply(2 * Math.PI);
+  return image
+    .addBands(timeRadians.cos().rename('cos'))
+    .addBands(timeRadians.sin().rename('sin'));
+});
+
+// Fit the model as with the linear trend, using the linearRegression() reducer:
+
+var harmonicTrend = harmonicS1
+  .select(harmonicIndependents.add(dependent))
+  // The output of this reducer is a 4x1 array image.
+  .reduce(ee.Reducer.linearRegression({
+    numX: harmonicIndependents.length(), 
+    numY: 1
+  }));
+
+// Plug the coefficients in to equation 2 in order to get a time series of fitted values:
+
+// Turn the array image into a multi-band image of coefficients.
+var harmonicTrendCoefficients = harmonicTrend.select('coefficients')
+  .arrayProject([0])
+  .arrayFlatten([harmonicIndependents]);
+
+// Compute fitted values.
+var fittedHarmonic = harmonicS1.map(function(image) {
+  return image.addBands(
+    image.select(harmonicIndependents)
+      .multiply(harmonicTrendCoefficients)
+      .reduce('sum')
+      .rename('fitted'));
+});
+
+var fittedHarmonic = fittedHarmonic.map( function (image) {
+  var db = ee.Image.constant(10)
+                   .multiply(image.select([ 'fitted',BAND_NAME + '_median'])
+                   .log10()).rename([ 'fitted',BAND_NAME + '_median']);
+  return image.addBands(db, null, true)
+});
+
+// Plot the fitted model and the original data at the AOI.
+print(ui.Chart.image.series(
+fittedHarmonic.select(['fitted',BAND_NAME + '_median']), AOI, ee.Reducer.mean(), 30)
+    .setSeriesNames([BAND_NAME + '_median', 'fitted'])
+    .setOptions({
+      title: 'Harmonic model: original and fitted values',
+      vAxis: {viewWindow: {min: -15, max:-12}},
+      lineWidth: 1,
+      pointSize: 3,
+}));
+
+
+// Although any coefficients can be mapped directly, it is useful and interesting to map the phase and amplitude of 
+// the estimated harmonic model.  First, compute phase and amplitude from the coefficients, then map:
+
+// Compute phase and amplitude.
+var phase = harmonicTrendCoefficients.select('sin')
+    .atan2(harmonicTrendCoefficients.select('cos'))
+    // Scale to [0, 1] from radians.
+    .unitScale(-Math.PI, Math.PI);
+    
+var amplitude = harmonicTrendCoefficients.select('sin')
+    .hypot(harmonicTrendCoefficients.select('cos'))
+    // Add a scale factor for visualization.
+    .multiply(5);
+
+// Compute the median index value.
+var medianIndex= s1withConstants.select(BAND_NAME).median();
+
+
+// Use the HSV to RGB transform to display phase and amplitude.
+var rgb = ee.Image.cat([
+  phase,      // hue
+  amplitude,  // saturation (difference from white)
+  medianIndex    // value (difference from black)
+]).hsvToRgb();
+
+var visparam = {}
+
+if (parameter.FORMAT=='DB'){
+    var s1_preprocess_view = s1_preprocess.map(helper.add_ratio_lin).map(helper.lin_to_db2);
+    visparam = {bands: ['VH', 'VV', parameter.VIS_BAND_RATIO], min: [-16, -10, 0],max: [-9, -5, 0.6]}
+    }
+    else {
+    var s1_preprocess_view = s1_preprocess.map(helper.add_ratio_lin);
+    visparam = {bands: ['VH', 'VV', parameter.VIS_BAND_RATIO], min: [0, 0, 0],max: [0.1, 0.3, 0.6]}
+}
+
+var medianvisparam = {}
+if (parameter.FORMAT=='DB'){
+    var S1withMedian_view = S1withMedian.map(helper.add_ratio_lin).map(helper.lin_to_db2);
+    medianvisparam = {bands: [BAND_NAME + '_median', BAND_NAME + '_sd'], min: [-16, -10],max: [-9, -5]}
+    }
+    else {
+    var S1withMedian_view = S1withMedian.map(helper.add_ratio_lin);
+    medianvisparam = {bands: [BAND_NAME + '_median', BAND_NAME + '_sd'], min: [0, 0],max: [0.1, 0.3]}
+}
+
+var rgbvisparam = {}
+    var bandNames = rgb.bandNames()
+    var db = ee.Image.constant(10).multiply(rgb.select(bandNames).log10()).rename(bandNames)
+    var rgb_view = rgb.addBands(db, null, true)
+    rgbvisparam = {bands: ['phase', 'amplitude', 'meanIndex'], min: [-16, -10, 0],max: [-9, -5, 0.6]}
+
+Map.centerObject(Park, 11);
+Map.addLayer(s1_preprocess_view.first(), visparam, 'selected S1 ' + BAND_NAME + ' Image', true);
+Map.addLayer(S1withMedian_view.first(), medianvisparam, 'selected S1 constant Median ' + BAND_NAME, false);
+Map.addLayer(S1withMedian_view.first(), medianvisparam, 'selected S1 constant st. dev. ' + BAND_NAME, false);
+Map.addLayer(rgb, rgbvisparam, 'RGB: phase (hue), amplitude (sat), backscatter (dB) value');
+Map.addLayer(Hectares, {color: 'red'}, 'forest plot locations');

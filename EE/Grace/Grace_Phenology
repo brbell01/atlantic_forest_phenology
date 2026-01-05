@@ -1,0 +1,226 @@
+// Linear modeling of time for Sentinel-1 time series
+// Estimate linear trend over time using pt = β0 + β1t + et, where e is a random error.
+// Reference: https://docs.google.com/document/d/1mNIRB90jwLuASO1JYas1kuOXCLbOoy1Z4NlV1qIXM10/edit#
+
+///////////////////////////////////////////////////////
+//// PART ONE: IMPORTS AND PARAMETER DEFINITIONS   ////
+///////////////////////////////////////////////////////
+
+// Geometry Imports
+var MataEscura_Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/1_MataEscura_Hectares1"),
+    MontePascoal_Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/2_MontePascoal_Hectares1"),
+    RioDoce_Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/3_RioDoce_Hectares1"),
+    Sooretama_Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/4_Sooretama_Hectares1"),
+    REBIO_Sooretama = ee.FeatureCollection("projects/af-phenology/assets/Parks/REBIO_Sooretama"),
+    PNH_Monte_Pascoal = ee.FeatureCollection("projects/af-phenology/assets/Parks/PNH_Monte_Pascoal"),
+    REBIO_Mata_Escura = ee.FeatureCollection("projects/af-phenology/assets/Parks/REBIO_Mata_Escura"),
+    PE_Rio_Doce = ee.FeatureCollection("projects/af-phenology/assets/Parks/PE_Rio_Doce");
+
+// Choose analysis area
+var Park = PNH_Monte_Pascoal, // PE_Rio_Doce ; PNH_Monte_Pascoal ; REBIO_Mata_Escura ; REBIO_Sooretama
+    Hectares = MontePascoal_Hectares, // Sooretama_Hectares, // RioDoce_Hectares ; MontePascoal_Hectares ; MataEscura_Hectares
+    AREA_NAME = 'PNH Monte Pascoal, BA', //'PE Rio Doce, MG', 'PNH Monte Pascoal, BA', 'REBIO Mata Escura, MG'
+    FILE_NAME = 'monte_pascoal'; // ; 'rio_doce' ; 'mata_escura' ; 'monte_pascoal' ; 'sooretama'
+    
+//export params
+var export_band = 'lwe_thickness_jpl' ; 'lwe_thickness_jpl' ; 'lwe_thickness_gfz'
+
+// Other params - no need to change for this study
+var plot1 = Hectares,
+    AOI = plot1.geometry(), 
+    BAND_NAME = export_band,
+    REDUCING_SCALE = 100;
+
+var grace = ee.ImageCollection('NASA/GRACE/MASS_GRIDS/LAND')
+  .filterDate('2015-01-01', '2016-12-30');
+var graceCSR = grace.select('lwe_thickness_csr');
+var graceGFZ = grace.select('lwe_thickness_gfz');
+var graceJPL = grace.select('lwe_thickness_jpl');
+
+var graceMean = graceJPL
+
+print(graceMean)
+
+
+/////////////////////////////////////////////////////////////////
+//// PART FOUR: ESTIMATE SEASONALITY WITH A HARMONIC MODEL   ////
+/////////////////////////////////////////////////////////////////
+
+
+// Define a function to add year band and constant band
+var addVariables = function(image) {
+  // Compute time in fractional years since the epoch.
+  var date = ee.Date(image.get('system:time_start'));
+  var years = date.difference(ee.Date('1970-01-01'), 'year');
+  // Return the image with the added bands.
+  return image
+    // Add a time band.
+    .addBands(ee.Image(years).rename('t'))
+    .float()
+    // Add a constant band.
+    .addBands(ee.Image.constant(1).rename('constant'));
+};
+
+// map over collection
+var gracewithConstants = graceMean.map(addVariables);
+
+print('Ensemble GRACE Water Storage with year and constant band', gracewithConstants);
+
+// List of the independent variable names
+var independents = ee.List(['constant', 't']);
+
+// Name of the dependent variable.
+var dependent = ee.String(BAND_NAME);
+
+// Compute a linear trend. This will have two bands: 'residuals' and 
+// a 2x1 band called coefficients (columns are for dependent variables).
+var trend = gracewithConstants.select(independents.add(dependent))
+    .reduce(ee.Reducer.linearRegression(independents.length(), 1));
+// Map.addLayer(trend, {}, 'trend array image');
+
+// Flatten the coefficients into a 2-band image
+var coefficients = trend.select('coefficients')
+  .arrayProject([0])
+  .arrayFlatten([independents]);
+
+// The coefficients image is a two band image in which each pixel contains values for β0 and β1.   
+// Use the model to "detrend" the original time series:
+
+// Compute a de-trended series.
+var detrended = gracewithConstants.map(function(image) {
+  return image.select(dependent).subtract(
+          image.select(independents).multiply(coefficients).reduce('sum'))
+          .rename(dependent)
+          .copyProperties(image, ['system:time_start']);
+});
+
+//print('Detrended ' + BAND_NAME + ' collection', detrended);
+
+
+// Plot the detrended results.
+// Define plot geometry
+var detrendedChart = ui.Chart.image.seriesByRegion({
+    imageCollection: detrended, 
+    regions: AOI, 
+    reducer: ee.Reducer.median(),
+    band: BAND_NAME,
+    scale: REDUCING_SCALE
+    })
+    .setOptions({
+      title: 'Detrended GRACE ' + BAND_NAME + 
+            ' time series over 1-ha sample plots, (' + AREA_NAME + ')',
+      vAxis: {title: 'GRACE values'},
+      lineWidth: 1,
+      pointSize: 3,
+      series: {
+        0: {visibleInLegend: false}
+              }
+    });
+
+print(detrendedChart);
+
+
+// Estimate seasonality with a harmonic model
+// Consider the following linear model, where et is a random error, A is amplitude, ω is frequency, and φ is phase:
+// pt = β0 + β1t + Acos(2πωt - φ) + et 
+//    = β0 + β1t + β2cos(2πωt) + β3sin(2πωt) + et
+// Note that β2 = Acos(φ) and β3 = Asin(φ), implying A = (β22 + β32)½ and φ = atan(β3/β2).  (See Shumway and Stoffer (2017) equations 4.1 - 4.2).  
+// To fit this model to the time series, set ω=1 (one cycle per unit time) and use ordinary least squares regression.
+// The setup for fitting the model is to first add the harmonic variables (the third and fourth terms of equation 2) to the image collection.
+	
+
+// Use these independent variables in the harmonic regression.
+var harmonicIndependents = ee.List(['constant', 't', 'cos', 'sin']);
+
+// Add harmonic terms as new image bands.
+var harmonicS1 = gracewithConstants.map(function(image) {
+  var timeRadians = image.select('t').multiply(2 * Math.PI);
+  return image
+    .addBands(timeRadians.cos().rename('cos'))
+    .addBands(timeRadians.sin().rename('sin'));
+});
+
+// Fit the model as with the linear trend, using the linearRegression() reducer:
+var harmonicTrend = harmonicS1
+  .select(harmonicIndependents.add(dependent))
+  // The output of this reducer is a 4x1 array image.
+  .reduce(ee.Reducer.linearRegression({
+    numX: harmonicIndependents.length(), 
+    numY: 1
+  }));
+
+// Plug the coefficients in to equation 2 in order to get a time series of fitted values:
+
+// Turn the array image into a multi-band image of coefficients.
+var harmonicTrendCoefficients = harmonicTrend.select('coefficients')
+  .arrayProject([0])
+  .arrayFlatten([harmonicIndependents]);
+
+// Compute fitted values.
+var fittedHarmonic = harmonicS1.map(function(image) {
+  return image.addBands(
+    image.select(harmonicIndependents)
+      .multiply(harmonicTrendCoefficients)
+      .reduce('sum')
+      .rename('fitted'));
+});
+
+
+//Plot the fitted model and the original data at the AOI.
+var fitted = ui.Chart.image.series({
+      imageCollection: fittedHarmonic.select([BAND_NAME, 'fitted']), 
+      region: AOI, 
+      reducer: ee.Reducer.mean(), 
+      scale: REDUCING_SCALE 
+      })
+        .setSeriesNames([BAND_NAME, 'fitted'])
+        .setOptions({
+          title: 'Harmonic model: original and fitted values',
+//          vAxis: {viewWindow: vwindowpref},
+          lineWidth: 1,
+          pointSize: 3
+        })
+
+print(fitted)
+
+// Compute phase and amplitude.
+var phase = harmonicTrendCoefficients.select('sin')
+    .atan2(harmonicTrendCoefficients.select('cos'))
+    // Scale to [0, 1] from radians.
+    .unitScale(-Math.PI, Math.PI);
+    
+var amplitude = harmonicTrendCoefficients.select('sin')
+    .hypot(harmonicTrendCoefficients.select('cos'))
+    // Add a scale factor for visualization.
+    .multiply(5);
+
+// Compute the median index value.
+var medianIndex= gracewithConstants.select(BAND_NAME).median();
+
+// Use the HSV to RGB transform to display phase and amplitude.
+var rgb = ee.Image.cat([
+  phase,      // hue (dominant color family - circular)
+  amplitude,  // saturation (difference from white)
+  medianIndex    // value (difference from black)
+]).hsvToRgb()
+.rename(['phase', 'amplitude', 'meanIndex']);
+
+
+var graceVis = {
+  min: -25.0,
+  max: 25.0,
+};
+
+Map.centerObject(Park, 11);
+Map.addLayer(graceCSR, graceVis, 'Equivalent Water Thickness CSR');
+Map.addLayer(graceGFZ, graceVis, 'Equivalent Water Thickness GFZ');
+Map.addLayer(graceGFZ, graceVis, 'Equivalent Water Thickness JPL');
+// Map.addLayer(fittedHarmonic.first(), {}, 'Fitted harmonic ' + BAND_NAME + ' collection', false);
+// Map.addLayer(rgb_view, rgbvisparam, 'RGB: phase (hue), amplitude (sat), backscatter (dB) value');
+// Map.addLayer(Hectares, {color: 'red'}, 'forest plot locations');
+
+Export.image.toDrive({
+  image: rgb,
+  description: FILE_NAME + '_mapped_harmonic_model_coeff_' + "S2_" + BAND_NAME,
+  maxPixels: 1e10
+});

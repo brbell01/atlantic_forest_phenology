@@ -1,0 +1,77 @@
+
+//Import study area and sampling plots
+var Park = ee.FeatureCollection("projects/af-phenology/assets/Parks/REBIO_Mata_Escura");
+var roi = Park.centroid();
+
+//import IMERG daily rainfall
+
+var rainfall = ee.ImageCollection('NASA/GPM_L3/IMERG_V06');
+var nDays = ee.Number(ee.Date(parameter.STOP_DATE).difference(ee.Date(parameter.START_DATE), 'day'));
+
+var dailymax = ee.List.sequence(0, nDays.subtract(1)).map(function(n){
+  var t1 = ee.Date(parameter.START_DATE).advance(ee.Number(n), 'day');
+  var t2 = t1.advance(1, 'day');
+  var dailymax = rainfall
+      .filterDate(t1, t2)
+      .select('precipitationCal')
+      .max();
+  return dailymax
+    .set({'system:time_start': t1.millis()});
+});
+
+var dailysum = ee.List.sequence(0, nDays.subtract(1)).map(function(n){
+  var t1 = ee.Date(parameter.START_DATE).advance(ee.Number(n), 'day');
+  var t2 = t1.advance(1, 'day');
+  var dailymax = rainfall
+      .filterDate(t1, t2)
+      .select('precipitationCal')
+      .sum();
+  return dailymax
+    .set({'system:time_start': t1.millis()});
+});
+
+dailymax = ee.ImageCollection(dailymax).map(function(image){return image.clip(Park)});
+dailysum = ee.ImageCollection(dailysum).map(function(image){return image.clip(Park)});
+
+var clipped = S2masked.map(function(image){return image.clip(Park)});
+
+
+
+var yvalues = ee.Array(dailymax.get('precipitationCal'));
+var xvalues = ee.Array(dailysum.get('precipitationCal'));
+var chart = ui.Chart.array.values(yvalues, 0, xvalues)
+.setSeriesNames(['precipitationCal', 'precipitationCal'])
+.setOptions({
+  title: 'Precipitation: daily max vs daily sum',
+  hAxis: {'title': 'dailymax'},
+  vAxis: {'title': 'dailysum'},
+  pointSize: 3,
+});
+
+print(chart);
+
+
+
+// // Display a time-series chart of sentinel-1 values with high precip values flagged
+
+// var chart1 = ui.Chart.image.series({
+//   imageCollection: dailymax,                          // Image collection we want to use for timeseries analysis
+//   region: roi,                                            // plot boundaries
+//   reducer: ee.Reducer.median(),                                // Pixel we want to use
+//   scale: 100,                                       // [Spatial Resolution]: 500
+//   xProperty: 'system:time_start'                       // Date 
+// })
+// .setOptions({
+// title: 'IMERG Daily Maximum Precip. over ' + AREA_NAME,
+// legend: {position: 'none'},
+// hAxis: {title: '', format: 'YYYY-MMM-dd'},
+// vAxes: {0: {
+//       title: "Precip. (mm/Hr)",
+//       baseline: 0,
+//       titleTextStyle: {bold: true, color: 'blue'},
+//       viewWindow: { min: 0 }
+//     }
+// }
+// });
+
+// print(chart1)

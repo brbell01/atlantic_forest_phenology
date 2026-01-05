@@ -1,0 +1,48 @@
+var HECTARES = ee.FeatureCollection("projects/af-phenology/assets/Hectares/1_MataEscura_Hectares1"),
+    S2 = ee.ImageCollection("COPERNICUS/S2_SR"),
+    s2Clouds = ee.ImageCollection("COPERNICUS/S2_CLOUD_PROBABILITY"),
+    PARK = ee.FeatureCollection("projects/af-phenology/assets/Parks/REBIO_Mata_Escura");
+
+// imports
+var helpers = require('users/brbell01/AF_Phenology:Helpers');
+var constants = require('users/brbell01/AF_Phenology:Constants');
+
+// Constants
+
+var START_DATE = constants.STUDY_START_DATE;
+var END_DATE = constants.STUDY_END_DATE;
+var MAX_CLOUD_PROBABILITY = 60
+
+// Create a filter for study dates and park bounds
+var filter = ee.Filter.and(
+    ee.Filter.bounds(PARK.geometry().centroid()), 
+    ee.Filter.date(START_DATE, END_DATE));
+
+// Join S2 SR with cloud probability dataset to add cloud mask.
+var s2WithCloudProperty = helpers.s2AddCloudProbability(S2, s2Clouds, filter);
+var s2CloudFiltered = s2WithCloudProperty.filterMetadata('CLOUDY_PIXEL_PERCENTAGE', 'less_than', MAX_CLOUD_PROBABILITY);
+var s2CloudMasked = helpers.s2MaskClouds(s2WithCloudProperty, MAX_CLOUD_PROBABILITY);
+
+var fc = s2CloudMasked
+                  .filterDate('2019-08-16','2019-08-18');
+//set to true to inspect north image; false for south image                  
+var image = ee.Image(fc.sort('system:time_start', true).first());
+
+Map.addLayer(image)
+
+Map.centerObject(image, 10)
+
+//add Park bounds and plots to visualization
+var empty = ee.Image().byte();
+var outline = empty.paint({
+  featureCollection: PARK,  
+  color: 1,
+  width: 3
+}); 
+var outline2 = empty.paint({
+  featureCollection: HECTARES,
+  color: 3,
+  width: 2
+}); 
+Map.addLayer(outline, {palette: '00FF00'}, 'park');
+Map.addLayer(outline2, {palette: 'FFFF00'}, 'hectares'); 

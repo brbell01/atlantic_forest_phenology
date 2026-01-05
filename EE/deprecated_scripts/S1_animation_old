@@ -1,0 +1,120 @@
+/**** Start of imports. If edited, may not auto-convert in the playground. ****/
+var geometryGradientBar = 
+    /* color: #d63000 */
+    /* displayProperties: [
+      {
+        "type": "rectangle"
+      }
+    ] */
+    ee.Geometry.Polygon(
+        [[[106.40599285362039, 11.312642905477976],
+          [106.40599285362039, 11.204893914864659],
+          [107.26841961143289, 11.204893914864659],
+          [107.26841961143289, 11.312642905477976]]], null, false),
+    geometryLabel = /* color: #98ff00 */ee.Geometry.Point([106.46993299855095, 11.750301410433268]);
+/***** End of imports. If edited, may not auto-convert in the playground. *****/
+//Import Sentinel-1 Image Collection
+var S1 = ee.ImageCollection("COPERNICUS/S1_GRD_FLOAT");
+
+//Import Study Area
+var StudyArea = ee.FeatureCollection("users/brbell01/Masters/PNH_Monte_Pascoal");
+// var StudyArea = ee.FeatureCollection("users/brbell01/Masters/PN_Mata_Escura");
+// var StudyArea = ee.FeatureCollection("users/brbell01/Masters/PE_Rio_Doce");
+// var StudyArea = ee.FeatureCollection("users/brbell01/Masters/PNH_Monte_Pascoal");
+
+Map.centerObject(StudyArea);
+
+//filter out edges from collection
+var S1filtered = S1.filter(ee.Filter.date('2015-01-01', '2021-12-31'))
+      .filter(ee.Filter.bounds(StudyArea))
+      .map(function(image) {
+          var edge = image.lt(-30.0);
+          var maskedImage = image.mask().and(edge.not());
+          return image.updateMask(maskedImage);
+        });
+
+print(S1filtered)
+
+
+// make a list with years
+var years = ee.List.sequence(2015,2021,1);
+var months = ee.List.sequence(1,12,1);
+
+
+var col =  ee.ImageCollection.fromImages(
+  years.map(function (y) {
+    return months.map(function(m){
+      var start = ee.Date.fromYMD(y,m,1).advance(-1,"month");
+      var end = ee.Date.fromYMD(y,m,1).advance(1,"month");
+      var w = col.filterDate(start,end).max();    
+                    
+      return w.set('year', y)
+              .set('month', m)
+              .set('system:time_start',start);
+  })}).flatten()
+);
+
+
+// Define RGB visualization parameters.
+var visParams = {
+  min: 3000.0,
+  max: 10000.0,
+  palette: [
+    'CE7E45', 'DF923D', 'F1B555', 'FCD163', '99B718', '74A901',
+    '66A000', '529400', '3E8601', '207401', '056201', '004C00', '023B01',
+    '012E01', '011D01', '011301'
+  ],
+};
+
+// Add a color gradient bar with a label.
+geometryGradientBar = geometryGradientBar; // <-- this is a drawn geometry;
+var style = require('users/gena/packages:style');
+var utils = require('users/gena/packages:utils');
+var txt = require('users/gena/packages:text');
+
+var min = 0;
+var max = 1;
+var textProperties = {
+  fontSize: 32,
+  textColor: 'ffffff',
+  outlineColor: '000000',
+  outlineWidth: 0,
+  outlineOpacity: 0.6
+};
+var labels = ee.List.sequence(min, max);
+var gradientBar = style.GradientBar.draw(geometryGradientBar, {
+  min: min, max: max, palette: visParams.palette, labels: labels,
+  format: '%.0f', text: textProperties
+});
+
+var label = 'NDVI';
+var scale = Map.getScale() * 1; // scale text font relative to the current map scale
+geometryLabel = geometryLabel;  // <-- this comes from drawn point geometry
+//var text = text.draw(label, geometryLabel, scale, {fontSize: 32});
+
+// Create RGB visualization images for use as animation frames.
+// Blend the gradient bar and label images to the NDVI images.
+var rgbVis =col.map(function(img) {
+  var y = ee.Number(img.get("year")).toInt()
+  var m = ee.Number(img.get("month")).toInt()
+  var label = ee.String(m).cat("-").cat(y)
+  var text = txt.draw(label, geometryLabel, scale, {fontSize: 32});
+  return img.visualize(visParams).clip(StudyArea).blend(text);
+});
+
+print(rgbVis)
+
+// Define GIF visualization arguments.
+var gifParams = {
+  'region': region,
+  'dimensions': 400,
+  'crs': 'EPSG:32648',
+  'framesPerSecond': 3,
+  'format': 'gif'
+};
+
+// Print the GIF URL to the console.
+print(rgbVis.getVideoThumbURL(gifParams));
+
+// Render the GIF animation in the console.
+print(ui.Thumbnail(rgbVis, gifParams));

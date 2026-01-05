@@ -1,0 +1,175 @@
+
+
+//Import study area and sampling plots
+// var AREA_NAME =  "REBIO Mata Escura, MG" , // "PNH Monte Pascoal, BA", // "REBIO Sooretama, ES" ; "PE Rio Doce, MG", "REBIO Mata Escura, MG"
+    //Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/1_MataEscura_Hectares1"),
+var Park = ee.FeatureCollection("projects/af-phenology/assets/Parks/PE_Rio_Doce");
+
+Park = Park.geometry()
+var roi = Park.centroid();
+
+Map.centerObject(Park,11)
+
+//import IMERG daily rainfall
+
+
+var startYear = "2002"
+var endYear = "2022"
+var rainfall = ee.ImageCollection('NASA/GPM_L3/IMERG_MONTHLY_V06')
+  .filterDate('2002-01-01', '2022-01-01')
+  .select('precipitation');
+// var meanmonthly = rainfall.map(function(image) {
+//   return image.clip(Park);
+// });
+
+//print(meanmonthly)
+
+var getPrecipit = function(image) {
+  // Reducing region and getting value
+  var value_ppt = ee.Image(image)
+    .reduceRegion(ee.Reducer.mean(), Park)
+    .get('precipitation');
+  return ee.Number(value_ppt).multiply(24);  //mm/day
+};
+
+var getStdDev = function(image) {
+  // Reducing region and getting value
+  var value_stdDev = ee.Image(image)
+    .reduceRegion(ee.Reducer.stdDev(), Park)
+    .get('precipitation');
+  return ee.Number(value_stdDev).multiply(24);  //mm/day
+};
+
+var count = rainfall.size();
+var ppt_list = rainfall.toList(count).map(getPrecipit);
+var stdDev_list = rainfall.toList(count).map(getStdDev);
+var year_list = ee.List.sequence(ee.Number.parse(startYear), ee.Number.parse(endYear).subtract(1));
+
+var leapYear_list = year_list.map( function leapYear(year) {
+  return ee.Number(year).mod(4).eq(0).and(ee.Number(year).mod(100).neq(0)).or(ee.Number(year).mod(400).eq(0));
+});
+
+var monthNumberDays = leapYear_list.map(function setYearsNumberDays (ele) {
+  return ee.Algorithms
+    .If(ee.Number(ele).eq(1), [31,29,31,30,31,30,31,31,30,31,30,31], 
+                              [31,28,31,30,31,30,31,31,30,31,30,31]);
+}).flatten();
+
+var monthlyValues = ppt_list.map(function (ele){
+  var idx = ppt_list.indexOf(ele);
+  return ee.Number(ele).multiply(monthNumberDays.get(idx));
+});
+
+var monthlyStDev = stdDev_list.map(function (ele){
+  var idx = stdDev_list.indexOf(ele);
+  return ee.Number(ele).multiply(monthNumberDays.get(idx));
+});
+
+var allDates = ee.List(rainfall.aggregate_array('system:time_start'));
+var allDatesSimple = allDates.map(function(date){
+  return ee.Date(date).format().slice(0,7);
+});
+
+// Incorporate the standard deviation values into the paired variable as a new column
+var paired = allDatesSimple.zip(monthlyValues.zip(monthlyStDev));
+print("ppt_list (mm/month)", paired);
+
+
+// Calculate the annual rainfall values by summing the monthly values for each year
+var annualValues = year_list.map(function(year) {
+  var startMonthIndex = year_list.indexOf(year).multiply(12);
+  var endMonthIndex = startMonthIndex.add(11);
+  var yearValues = monthlyValues.slice(startMonthIndex, endMonthIndex.add(1));
+  return ee.List(yearValues).reduce(ee.Reducer.sum());
+});
+
+// // Calculate the annual rainfall stdev values
+// var annualStdDevValues = year_list.map(function(year) {
+//   var startOfYear = ee.Date.fromYMD(year, 1, 1);
+//   var endOfYear = startOfYear.advance(1, 'year');
+//   var yearRainfall = rainfall.filterDate(startOfYear, endOfYear);
+//   var yearStdDev = yearRainfall.reduce(ee.Reducer.stdDev()).clip(Park);
+//   var value_stdDev = yearStdDev.reduceRegion(ee.Reducer.mean(), Park).get('precipitation_stdDev');
+//   var daysInYear = endOfYear.difference(startOfYear, 'days');
+//   return ee.Number(value_stdDev).multiply(daysInYear);
+// });
+
+// Calculate the annual standard deviation values by computing the standard deviation of the monthly values for each year
+var annualStdDevValues = year_list.map(function(year) {
+  var startMonthIndex = year_list.indexOf(year).multiply(12);
+  var endMonthIndex = startMonthIndex.add(11);
+  var yearValues = monthlyValues.slice(startMonthIndex, endMonthIndex.add(1));
+  return ee.List(yearValues).reduce(ee.Reducer.stdDev());
+});
+
+
+var monthly_chart = ui.Chart.array.values({
+  array: monthlyValues,
+  axis: 0,
+  xLabels: allDatesSimple
+})
+.setChartType('ColumnChart')
+.setOptions({
+  title: 'Monthly Rainfall',
+  legend: {position: 'none'},
+  hAxis: {title: 'Date', format: 'YYYY-MMM-dd'},
+  vAxis: {title: "Total Precip. (mm)"}
+});
+
+print(monthly_chart);
+
+
+var mon_sd_chart = ui.Chart.array.values({
+  array: monthlyStDev,
+  axis: 0,
+  xLabels: allDatesSimple
+})
+.setChartType('ColumnChart')
+.setOptions({
+  title: 'Monthly Standard Deviation of Rainfall',
+  legend: {position: 'none'},
+  hAxis: {title: 'Date', format: 'YYYY-MMM-dd'},
+  vAxis: {title: "Standard Deviation (mm)"},
+  series: {
+  0: {color: '#ff0000'}
+  }
+});
+
+print(mon_sd_chart);
+
+
+// Create a bar chart to plot the annual rainfall data
+var annual_chart = ui.Chart.array.values({
+  array: annualValues,
+  axis: 0,
+  xLabels: year_list
+})
+.setChartType('ColumnChart')
+.setOptions({
+  title: 'Annual Rainfall',
+  legend: {position: 'none'},
+  hAxis: {title: 'Year'},
+  vAxis: {title: "Total Precip. (mm)"}
+});
+
+print(annual_chart);
+
+
+var yearly_sd_chart = ui.Chart.array.values({
+  array: annualStdDevValues,
+  axis: 0,
+  xLabels: year_list
+})
+.setChartType('ColumnChart')
+.setOptions({
+  title: 'Annual Standard Deviation of Rainfall',
+  legend: {position: 'none'},
+  hAxis: {title: 'Year'},
+  vAxis: {title: "Standard Deviation (mm)"},
+  series: {
+  0: {color: '#ff0000'}
+  }
+});
+
+print(yearly_sd_chart);
+

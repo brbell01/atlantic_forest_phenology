@@ -1,0 +1,33 @@
+/**** Start of imports. If edited, may not auto-convert in the playground. ****/
+var image = ee.Image("projects/af-phenology/assets/Mapbiomas_MG_LULC_2019");
+/***** End of imports. If edited, may not auto-convert in the playground. *****/
+//This script makes the random grid and filters out grid squares
+// by masking out non-forest sites.  Forest cover provided by Mapbiomas. 
+// https://github.com/mapbiomas-brazil/user-toolkit/mapbiomas-user-toolkit-lulc.js
+
+var PARK_GRID = ee.FeatureCollection("projects/af-phenology/assets/Parks/Mata_Escura_park_grid");
+var grid_name = "MATA_ESCURA_RANDOM_GRID"
+var grid_percentage = 0.01
+var lulc = ee.Image("projects/af-phenology/assets/Mapbiomas_MG_LULC_2019");
+var lulc_name = "MapBiomas - LandCover 2019"
+var helpers = require('users/brbell01/AF_Phenology:Helpers');
+
+//would be good to set a seed here for reproduceability, but later..
+var RANDOM_GRID = helpers.randomFeaturesByPercentage(PARK_GRID, grid_percentage);
+print(RANDOM_GRID)
+
+var empty = ee.Image().byte();
+var outline = empty.paint({
+  featureCollection: RANDOM_GRID,
+  color: 1,
+  width: 3
+});
+
+Map.addLayer(lulc, {min:2, max: 4}, lulc_name)
+Map.addLayer(outline, {palette: '00FF00'}, 'PARK_GRID');
+
+Export.table.toAsset({
+  collection: RANDOM_GRID,
+  description: grid_name,
+  assetId: grid_name
+})

@@ -1,0 +1,81 @@
+// Extract and export sample points from 1ha plots in various parks.
+
+// Geometry imports
+var MataEscura_Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/1_MataEscura_Hectares1"),
+    MontePascoal_Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/2_MontePascoal_Hectares1"),
+    RioDoce_Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/3_RioDoce_Hectares1"),
+    Sooretama_Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/4_Sooretama_Hectares1"),
+    AF = ee.FeatureCollection("projects/af-phenology/assets/Atlantic_Forest");
+
+// Analysis parameters
+var dataset = ee.Image('NASA/NASADEM_HGT/001');
+var elevation = dataset.select('elevation');
+var slope = ee.Terrain.slope(elevation);
+
+// Add reducer output to the Features in the collection.
+var MontePascoal_Hectare_means = slope.reduceRegions({
+                        collection: MontePascoal_Hectares,
+                        reducer: ee.Reducer.mean(),
+                        scale: 30,
+                      });
+
+Export.table.toDrive({
+  collection: MontePascoal_Hectare_means,
+  description: 'MontePascoal_Hectare_means',
+  fileFormat: 'CSV'
+});
+
+// Add reducer output to the Features in the collection.
+var RioDoce_Hectare_means = slope.reduceRegions({
+                        collection: RioDoce_Hectares,
+                        reducer: ee.Reducer.mean(),
+                        scale: 30,
+                      });
+
+Export.table.toDrive({
+  collection: RioDoce_Hectare_means,
+  description: 'RioDoce_Hectare_means',
+  fileFormat: 'CSV'
+});
+
+// Add reducer output to the Features in the collection.
+var MataEscura_Hectare_means = slope.reduceRegions({
+                        collection: MataEscura_Hectares,
+                        reducer: ee.Reducer.mean(),
+                        scale: 30,
+                      });
+
+Export.table.toDrive({
+  collection: MataEscura_Hectare_means,
+  description: 'MataEscura_Hectare_means',
+  fileFormat: 'CSV'
+});
+
+// Add reducer output to the Features in the collection.
+var Sooretama_Hectare_means = slope.reduceRegions({
+                        collection: Sooretama_Hectares,
+                        reducer: ee.Reducer.mean(),
+                        scale: 30,
+                      });
+
+Export.table.toDrive({
+  collection: Sooretama_Hectare_means,
+  description: 'Sooretama_Hectare_means',
+  fileFormat: 'CSV'
+});
+
+// Generate 1000 random points to sample background 
+var points = ee.FeatureCollection.randomPoints(AF.geometry(), 1e6);
+
+// Combine parks
+var combinedParks = RioDoce_Hectares.merge(MataEscura_Hectares).merge(Sooretama_Hectares).merge(MontePascoal_Hectares);
+combinedParks = combinedParks.map(function(feature) {return feature.buffer(1e6)});
+
+// remove intersecting points for independent samples
+var filterpoints = points.filterBounds(combinedParks);
+var AF_slopes = slope.reduceRegions(filterpoints, ee.Reducer.mean());
+
+Export.table.toAsset({
+		collection:filterpoints,	
+		description:'filterpoints'
+})

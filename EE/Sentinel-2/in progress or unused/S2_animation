@@ -1,0 +1,117 @@
+/**** Start of imports. If edited, may not auto-convert in the playground. ****/
+var S2 = ee.ImageCollection("COPERNICUS/S2");
+/***** End of imports. If edited, may not auto-convert in the playground. *****/
+//Import Study Area
+var StudyArea = ee.FeatureCollection("users/brbell01/Masters/PNH_Monte_Pascoal");
+// var StudyArea = ee.FeatureCollection("users/brbell01/Masters/PN_Mata_Escura");
+//var StudyArea = ee.FeatureCollection("users/brbell01/Masters/PE_Rio_Doce");
+//var StudyArea = ee.FeatureCollection("users/brbell01/Masters/REBIO_Sooretama");
+
+
+function S2mask(image) {
+  var qa = image.select('QA60')
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0).and(
+             qa.bitwiseAnd(cirrusBitMask).eq(0))
+  return image.updateMask(mask)
+      .select("B.*")
+      .copyProperties(image, ["system:time_start"])
+}
+
+var filtered = S2
+  .filter(ee.Filter.date('2015-01-01', '2021-11-01'))
+  .filter(ee.Filter.bounds(StudyArea))  
+  .map(S2mask)
+  
+function addNDVI(image) {
+  var ndvi = image.normalizedDifference(['B8', 'B4']).rename('ndvi');
+  return image.addBands(ndvi);
+}
+  
+var withNDVI = filtered.map(addNDVI);
+
+var ndviPalette = ['FFFFFF', 'CE7E45', 'DF923D', 'F1B555', 'FCD163', '99B718',
+               '74A901', '66A000', '529400', '3E8601', '207401', '056201',
+               '004C00', '023B01', '012E01', '011D01', '011301'];
+
+
+//Function to visualize NDVI band
+function visualizeNDVI(image) {
+  var ndvi = image.normalizedDifference(['B8', 'B4']);
+  var vis = ndvi.visualize({bands: 'nd', min:0, max:1, palette:ndviPalette});
+  return vis.set('system:index', image.get('system:index'))
+}
+
+var visualized = withNDVI.map(visualizeNDVI);
+// Map.addLayer(visualized.median(), {}, 'Median composite')
+    
+// // Option 1: Convert collection to a gigantic image containing bands from all image
+// var visualizedBands = visualized.toBands()
+// Export.image.toDrive({
+//   image: visualizedBands,
+//   folder: folder,
+//   description: 'multiband_export',
+//   region: geometry,
+//   scale: scale
+// })
+
+// Option 2: Export the collection as a video
+Export.video.toDrive({
+  collection: visualized,
+  dimensions: 1024,
+  region: StudyArea,
+  description: 'video_export',
+  folder: 'earthengine',
+//  scale: 100,
+  framesPerSecond: 8,
+  maxPixels: 1e12}
+  )
+
+// // Option 3a: Use a client-side for loop. DONT DO THIS. See option 3b.
+// var size = visualized.size().getInfo();
+// for (var i = 0; i < size ; i++) {
+//     var image = ee.Image(visualized.toList(1, i).get(0));
+//     print(image)
+//     Export.image.toDrive({
+//       image: image,
+//       region: geometry,
+//       scale: 30,
+//       fileNamePrefix: image.get('system:index').getInfo(),
+//       folder: 'earthengine',
+//       description: 'Export_' + i
+//     })
+// }
+
+// // Option 3b: Export individual images, but do it asynchonously and 
+// // on press of a button rather than on load.
+// var doExport = function() {
+//   print('Working')
+//   var ids = visualized.aggregate_array('system:index');
+//   // evaluate() will not block the UI and once the result is available
+//   // will be passed-on to the callback function where we will call
+//   // Export.image.toDrive()
+//   ids.evaluate(function(imageIds) {
+//     print('Total number of images', imageIds.length)
+//     print('Exporting now... (see Tasks tab)')
+//     for(var i = 0; i < imageIds.length; i++) {
+      
+//       // Filter using the image id
+//       var image = ee.Image(visualized.toList(1, i).get(0));
+
+//       Export.image.toDrive({
+//         image: image,
+//         region: geometry,
+//         scale: 30,
+//         fileNamePrefix: imageIds[i],
+//         folder: 'earthengine',
+//         description: 'Export_' + i + '_' + imageIds[i]
+//       })
+//       }
+//   })
+  
+// }
+
+// print('Click button below to start export')
+// var button = ui.Button({label: 'Export', onClick: doExport})
+// print(button)

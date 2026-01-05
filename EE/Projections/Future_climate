@@ -1,0 +1,26 @@
+// Future climate
+// NEX-DCP30 data contain 33 climate models projected to the year 2100 using several scenarios of greenhouse gas concentration pathways (RCP). Here, we'll use the median of all models for RCP 8.5 (the worst case scenario) to look at potential future temperature and precipitation.
+
+// Import and prepare collection
+// Filter the collection by date and scenario.
+// Calculate 'mean' temperature from median min and max among 33 models.
+
+var dcp_col = (ee.ImageCollection('NASA/NEX-DCP30_ENSEMBLE_STATS')
+           .select(['tasmax_median', 'tasmin_median', 'pr_median'])
+           .filter(
+               ee.Filter.and(ee.Filter.eq('scenario', 'rcp85'),
+                             ee.Filter.date('2022-01-01', '2070-01-01'))))
+
+print(dcp_col, "climate models collection")
+
+
+// var calc_mean_temp = function (img) {
+//   return (img.select('tasmax_median')
+//           .add(img.select('tasmin_median'))
+//           .divide(ee.Image.constant(2.0))
+//           .addBands(img.select('pr_median'))
+//           .rename(['Temp-mean', 'Precip-rate'])
+//           .copyProperties(img, img.propertyNames()))
+// }
+
+// dcp_col = dcp_col.map(calc_mean_temp)

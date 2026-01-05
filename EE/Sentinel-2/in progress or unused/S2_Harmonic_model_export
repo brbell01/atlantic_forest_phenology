@@ -1,0 +1,261 @@
+// Linear modeling of time for Sentinel-2 time series
+// Estimate linear trend over time using pt = β0 + β1t + et, where e is a random error.
+// Reference: https://docs.google.com/document/d/1mNIRB90jwLuASO1JYas1kuOXCLbOoy1Z4NlV1qIXM10/edit#
+
+// Geometry Imports
+var MataEscura_Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/1_MataEscura_Hectares1"),
+    MontePascoal_Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/2_MontePascoal_Hectares1"),
+    RioDoce_Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/3_RioDoce_Hectares1"),
+    Sooretama_Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/4_Sooretama_Hectares1"),
+    REBIO_Sooretama = ee.FeatureCollection("projects/af-phenology/assets/Parks/REBIO_Sooretama"),
+    PNH_Monte_Pascoal = ee.FeatureCollection("projects/af-phenology/assets/Parks/PNH_Monte_Pascoal"),
+    REBIO_Mata_Escura = ee.FeatureCollection("projects/af-phenology/assets/Parks/REBIO_Mata_Escura"),
+    PE_Rio_Doce = ee.FeatureCollection("projects/af-phenology/assets/Parks/PE_Rio_Doce");
+
+// Image and feature collection imports
+var S2 = ee.ImageCollection("COPERNICUS/S2"),  // S2 L1C for Cloud Displacement Index (CDI) bands.
+    S2c = ee.ImageCollection('COPERNICUS/S2_CLOUD_PROBABILITY'),
+    S2Sr = ee.ImageCollection('COPERNICUS/S2_SR');
+
+
+// Set study area and sampling plots
+var AREA_NAME = 'PE Rio Doce, MG', // 'REBIO Sooretama, ES'
+    FILE_NAME = 'rio_doce', // 'mata_escura', // 'monte_pascoal' , 'sooretama',
+    BAND_NAME = 'EVI',
+    START_DATE = '2016-01-01', // constants.STUDY_START_DATE;
+    END_DATE ='2021-01-01', // constants.STUDY_END_DATE;// 
+    Hectares = RioDoce_Hectares,
+    PARK = PE_Rio_Doce,
+    AOI = Hectares.geometry();
+
+// var northtile = ee.Geometry.Point([-41.082845605213365, -16.216517258346485]);
+// var southtile = ee.Geometry.Point([-41.02285531019635, -16.36880497486341]);
+//var AOI = northtile
+
+// Import helper scripts
+var helpers = require('users/brbell01/AF_Phenology:Helpers');
+var constants = require('users/brbell01/AF_Phenology:Constants');
+
+
+////// Build Sentinel-2 collection
+    
+// S2 L1C for Cloud Displacement Index (CDI) bands.
+S2 = S2.filterBounds(AOI).filterDate(START_DATE, END_DATE)
+//    .select(['B7', 'B8', 'B8A', 'B10']);
+// S2Cloudless for the cloud probability band.
+S2c = S2c.filterDate(START_DATE, END_DATE).filterBounds(AOI);
+// S2 L2A for surface reflectance bands.
+S2Sr = S2Sr.filterDate(START_DATE, END_DATE).filterBounds(AOI)
+//    .select(['B2', 'B3', 'B4', 'B5']);
+
+print('Input S2 TOA Collection', S2);
+print('Input S2 Cloud Probability Collection', S2c);
+print('Input S2 Surface Reflectance Collection', S2Sr);
+
+// Join the cloud probability dataset to surface reflectance.
+var withCloudProbability = helpers.indexJoin(S2Sr, S2c, 'cloud_probability');
+// Join the L1C data to get the bands needed for CDI.
+var withS2L1C = helpers.indexJoin(withCloudProbability, S2, 'l1c');
+// Map the cloud masking function over the joined collection.
+var S2masked = ee.ImageCollection(withS2L1C.map(helpers.maskImage))
+// Add vegetation indices             
+              .map(helpers.S2AddIndices);
+
+
+print('Input Masked S2 Collection', S2masked);
+
+// Clip the image collection to the plot boundaries, calculate the median statistic,
+// and add as new band for use in modeling
+
+var clipped = S2masked.map(function(image){return image.clip(PARK)});
+
+// var s2withMedian = clipped.map(function (image) {
+//   var time = image.get('system:time_start');
+//   var median = image.select(BAND_NAME)
+//                     .reduceRegion({
+//                       reducer: ee.Reducer.median(),
+//                       scale: 10,
+//                       maxPixels: 1e13,
+//                       tileScale: 1
+//                     });
+//   var newImg = ee.Image(ee.Algorithms.If(   //dealing with null calculations
+//     median.getNumber(BAND_NAME), 
+//     ee.Image(median[0]).set('isNull', false),
+//     ee.Image(0).selfMask().set('isNull', true)
+//   ));
+//   var medianImage = newImg.rename(BAND_NAME + '_median')
+//                             // cast it to same type as EVI band
+//                             .double()
+//                             .set(time);
+//   return image.select(BAND_NAME)
+//               .addBands(medianImage);
+// });
+
+// //var s2withMedian = s2withMedian.filter(ee.Filter.eq('isNull', false));
+
+
+// print('S2 Collection with median ' + BAND_NAME + ' property', s2withMedian);
+
+
+// Define a function to add year and constant bands
+var addVariables = function(image) {
+  // Compute time in fractional years since the epoch.
+  var date = ee.Date(image.get('system:time_start'));
+  var years = date.difference(ee.Date('1970-01-01'), 'year');
+  // Return the image with the added bands.
+  return image
+    // Add a time band.
+    .addBands(ee.Image(years).rename('t'))
+    .float()
+    // Add a constant band.
+    .addBands(ee.Image.constant(1).rename('constant'));
+};
+
+// map over collection
+var s2withConstants = clipped.map(addVariables);
+print('S2 Collection with year and constant band', s2withConstants);
+
+// List of the independent variable names
+var independents = ee.List(['constant', 't']);
+
+// Name of the dependent variable.
+var dependent = ee.String(BAND_NAME);
+
+// Compute a linear trend. This will have two bands: 'residuals' and 
+// a 2x1 band called coefficients (columns are for dependent variables).
+var trend = s2withConstants.select(independents.add(dependent))
+    .reduce(ee.Reducer.linearRegression(independents.length(), 1));
+// Map.addLayer(trend, {}, 'trend array image');
+
+// Flatten the coefficients into a 2-band image
+var coefficients = trend.select('coefficients')
+  .arrayProject([0])
+  .arrayFlatten([independents]);
+
+// The coefficients image is a two band image in which each pixel contains values for β0 and β1.   
+// Use the model to "detrend" the original EVI time series:
+
+// Compute a de-trended series.
+var detrended = s2withConstants.map(function(image) {
+  return image.select(dependent).subtract(
+          image.select(independents).multiply(coefficients).reduce('sum'))
+          .rename(dependent)
+          .copyProperties(image, ['system:time_start']);
+});
+
+print('Detrended EVI collection', detrended);
+
+// Plot the detrended results.
+var detrendedChart = ui.Chart.image.seriesByRegion({
+    imageCollection: detrended, 
+    regions: AOI, 
+    reducer: ee.Reducer.median(),
+    band: BAND_NAME,
+    scale: 30,
+    bestEffort: true
+    })
+    .setOptions({
+      title: 'Detrended Sentinel-2 ' + BAND_NAME + ' time series at AOI',
+      vAxis: {title: 'S2 ' + BAND_NAME + ' index values'},
+      lineWidth: 1,
+      pointSize: 3,
+    });
+print(detrendedChart);
+
+
+// Estimate seasonality with a harmonic model
+// Consider the following linear model, where et is a random error, A is amplitude, ω is frequency, and φ is phase:
+// pt = β0 + β1t + Acos(2πωt - φ) + et 
+//    = β0 + β1t + β2cos(2πωt) + β3sin(2πωt) + et
+// Note that β2 = Acos(φ) and β3 = Asin(φ), implying A = (β22 + β32)½ and φ = atan(β3/β2).  (See Shumway and Stoffer (2017) equations 4.1 - 4.2).  
+// To fit this model to the time series, set ω=1 (one cycle per unit time) and use ordinary least squares regression.
+// The setup for fitting the model is to first add the harmonic variables (the third and fourth terms of equation 2) to the image collection.
+	
+
+// Use these independent variables in the harmonic regression.
+var harmonicIndependents = ee.List(['constant', 't', 'cos', 'sin']);
+
+// Add harmonic terms as new image bands.
+var harmonicS2 = s2withConstants.map(function(image) {
+  var timeRadians = image.select('t').multiply(2 * Math.PI);
+  return image
+    .addBands(timeRadians.cos().rename('cos'))
+    .addBands(timeRadians.sin().rename('sin'));
+});
+
+// Fit the model as with the linear trend, using the linearRegression() reducer:
+
+var harmonicTrend = harmonicS2
+  .select(harmonicIndependents.add(dependent))
+  // The output of this reducer is a 4x1 array image.
+  .reduce(ee.Reducer.linearRegression({
+    numX: harmonicIndependents.length(), 
+    numY: 1
+  }));
+
+// Plug the coefficients in to equation 2 in order to get a time series of fitted values:
+
+// Turn the array image into a multi-band image of coefficients.
+var harmonicTrendCoefficients = harmonicTrend.select('coefficients')
+  .arrayProject([0])
+  .arrayFlatten([harmonicIndependents]);
+
+// Compute fitted values.
+var fittedHarmonic = harmonicS2.map(function(image) {
+  return image.addBands(
+    image.select(harmonicIndependents)
+      .multiply(harmonicTrendCoefficients)
+      .reduce('sum')
+      .rename('fitted'));
+});
+
+// Plot the fitted model and the original data at the AOI.
+print(ui.Chart.image.series(
+fittedHarmonic.select(['fitted',BAND_NAME]), AOI, ee.Reducer.mean(), 30)
+    .setSeriesNames([BAND_NAME, 'fitted'])
+    .setOptions({
+      title: 'Harmonic model: original and fitted values',
+      lineWidth: 1,
+      pointSize: 3,
+}));
+
+
+// Although any coefficients can be mapped directly, it is useful and interesting to map the phase and amplitude of 
+// the estimated harmonic model.  First, compute phase and amplitude from the coefficients, then map:
+
+// Compute phase and amplitude.
+var phase = harmonicTrendCoefficients.select('sin')
+    .atan2(harmonicTrendCoefficients.select('cos'))
+    // Scale to [0, 1] from radians.
+    .unitScale(-Math.PI, Math.PI);
+    
+var amplitude = harmonicTrendCoefficients.select('sin')
+    .hypot(harmonicTrendCoefficients.select('cos'))
+    // Add a scale factor for visualization.
+    .multiply(5);
+
+// Compute the median EVI.
+var meanEVI= s2withConstants.select(BAND_NAME).median();
+
+// Use the HSV to RGB transform to display phase and amplitude.
+var rgb = ee.Image.cat([
+  phase,      // hue
+  amplitude,  // saturation (difference from white)
+  meanEVI    // value (difference from black)
+]).hsvToRgb();
+
+Map.centerObject(AOI, 11);
+Map.addLayer(S2Sr.first(), {"opacity":1,"bands":["B4","B3","B2"],"max":3000,"gamma":1}, 'selected S2 Image', false);
+Map.addLayer(S2masked.first(), {"opacity":1,"bands":["EVI"],"gamma":1}, 'selected S2 Masked Image');
+Map.addLayer(rgb, {}, 'RGB: phase (hue), amplitude (sat), EVI value');
+Map.addLayer(AOI, {color: 'red'}, 'forest plot locations');  
+
+var projection = S2Sr.first().select('B2').projection().getInfo();
+
+Export.image.toDrive({
+  image: rgb,
+  description: 'mapped_harmonic_model_coeff2',
+  crs: projection.crs,
+  crsTransform: projection.transform,
+  region: PARK
+});

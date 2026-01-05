@@ -1,0 +1,154 @@
+///////////////////////////////////////////////////////
+//// PART ONE: IMPORTS AND PARAMETER DEFINITIONS   ////
+///////////////////////////////////////////////////////
+
+// Import helper scripts
+var helpers = require('users/brbell01/AF_Phenology:Helpers');
+var constants = require('users/brbell01/AF_Phenology:Constants');
+
+// Geometry Imports
+var MataEscura_Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/1_MataEscura_Hectares1"),
+    MontePascoal_Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/2_MontePascoal_Hectares1"),
+    RioDoce_Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/3_RioDoce_Hectares1"),
+    Sooretama_Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/4_Sooretama_Hectares1"),
+    REBIO_Sooretama = ee.FeatureCollection("projects/af-phenology/assets/Parks/REBIO_Sooretama"),
+    PNH_Monte_Pascoal = ee.FeatureCollection("projects/af-phenology/assets/Parks/PNH_Monte_Pascoal"),
+    REBIO_Mata_Escura = ee.FeatureCollection("projects/af-phenology/assets/Parks/REBIO_Mata_Escura"),
+    PE_Rio_Doce = ee.FeatureCollection("projects/af-phenology/assets/Parks/PE_Rio_Doce");
+
+// Image and feature collection imports
+var S2 = ee.ImageCollection("COPERNICUS/S2"),  // S2 L1C for Cloud Displacement Index (CDI) bands.
+    S2c = ee.ImageCollection('COPERNICUS/S2_CLOUD_PROBABILITY'),
+    S2Sr = ee.ImageCollection('COPERNICUS/S2_SR');
+
+// Set study area and sampling plots
+var AREA_NAME =  'PE Rio Doce, MG', // 'REBIO Sooretama, ES' , 'PE Rio Doce, MG'
+    FILE_NAME = 'rio_doce', // 'mata_escura', // 'monte_pascoal' , 'sooretama'
+    START_DATE = '2016-01-01', 
+    END_DATE ='2022-01-01', 
+    Hectares = RioDoce_Hectares,
+    Park = PE_Rio_Doce,
+    AOI = Hectares.geometry(),
+    REDUCING_SCALE = 100;  // to cut down on processing time
+
+///////////////////////////////////////////////////////
+//// PART TWO: BUILD THE SENTINAL-2 COLLECTION     ////
+///////////////////////////////////////////////////////
+    
+// S2 L1C for Cloud Displacement Index (CDI) bands.
+S2 = S2.filterDate(START_DATE, END_DATE).filterBounds(AOI);
+// S2Cloudless for the cloud probability band.
+S2c = S2c.filterDate(START_DATE, END_DATE).filterBounds(AOI);
+// S2 L2A for surface reflectance bands.
+S2Sr = S2Sr.filterDate(START_DATE, END_DATE).filterBounds(AOI);
+
+// print('Input S2 TOA Collection', S2);
+// print('Input S2 Cloud Probability Collection', S2c);
+// print('Input S2 Surface Reflectance Collection', S2Sr);
+
+// Join the cloud probability dataset to surface reflectance.
+var withCloudProbability = helpers.indexJoin(S2Sr, S2c, 'cloud_probability');
+// Join the L1C data to get the bands needed for CDI.
+var withS2L1C = helpers.indexJoin(withCloudProbability, S2, 'l1c');
+// Map the cloud masking function over the joined collection.
+var S2masked = ee.ImageCollection(withS2L1C.map(helpers.maskImage))
+// Add vegetation indices             
+              .map(helpers.S2AddIndices2);
+
+
+//// Functions
+var generateIndexChart = function(indexName, imageCollection, featureCollection) {
+
+  // // Function to calculate median index within the given geometry
+  function medianIndex(image, geometry) {
+    var stats = image.reduceRegion({
+      reducer: ee.Reducer.median(),
+      geometry: geometry,
+      scale: REDUCING_SCALE,
+      bestEffort: true
+    });
+    
+    return stats.get(indexName);
+  }
+  // // Function to calculate standard deviation of index within the given geometry
+  function sdIndex(image, geometry) {
+    var stats = image.reduceRegion({
+      reducer: ee.Reducer.stdDev(),
+      geometry: geometry,
+      scale: REDUCING_SCALE, 
+      bestEffort: true
+    });
+    
+    return stats.get(indexName);
+  }
+
+  //function to get the median of a band over a month in a supplied region
+  function getMedianIndex(feature, imageCollection) {
+    // filter by bounds
+    var filtered = imageCollection.filterBounds(feature.geometry());
+    
+    var medians = filtered.toList(1000).map(function (image) {
+      image = ee.Image(image)
+      var median = medianIndex(image, feature.geometry());
+      var sd = sdIndex(image, feature.geometry());
+      var date = image.date()
+      return ee.List([date.format('y-M-d'), median, sd])
+    })
+    .filter(ee.Filter.listContains('item', null).not())
+    
+    var propertyKey = indexName
+    return feature.set(propertyKey, medians)
+  }
+  
+  var meanIndices = featureCollection.map(function(feature) { 
+        return getMedianIndex(feature, imageCollection); 
+        })
+        
+  return meanIndices
+}
+
+// Create daily mosaics for overlapping tiles acquired in the same
+// day...
+// Difference in days between start and finish
+var diff = ee.Date(END_DATE).difference(ee.Date(START_DATE), 'day')
+
+// Make a list of all dates
+var range = ee.List.sequence(0, diff.subtract(1)).map(function(day){return ee.Date(START_DATE).advance(day,'day')})
+
+// Function for iteration over the range of dates
+var day_mosaics = function(date, newlist) {
+  // Cast
+  date = ee.Date(date)
+  newlist = ee.List(newlist)
+
+  // Filter collection between date and the next day
+  var filtered = S2masked.filterDate(date, date.advance(1,'day'))
+
+  // Make the mosaic
+  var image = ee.Image(filtered.mosaic())
+                .copyProperties(filtered.first(), ['system:time_start'])
+
+  // Add the mosaic to a list only if the collection has images
+  return ee.List(ee.Algorithms.If(filtered.size(), newlist.add(image), newlist))
+}
+
+// Iterate over the range to make a new list, and then cast the list to an imagecollection
+var S2mosaic = ee.ImageCollection(ee.List(range.iterate(day_mosaics, ee.List([]))))
+
+var hect_table = generateIndexChart(constants.EVI2_NAME, S2mosaic, Hectares);
+    hect_table = generateIndexChart(constants.EVI_NAME, S2mosaic, hect_table);
+    hect_table = generateIndexChart(constants.NDVI_NAME, S2mosaic, hect_table);
+    
+
+//print(hect_table)
+
+var year = ee.String(START_DATE).slice(0,4)
+var year1 = ee.String(END_DATE).slice(0,4)
+
+Export.table.toDrive({
+  collection: hect_table,
+  description: FILE_NAME + '_s2_1ha_' + year.getInfo() + '_' + year1.getInfo(),
+  folder: 'phenology',
+  fileFormat: 'GeoJSON',
+  selectors: ['Hectare_ID', constants.EVI2_NAME, constants.EVI_NAME, constants.NDVI_NAME]
+});

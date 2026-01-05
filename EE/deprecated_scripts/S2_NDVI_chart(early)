@@ -1,0 +1,165 @@
+/**** Start of imports. If edited, may not auto-convert in the playground. ****/
+var table = ee.FeatureCollection("projects/af-phenology/assets/Hectares/4_Sooretama_Hectares");
+/***** End of imports. If edited, may not auto-convert in the playground. *****/
+
+var SENTINEL_2 = ee.ImageCollection("COPERNICUS/S2");
+    
+//var sooretama = ee.FeatureCollection("projects/af-phenology/assets/Parks/REBIO_Sooretama");
+var sooretama = ee.FeatureCollection("projects/af-phenology/assets/Hectares/4_Sooretama_Hectares");
+ 
+// Constants
+var NDVI_NAME = 'ndvi';
+var S2_RED_BAND = 'B4';
+var S2_NIR_BAND = 'B8';
+
+var START_DATE = '2015-01-01';
+var END_DATE = '2020-12-31';
+
+/*
+ Set up
+*/
+
+// Display Region on map
+var sooretama_geometry = sooretama.geometry();
+Map.centerObject(sooretama_geometry, 12)
+Map.addLayer(sooretama_geometry, {}, "sooretama")
+
+// Add a Metadata filter to select images with minimal clouds
+var filteredS2 = SENTINEL_2.filterDate(START_DATE, END_DATE)
+.filterBounds(sooretama_geometry)
+.filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 80));
+
+
+/*
+  Helpers
+*/
+
+// Write a function that computes NDVI for an image and adds it as a band
+function addNDVI(image) {
+  var ndvi = image.normalizedDifference([S2_NIR_BAND, S2_RED_BAND]).rename(NDVI_NAME);
+  return image.addBands(ndvi);
+}
+
+// Function to calculate average NDVI within the given geometry
+function meanNDVI(image, geometry) {
+  var stats = image.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: geometry,
+    scale: 30
+  });
+  return stats.get(NDVI_NAME);
+}
+
+// Function to select all images for the given month and compute a mean composite
+function monthNDVI(month, withNDVI, geometry) {
+  var monthImages = withNDVI.filter(
+    // Use calendarRange function to filter by month
+    ee.Filter.calendarRange({start: month, field: 'month'}));
+  // For simplicity, pick one image and compute mean NDVI
+  // You can also take all images and take the mean value of the stack
+  var mean = meanNDVI(ee.Image(monthImages.first()), geometry);
+  // Round it to 2 decimals
+  return ee.Number(mean);
+}
+
+function getNDVIByMonth(feature, imageCollection) {
+  // filter by bounds
+
+  var filtered = imageCollection.filterBounds(feature.geometry());
+
+  // List of months
+  var months = ee.List.sequence(1, 12);
+  // Map the function over the list
+  var NDVIs = months.map(function(month) { return monthNDVI(month, filtered, feature.geometry()); });
+  var monthNames = ee.List(["01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12"]);
+  var NDVIByMonth = ee.Dictionary.fromLists(monthNames, NDVIs);
+  
+  
+  var properties = feature.toDictionary().combine(NDVIByMonth);
+  
+  return ee.Feature(feature.geometry(), properties);
+}
+
+//Main
+var S2WithNDVI = filteredS2.map(addNDVI);
+var meanNDVIs = sooretama.map(function(feature) { return getNDVIByMonth(feature, S2WithNDVI); })
+var total = getNDVIByMonth(sooretama, S2WithNDVI);
+
+
+
+// Charts
+
+// Define a dictionary that associates property names with values and labels.
+var NDVIInfo = {
+  '01': {v: 1, f: 'Jan'},
+  '02': {v: 2, f: 'Feb'},
+  '03': {v: 3, f: 'Mar'},
+  '04': {v: 4, f: 'Apr'},
+  '05': {v: 5, f: 'May'},
+  '06': {v: 6, f: 'Jun'},
+  '07': {v: 7, f: 'Jul'},
+  '08': {v: 8, f: 'Aug'},
+  '09': {v: 9, f: 'Sep'},
+  '10': {v: 10, f: 'Oct'},
+  '11': {v: 11, f: 'Nov'},
+  '12': {v: 12, f: 'Dec'}
+};
+
+// Organize property information into objects for defining x properties and
+// their tick labels.
+var xPropValDict = {};  // Dictionary to codify x-axis property names as values.
+var xPropLabels = [];   // Holds dictionaries that label codified x-axis values.
+for (var key in NDVIInfo) {
+  xPropValDict[key] = NDVIInfo[key].v;
+  xPropLabels.push(NDVIInfo[key]);
+}
+
+// Define the chart and print it to the console.
+var chart = ui.Chart.feature
+                .byProperty({
+                  features: meanNDVIs,
+                  xProperties: xPropValDict,
+                  seriesProperty: 'layer'
+                })
+                .setChartType('ColumnChart')
+                .setOptions({
+                  title: 'Average NDVI by Month',
+                  hAxis: {
+                    title: 'Month',
+                    titleTextStyle: {italic: false, bold: true},
+                    ticks: xPropLabels
+                  },
+                  vAxis: {
+                    title: 'NDVI',
+                    titleTextStyle: {italic: false, bold: true}
+                  },
+                  colors: ['604791', '1d6b99', '39a8a7', '0f8755', '76b349', 'f0af07', 'e37d05', 'cf513e', '96356f', '724173'],
+                });
+print(chart);
+
+// var chart =
+//     ui.Chart.feature
+//         .byFeature({
+//           features: meanNDVIs.select('[0-9][0-9]|layer'),
+//           xProperty: 'layer',
+//         })
+//         .setSeriesNames([
+//           'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct',
+//           'Nov', 'Dec'
+//         ])
+//         .setChartType('ColumnChart')
+//         .setOptions({
+//           title: 'Average NDVI Temperature by Study Site',
+//           hAxis:
+//               {title: 'Site', titleTextStyle: {italic: false, bold: true}},
+//           vAxis: {
+//             title: 'NDVI',
+//             titleTextStyle: {italic: false, bold: true}
+//           },
+//           colors: [
+//             '604791', '1d6b99', '39a8a7', '0f8755', '76b349', 'f0af07',
+//             'e37d05', 'cf513e', '96356f', '724173', '9c4f97', '696969'
+//           ]
+//         });
+// print(chart);
+

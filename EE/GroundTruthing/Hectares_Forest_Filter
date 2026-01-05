@@ -1,0 +1,56 @@
+/**** Start of imports. If edited, may not auto-convert in the playground. ****/
+var imageVisParam = {"opacity":1,"bands":["classification_2019"],"max":10,"gamma":1};
+/***** End of imports. If edited, may not auto-convert in the playground. *****/
+//Import Sampling 1-ha grid, study region, and forest cover assets
+    
+var HECTARES = ee.FeatureCollection("projects/af-phenology/assets/Hectares/1_MataEscura_Hectares1"),
+    PARK = ee.FeatureCollection("projects/af-phenology/assets/Parks/REBIO_Mata_Escura"),
+    lulc = ee.Image("projects/af-phenology/assets/Mapbiomas_MG_LULC_2019"),
+    gfc2020 = ee.Image('UMD/hansen/global_forest_change_2020_v1_8');
+
+var constants = require('users/brbell01/AF_Phenology:Constants');
+
+//Display Hanson forest cover
+var canopyCover = gfc2020.select(['treecover2000']);
+var canopyCover90 = canopyCover.gte(90).selfMask();
+var contArea = canopyCover90.connectedPixelCount(); // Use connectedPixelCount() to get contiguous area.
+var minArea = contArea.gte(9).selfMask(); // Apply the minimum area requirement.
+var prj = gfc2020.projection();
+var scale = prj.nominalScale();
+
+Map.addLayer(minArea.reproject(prj.atScale(scale)).clip(PARK), 
+  {palette: ['#96ED89']},
+  "Tree Cover (>90%) - Hanson")
+
+/* Display forest cover provided by Mapbiomas LULC classification 
+   source: https://github.com/mapbiomas-brazil/user-toolkit/mapbiomas-user-toolkit-lulc.js
+*/
+
+Map.addLayer(lulc,{min:0, max:10},
+  constants.FOREST_DATA_SOURCE
+  )
+
+// // Creates an image mask which filters out non-forest sites using MapBiomas Forest Cover
+
+// var lulcMask = function (image) {
+//   var forest = lulc.eq(3);
+//   return image.updateMask(forest);
+// }
+
+// // Mask out non-forest 1-hectare plots
+// var ForestHectares = HECTARES.map(lulcMask);
+
+//Overlay masked 1-hectare plots
+var empty = ee.Image().byte();
+var outline = empty.paint({
+  featureCollection: HECTARES,
+  color: 1,
+  width: 3
+}); 
+Map.addLayer(outline, {palette: '00FF00'}, 'Forest-only 1-hectare plots');
+
+
+Map.centerObject(PARK,11);
+Map.addLayer(PARK, {color : "green"}, 'Mata Escura', true, 0.3);
+
+

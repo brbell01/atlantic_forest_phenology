@@ -1,0 +1,131 @@
+/**** Start of imports. If edited, may not auto-convert in the playground. ****/
+var MATA_ESCURA_PARK_GRID = ee.FeatureCollection("projects/af-phenology/assets/Parks/Mata_Escura_park_grid"),
+    s2Clouds = ee.ImageCollection("COPERNICUS/S2_CLOUD_PROBABILITY"),
+    S2 = ee.ImageCollection("COPERNICUS/S2"),
+    MATA_ESCURA_PARK = ee.FeatureCollection("projects/af-phenology/assets/Parks/REBIO_Mata_Escura"),
+    S2_SR = ee.ImageCollection("COPERNICUS/S2_SR");
+/***** End of imports. If edited, may not auto-convert in the playground. *****/
+// imports
+
+var helpers = require('users/brbell01/AF_Phenology:Helpers');
+var constants = require('users/brbell01/AF_Phenology:Constants');
+
+var s2RGBVis = {min: 0, max: 3000, bands: ['B4', 'B3', 'B2']};
+var START_DATE = ee.Date('2015-01-01');
+var END_DATE = ee.Date('2022-01-01');
+var MAX_CLOUD_PROBABILITY = 30;
+
+Map.centerObject(MATA_ESCURA_PARK,11);
+Map.addLayer(MATA_ESCURA_PARK, {color : "yellow"}, 'Mata Escura', null, 0.3);
+
+// Filter input collections by desired data range and region.
+var filter = ee.Filter.and(
+    ee.Filter.bounds(MATA_ESCURA_PARK.geometry()), 
+    ee.Filter.date(START_DATE, END_DATE));
+    
+S2 = S2.filter(filter)
+    .map(helpers.S2AddIndeces);
+    
+//How many images in the period 2015-2017 which still need to be processed by GEE?
+
+S2_SR = S2_SR.filter(filter)
+    .map(helpers.S2AddIndeces);
+
+print(S2)
+print(S2_SR)
+
+// Join S2 SR with cloud probability dataset to add cloud mask.
+var s2WithCloudProperty = helpers.s2AddCloudProbability(S2, s2Clouds, filter);
+var s2CloudFiltered = s2WithCloudProperty.filterMetadata('CLOUDY_PIXEL_PERCENTAGE', 'less_than', MAX_CLOUD_PROBABILITY);
+var s2CloudMasked = helpers.s2MaskClouds(s2WithCloudProperty, MAX_CLOUD_PROBABILITY);
+
+///////////////////////////////
+// Example Images
+// Map.addLayer(
+//     S2.first(), rgbVis, 'Example S2 image',
+//     true);
+// Map.addLayer(
+//     s2CloudMasked.first(), rgbVis, 'Example S2 masked at ' + MAX_CLOUD_PROBABILITY + '%',
+//     true);
+////////////////////////////////////
+
+/////////////////////////////////////
+// Animated Gif
+// var animatedURL = helpers.animatedImageURL(['B4', 'B3', 'B2'], S2, MATA_ESCURA_PARK, '2020-01-01', '2021-01-01');
+// print(animatedURL);
+
+// var maskedAnimatedURL = helpers.animatedImageURL(['B4', 'B3', 'B2'], s2CloudMasked, MATA_ESCURA_PARK, '2020-01-01', '2021-01-01');
+// print(maskedAnimatedURL);
+//////////////////////////////////
+
+// adapted from https://gis.stackexchange.com/questions/363682/counting-number-of-unmasked-pixels-per-image-in-collection-using-google-earth-en
+function get_cloud_cover_roi(image, region, bandname){
+
+  var pixelscount = image.select(bandname).reduceRegion({
+    reducer: ee.Reducer.count(),
+    geometry: region.geometry(),
+    scale: 10,
+    maxPixels: 1e9
+  }).get(bandname)
+
+  var npix = image.unmask().select(bandname).reduceRegion({
+    reducer: ee.Reducer.count(),
+    geometry: region.geometry(),
+    scale: 10,
+    maxPixels: 1e9
+  }).get(bandname)
+
+  var cloud_cover_roi = ee.Number(1)
+      .subtract(ee.Number(pixelscount).divide(npix))
+      .multiply(100)
+
+  return image.set('cloud_cover_roi', cloud_cover_roi)
+}
+
+var season_names = ee.List(['Jan-Mar', 'Apr-Jun', 'Jul-Sep', 'Oct-Dec']);
+var season_start_indeces = ee.List.sequence(1, 10, 3);
+
+var S2_Park = S2.filterBounds(MATA_ESCURA_PARK_GRID.first().geometry());
+var S2_Park_Filtered = s2CloudFiltered.filterBounds(MATA_ESCURA_PARK_GRID.first().geometry());
+var numberOfImagesUnfiltered = helpers.numberOfImagesPerSeason(S2_Park, season_names, season_start_indeces, START_DATE, END_DATE);
+
+var notFilteredChart = ui.Chart.array.values(numberOfImagesUnfiltered, 0, season_names)
+.setChartType('ColumnChart')
+  .setOptions({
+    title: "Number of images per season in Mata Escura",
+    hAxis: {
+      title: 'Season',
+    },
+    vAxis: {title: 'Number of images',
+      viewWindowMode:'explicit',
+              viewWindow:{
+                max:100,
+                min:0
+              }
+    },
+    legend: {position: 'none'}
+  });
+print(notFilteredChart);
+
+var numberOfImagesFiltered = helpers.numberOfImagesPerSeason(S2_Park_Filtered, season_names, season_start_indeces, START_DATE, END_DATE);
+
+var filteredChart = ui.Chart.array.values(numberOfImagesFiltered, 0, season_names)
+.setChartType('ColumnChart')
+  .setOptions({
+    title: "Number of images per season in Mata Escura (<60 cloud coverage)",
+    colors: ['blue'],
+    hAxis: {
+      title: 'Season',
+    },
+    vAxis: {
+      title: 'Number of images',
+      colors: ['blue'],
+      viewWindowMode:'explicit',
+              viewWindow:{
+                max:100,
+                min:0
+              }
+    },
+    legend: {position: 'none'}
+  });
+print(filteredChart);

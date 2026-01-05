@@ -1,0 +1,26 @@
+/**** Start of imports. If edited, may not auto-convert in the playground. ****/
+var geometry = ee.FeatureCollection("projects/af-phenology/assets/1_MataEscura_Hectares");
+/***** End of imports. If edited, may not auto-convert in the playground. *****/
+var gedi_test = ee. ImageCollection('LARSE/GEDI/GEDI02_A_002_MONTHLY');
+
+var gedi_clean = gedi_test.map(function(img){
+  var int = img.select (['beam', 'degrade_flag', 'quality_flag']).toInt();
+  var float = img. select (['rh.*']);
+return int.addBands(float);
+});
+
+var gedi_AF = gedi_clean.filterBounds(geometry);
+Map.centerObject(geometry, 12);
+print(gedi_AF);
+
+Map.addLayer(gedi_clean.select('rh98'), {palette: 'red'}, 'all data');
+
+var qa = gedi_clean.map(function(img){
+  var quality = img.select(['quality_flag']).eq(1);
+  var degrade = img.select(['degrade_flag']).eq(0);
+return img.mask(quality).updateMask(degrade);
+});
+
+Map.addLayer(qa.select('rh98'), {palette: 'cyan'}, 'qa passed');
+
+

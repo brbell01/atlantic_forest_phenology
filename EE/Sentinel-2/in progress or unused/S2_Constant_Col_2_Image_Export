@@ -1,0 +1,268 @@
+// Linear modeling of time for Sentinel-2 time series
+// Estimate linear trend over time using pt = β0 + β1t + et, where e is a random error.
+// Reference: https://docs.google.com/document/d/1mNIRB90jwLuASO1JYas1kuOXCLbOoy1Z4NlV1qIXM10/edit#
+
+///////////////////////////////////////////////////////
+//// PART ONE: IMPORTS AND PARAMETER DEFINITIONS   ////
+///////////////////////////////////////////////////////
+
+
+// Geometry Imports
+var MataEscura_Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/1_MataEscura_Hectares1"),
+    MontePascoal_Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/2_MontePascoal_Hectares1"),
+    RioDoce_Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/3_RioDoce_Hectares1"),
+    Sooretama_Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/4_Sooretama_Hectares1"),
+    REBIO_Sooretama = ee.FeatureCollection("projects/af-phenology/assets/Parks/REBIO_Sooretama"),
+    PNH_Monte_Pascoal = ee.FeatureCollection("projects/af-phenology/assets/Parks/PNH_Monte_Pascoal"),
+    REBIO_Mata_Escura = ee.FeatureCollection("projects/af-phenology/assets/Parks/REBIO_Mata_Escura"),
+    PE_Rio_Doce = ee.FeatureCollection("projects/af-phenology/assets/Parks/PE_Rio_Doce");
+
+// Image and feature collection imports
+var S2 = ee.ImageCollection("COPERNICUS/S2"),  // S2 L1C for Cloud Displacement Index (CDI) bands.
+    S2c = ee.ImageCollection('COPERNICUS/S2_CLOUD_PROBABILITY'),
+    S2Sr = ee.ImageCollection('COPERNICUS/S2_SR');
+
+// Set study area and sampling plots
+var AREA_NAME = 'REBIO Mata Escura, MG', // 'REBIO Sooretama, ES' , 'PE Rio Doce, MG', 'PNH Monte Pascoal, BA'
+    FILE_NAME = 'mata_escura', // 'mata_escura', // 'monte_pascoal' , 'sooretama', 'rio_doce'
+    BAND_NAME = 'EVI2',  // 'NDVI' , 'EVI2'
+    START_DATE = '2019-01-01', 
+    END_DATE ='2022-01-01', 
+    Hectares = MataEscura_Hectares,
+    Park = REBIO_Mata_Escura,
+    AOI = Hectares.geometry(),
+    REDUCING_SCALE = 100;  // to cut down on processing time
+
+///////////////////////////////////////////////////////
+//// PART TWO: BUILD THE SENTINAL-2 COLLECTION     ////
+///////////////////////////////////////////////////////
+    
+// S2 L1C for Cloud Displacement Index (CDI) bands.
+S2 = S2.filterDate(START_DATE, END_DATE).filterBounds(AOI);
+// S2Cloudless for the cloud probability band.
+S2c = S2c.filterDate(START_DATE, END_DATE).filterBounds(AOI);
+// S2 L2A for surface reflectance bands.
+S2Sr = S2Sr.filterDate(START_DATE, END_DATE).filterBounds(AOI);
+
+var S2Sr_1 = S2Sr.first();
+
+// print('Input S2 TOA Collection', S2);
+// print('Input S2 Cloud Probability Collection', S2c);
+// print('Input S2 Surface Reflectance Collection', S2Sr);
+
+// Join the cloud probability dataset to surface reflectance.
+var indexJoin = function (collectionA, collectionB, propertyName) {
+    var joined = ee.ImageCollection(ee.Join.saveFirst(propertyName).apply({
+      primary: collectionA,
+      secondary: collectionB,
+      condition: ee.Filter.equals({
+        leftField: 'system:index',
+        rightField: 'system:index'})
+    }));
+    // Merge the bands of the joined image.
+    return joined.map(function(image) {
+      return image.addBands(ee.Image(image.get(propertyName)));
+    });
+  };
+var withCloudProbability = indexJoin(S2Sr, S2c, 'cloud_probability');
+
+// Join the L1C data to get the bands needed for CDI.
+var withS2L1C = indexJoin(withCloudProbability, S2, 'l1c');
+
+
+
+// Create a mask using for clouds and shadows using the cloud displacement index (CDI)
+var maskImage = function(image) {
+    // Compute the cloud displacement index from the L1C bands.
+    var cdi = ee.Algorithms.Sentinel2.CDI(image);
+    var S2c = image.select('probability');
+    var cirrus = image.select('B10').multiply(0.0001);
+  
+    /* Assume low-to-mid atmospheric clouds to be pixels where probability
+    // is greater than 60%, and CDI is less than -0.1. For higher atmosphere
+    // cirrus clouds, assume the cirrus band is greater than 0.01.
+    // The final cloud mask is one or both of these conditions.
+    */
+    var isCloud = S2c.gt(60).and(cdi.lt(-0.1)).or(cirrus.gt(0.01));
+  
+    // Reproject is required to perform spatial operations at 40m scale.
+    // 40m scale is for speed, and assumes clouds don't require 10m precision.
+    isCloud = isCloud.focal_min(3).focal_max(16);
+    isCloud = isCloud.reproject({crs: cdi.projection(), scale: 40});
+  
+    // Project shadows from clouds we found in the last step. This assumes we're working in
+    // a UTM projection.
+    var shadowAzimuth = ee.Number(90)
+        .subtract(ee.Number(image.get('MEAN_SOLAR_AZIMUTH_ANGLE')));
+  
+    // With the following reproject, the shadows are projected 0.5km.
+    isCloud = isCloud.directionalDistanceTransform(shadowAzimuth, 5);
+    isCloud = isCloud.reproject({crs: cdi.projection(), scale: 100});
+  
+    isCloud = isCloud.select('distance').mask();
+    return image.updateMask(isCloud.not());
+  }
+
+// Map the cloud/shadow masking function over the joined collection.
+var S2masked = ee.ImageCollection(withS2L1C.map(maskImage))
+
+// Add vegetation indices 
+
+var S2addNDVI = function (image) {
+  var ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  return image.addBands(ndvi);
+}
+
+var S2addEVI = function (image) {
+  var EVI = image.expression(
+      '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))', {
+      'NIR' : image.select('B8').divide(10000),
+      'RED' : image.select('B4').divide(10000),
+      'BLUE': image.select('B2').divide(10000)}).rename('EVI');
+  return image.addBands(EVI);
+};
+
+var S2addEVI2 = function (image) {
+  var EVI2 = image.expression(
+      '2.4 * ((NIR - RED) / (NIR + RED + 1))', {
+      'NIR' : image.select('B8').divide(10000),
+      'RED' : image.select('B4').divide(10000),
+      'BLUE': image.select('B2').divide(10000)}).rename('EVI2');
+  return image.addBands(EVI2);
+};
+
+var S2AddIndices = function (image) {
+    return S2addNDVI(S2addEVI(image));
+  }
+  
+var S2AddIndices2 = function (image) {
+    return S2addNDVI(S2addEVI(S2addEVI2(image)));
+  }
+
+S2masked = S2masked.map(S2AddIndices2);
+
+print('Masked S2 Collection', S2masked)
+
+// Create daily mosaics for overlapping tiles acquired in the same
+// day...
+
+// Difference in days between start and finish
+var diff = ee.Date(END_DATE).difference(ee.Date(START_DATE), 'day')
+
+// Make a list of all dates
+var range = ee.List.sequence(0, diff.subtract(1)).map(function(day){return ee.Date(START_DATE).advance(day,'day')})
+
+// Function for iteration over the range of dates
+var day_mosaics = function(date, newlist) {
+  // Cast
+  date = ee.Date(date)
+  newlist = ee.List(newlist)
+
+  // Filter collection between date and the next day
+  var filtered = S2masked.filterDate(date, date.advance(1,'day'))
+
+  // Make the mosaic
+  var image = ee.Image(filtered.mosaic())
+                .copyProperties(filtered.first(), ['system:time_start'])
+
+  // Add the mosaic to a list only if the collection has images
+  return ee.List(ee.Algorithms.If(filtered.size(), newlist.add(image), newlist))
+}
+
+// Iterate over the range to make a new list, and then cast the list to an imagecollection
+var S2mosaic = ee.ImageCollection(ee.List(range.iterate(day_mosaics, ee.List([]))))
+
+print('Masked / Mosaicked S2 Collection', S2mosaic);
+
+// Function to create constant images median and st. dev as bands
+var generateIndexCollection = function (indexName, imageCollection, fc) {
+  
+  //input can be feature or feature collection
+  var feature = ee.Feature(fc);
+  
+  // // Function to calculate median index on an image within the geometry
+  function medianIndex(image, geometry) {
+    var stats = image.reduceRegion({
+      reducer: ee.Reducer.median(),
+      geometry: geometry,
+      scale: REDUCING_SCALE,
+      maxPixels:1e10
+    });
+    
+      // set the veg index to -999 for null values
+    stats = ee.List([stats.get(indexName), -999])
+    .reduce(ee.Reducer.firstNonNull())
+
+    return stats;
+  }
+  // Function to calculate standard deviation of index on an image within the geometry
+  function sdIndex(image, geometry) {
+    var stats = image.reduceRegion({
+      reducer: ee.Reducer.stdDev(),
+      geometry: geometry,
+      scale: REDUCING_SCALE, 
+      maxPixels: 1e10
+    });
+    
+    // set the veg index to -999 for null values
+    stats = ee.List([stats.get(indexName), -999])
+          .reduce(ee.Reducer.firstNonNull())
+
+    return stats;
+  }
+  // return a dictionary of the plot median and stdevs
+  // for each image in the image collection 
+  return imageCollection.map(function (image) {
+      var time = image.get('system:time_start');
+      var median = ee.Number(medianIndex(image, feature.geometry()));
+      var median_image = ee.Image(median).double();
+      var sd = ee.Number(sdIndex(image, feature.geometry()));
+      var sd_image = ee.Image(sd).double();
+      return ee.ImageCollection.fromImages([median_image, sd_image])
+                     .toBands().set({time:time});
+    });
+};
+
+// Create the two band constant image collection
+var S2constantCol = generateIndexCollection(BAND_NAME, S2mosaic, AOI);
+
+// Rename the bands in the collection
+S2constantCol = S2constantCol.map(function (image) {
+            var b1 = image.select("0_constant").rename(BAND_NAME + '_median');
+            var b2 = image.select("1_constant").rename(BAND_NAME + '_sd');
+            return ee.Image.cat(b1, b2);
+});
+
+//filter out the null values
+S2constantCol = S2constantCol.filter(ee.Filter.neq('median_' + BAND_NAME, -999));
+
+S2constantCol = S2constantCol.map(function (image){
+                    var mask = image.select(BAND_NAME + '_median').gte(0);
+                    return image.mask(mask);
+                });
+
+// Clip the image collection to the plot boundaries
+S2constantCol = S2constantCol.map(function(image){return image.clip(Park)});
+
+// Select only one band for export for each image
+
+S2constantCol = S2constantCol.map(function(image){return image.select(BAND_NAME + '_median')})
+
+// Export Constant Image Collection as a MultiBand Image.
+var S2_ContantCol_IMG = S2constantCol.toBands(); 
+var projection = S2Sr_1.select(1).projection().getInfo();
+
+Export.image.toAsset({
+  image: S2_ContantCol_IMG,
+  description: FILE_NAME + '_S2_Median_Image_Collection_' + BAND_NAME,
+  region: Park,
+  scale: 100,
+  crs: projection.crs,
+  maxPixels: 1e13
+});
+
+
+
+
+
+

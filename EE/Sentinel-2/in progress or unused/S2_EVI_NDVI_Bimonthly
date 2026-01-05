@@ -1,0 +1,264 @@
+// imports
+var s2Clouds = ee.ImageCollection("COPERNICUS/S2_CLOUD_PROBABILITY"),
+    S2 = ee.ImageCollection("COPERNICUS/S2_SR"),
+    Park = ee.FeatureCollection("projects/af-phenology/assets/Parks/REBIO_Mata_Escura"),
+    Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/1_MataEscura_Hectares1");
+
+
+var helpers = require('users/brbell01/AF_Phenology:Helpers');
+var constants = require('users/brbell01/AF_Phenology:Constants');
+
+// Constants
+var AREA_NAME = 'Mata Escura';
+
+var START_DATE = constants.STUDY_START_DATE;
+var END_DATE = constants.STUDY_END_DATE;
+var START_YEAR = ee.Date(START_DATE).get('year');
+var END_YEAR = ee.Date(END_DATE).advance(-1, 'year').get('year');
+var MAX_CLOUD_PROBABILITY = 60;
+
+var YEARS = ee.List.sequence(START_YEAR, END_YEAR);
+
+var bimonthlyEVIKey = 'bimonthly_EVI';
+var bimonthlyNDVIKey = 'bimonthly_NDVI';
+
+
+//////////////////////////////////////////////////////////////////////////
+//////////
+//Main
+/////////
+//////////////////////////////////////////////////////////////////////////
+
+// Filter by study dates and park bounds
+var filter = ee.Filter.and(
+    ee.Filter.bounds(Park.geometry()), 
+    ee.Filter.date(START_DATE, END_DATE));
+    
+S2 = S2.filter(filter)
+    .map(helpers.S2AddIndices)
+    // .map(function (image) { return image.select(constants.EVI_NAME, constants.NDVI_NAME)});
+
+// Join S2 SR with cloud probability dataset to add cloud mask.
+var s2WithCloudProperty = helpers.s2AddCloudProbability(S2, s2Clouds, filter);
+var s2CloudFiltered = s2WithCloudProperty.filterMetadata('CLOUDY_PIXEL_PERCENTAGE', 'less_than', MAX_CLOUD_PROBABILITY);
+var s2CloudMasked = helpers.s2MaskClouds(s2WithCloudProperty, MAX_CLOUD_PROBABILITY);
+
+//// TODOs
+// Create Bimonthly-index dictyionaries, set them
+// for each year add on to it
+
+// array of xprop values
+//create array of evi value, creating an empty entry if theres no value
+
+  var MONTHS = ee.List.sequence(1, 12);
+  var YEARS = ee.List.sequence(START_YEAR, END_YEAR);
+
+// // Function to calculate average index within the given geometry
+  function meanIndex(image, geometry) {
+    // return ee.Dictionary();
+    var stats = image.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: geometry,
+      scale: 10,
+      tileScale: 16
+    });
+    return stats;
+  }
+  
+  // Function to select all images for the given month in a year and compute two mean composites
+  function monthIndex(year, month, imageCollection) {
+    var list = ee.List([]);
+    var monthImages = imageCollection.filter(
+      ee.Filter.calendarRange({start: year, field: 'year'})
+      )
+      .filter(
+      ee.Filter.calendarRange({start: month, field: 'month'})
+      );
+      
+    var firstOfMonthImages = monthImages.filter(
+      ee.Filter.calendarRange({start: 1, end: 15, field: 'day_of_month'})
+      );
+      
+    var endOfMonthImages = monthImages.filter(
+      ee.Filter.calendarRange({start: 15, end: 31, field: 'day_of_month'})
+      );
+    year = ee.Number(year).format('%d');
+    month = ee.Number(month).format('%02d');
+    
+    var meanImage_1 = firstOfMonthImages.reduce(ee.Reducer.median());
+    var name_1 = year.cat('-').cat(month).cat('-01');
+
+    var meanImage_2 = endOfMonthImages.reduce(ee.Reducer.median());
+    var name_2 = year.cat('-').cat(month).cat('-15');
+
+    meanImage_1 = meanImage_1.set('date_range', name_1);
+    list = ee.Algorithms.If(meanImage_1.bandNames().size().gt(0), 
+    ee.List(list).add(meanImage_1), 
+    list);
+    meanImage_2 = meanImage_2.set('date_range', name_2);
+    list = ee.Algorithms.If(meanImage_2.bandNames().size().gt(0), 
+    ee.List(list).add(meanImage_2), 
+    list);
+    return list;
+  }
+  
+  //function to get the average of a band over a month in a supplied region
+  function getIndexByMonth(year, month, geometry, imageCollection) {
+    // filter by bounds
+    // var filtered = imageCollection.filterBounds(geometry);
+    
+    // Map the function over the list
+    return monthIndex(year, month, imageCollection, geometry);
+  }
+  
+// Returns a collection of bimonthly means.
+// Includes property 'date_range' which indicates the start date
+//
+var bimonthlyImages = ee.ImageCollection(YEARS.map(function (year) { 
+    return  MONTHS.map(function (month) {
+      return getIndexByMonth(year, month, Park.geometry(), s2CloudMasked);
+    })})
+    .flatten());
+
+print(bimonthlyImages);
+
+var setBimonthlyMeans = function(feature, imageCollection, indexName) {
+  var propertyKey = 'bimonthly_' + indexName ;
+  var meanIndexKey = indexName + '_median' ;
+  var bimonthlyMeans = imageCollection.toList(100).map(function (image) {
+    image = ee.Image(image);
+    var indexMean = image.reduceRegion({
+      reducer: ee.Reducer.median(),
+      geometry: feature.geometry(),
+      scale: 10,
+    }).get(meanIndexKey);
+    
+    var date_range = image.get('date_range');
+    return ee.List([date_range, indexMean]);
+  });
+  return feature.set(propertyKey, bimonthlyMeans);
+};
+
+var hectaresWithBimonthlyIndices = Hectares
+.map( function (feature) {
+  return setBimonthlyMeans(feature, bimonthlyImages, constants.EVI_NAME);
+})
+.map( function (feature) {
+  return setBimonthlyMeans(feature, bimonthlyImages, constants.NDVI_NAME);
+});
+
+print(hectaresWithBimonthlyIndices);
+
+// filter null EVI
+// hectaresWithBimonthlyIndices = hectaresWithBimonthlyIndices.map(
+//   function (feature) {
+//     var bimonthlyEVI = ee.List(feature.get(bimonthlyEVIKey))
+//     var filteredBimonthlyEVI = bimonthlyEVI.filter(ee.Filter.listContains('item', null).not())
+//     feature = feature.set('filtered_EVI', filteredBimonthlyEVI)
+    
+//     var bimonthlyNDVI = ee.List(feature.get(bimonthlyNDVIKey))
+//     var filteredBimonthlyNDVI = bimonthlyNDVI.filter(ee.Filter.listContains('item', null).not())
+    
+//     return feature = feature.set('filtered_NDVI', filteredBimonthlyNDVI)
+//   }
+// )
+
+// Replace null with 0
+hectaresWithBimonthlyIndices = hectaresWithBimonthlyIndices.map(
+  function (feature) {
+    var bimonthlyEVI = ee.List(feature.get(bimonthlyEVIKey));
+    var filteredBimonthlyEVI = bimonthlyEVI.map( function (list) {
+      list = ee.List(list);
+        var key = list.get(0);
+        var value = list.get(1);
+        
+        return ee.Algorithms.If(value, list, ee.List([key, 0]));
+      });
+    feature = feature.set(bimonthlyEVIKey, filteredBimonthlyEVI);
+    
+    var bimonthlyNDVI = ee.List(feature.get(bimonthlyNDVIKey));
+    var filteredBimonthlyNDVI = bimonthlyNDVI.filter(ee.Filter.listContains('item', null).not());
+    
+    return feature = feature.set('filtered_NDVI', filteredBimonthlyNDVI)
+  }
+);
+
+print(hectaresWithBimonthlyIndices);
+
+print(hectaresWithBimonthlyIndices.first().set('test', 0));
+
+// function to transform the bimonthly array into dictionaries
+
+var hectaresForCharting = hectaresWithBimonthlyIndices.map(
+  function (feature) {
+    var bimonthlyEVIKeyValues = ee.List(feature.get(bimonthlyEVIKey)).flatten();
+    var bimonthlyNDVIDictionary = ee.Dictionary(ee.List(feature.get(bimonthlyNDVIKey)).flatten());
+    
+    return feature.set(bimonthlyEVIKeyValues);
+  }
+);
+
+print(hectaresForCharting);
+var bimonthlyDates = ee.List(hectaresForCharting.first().get(bimonthlyEVIKey));
+print(bimonthlyDates);
+var bimonthlyDates = bimonthlyDates.map(
+  function (list) {
+    return ee.List(list).get(0);
+  }
+);
+
+// /// Experimenting with charting
+
+//   var regionName = AREA_NAME;
+//   var indexName = 'EVI';
+
+//   // Organize property information into objects for defining x properties and
+//   // their tick labels.
+//   var xPropValDict = {};  // Dictionary to codify x-axis property names as values.
+//   var xPropLabels = [];   // Holds dictionaries that label codified x-axis values.
+//   var monthValueIndex = 1;
+//   var valueIndex = 1;
+//   var dates = bimonthlyDates.getInfo();
+//   print(dates);
+//   // why do the values turn into numbers
+//   var first = dates[0];
+//   print(first);
+//   for (var i = 0; i < dates.length; i++) {
+//     var date = dates[i];
+    
+//     xPropValDict[date] = valueIndex;
+    
+//     xPropLabels.push({v: valueIndex, f: date});
+//     valueIndex++ ;
+//   }
+  
+//   print(ee.List(xPropLabels));
+//   print(xPropValDict);
+  
+//   var combinedIndexChart = ui.Chart.feature
+//                   .byProperty({
+//                     features: hectaresForCharting,
+//                     xProperties: xPropValDict,
+//                     seriesProperty: 'Hectare_ID'
+//                   })
+//                   .setChartType('ScatterChart')
+//                   .setOptions({
+//                     title: 'Average BiMonthly ' + 'EVI' + '(' + regionName + ')',
+//                     hAxis: {
+//                       title: 'Date',
+//                       titleTextStyle: {italic: false, bold: true},
+//                       ticks: xPropLabels
+//                     },
+//                     vAxis: {
+//                       title: indexName,
+//                       titleTextStyle: {italic: false, bold: true}
+//                     },
+//                     colors: ['604791', '1d6b99', '39a8a7', '0f8755', '76b349', 'f0af07', 'e37d05', 'cf513e', '96356f', '724173'],
+//                     lineSize: 1,
+//                     pointSize: 0,
+//                   });
+//   print(combinedIndexChart);
+  
+  
+//   // How to deal with null values?
+  

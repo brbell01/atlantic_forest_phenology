@@ -1,0 +1,239 @@
+//Step 1: Compile cloud-free image collection
+//Step 2: Filter non-forest area from sample grids
+//Step 3: Calculate NDVI/EVI
+
+//import helper scripts
+var helpers = require('users/brbell01/AF_Phenology:Helpers');
+var constants = require('users/brbell01/AF_Phenology:Constants');
+
+var StudyArea = ee.FeatureCollection("projects/af-phenology/assets/Parks/PN_Mata_Escura");
+var hectares = ee.FeatureCollection("projects/af-phenology/assets/1_MataEscura_Hectares_1Percent");
+//var hectares2 = ee.FeatureCollection("projects/af-phenology/assets/Hectares/2_MontePascoal_Hectares");
+//var hectares3 = ee.FeatureCollection("projects/af-phenology/assets/Hectares/3_RioDoce_Hectares");
+//var hectares4 = ee.FeatureCollection("projects/af-phenology/assets/Hectares/4_Sooretama_Hectares");
+
+var geometry = hectares;  //change "hectares" for other study areas above
+
+Map.centerObject(StudyArea, 8);
+
+//Import Sentinel-2 Collection
+var S2 = ee.ImageCollection("COPERNICUS/S2");
+
+/////////////////////
+//STEP 1: Level 1C cloud mask
+/////////////////////
+function S2mask(image) {
+  var qa = image.select('QA60')
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0).and(
+             qa.bitwiseAnd(cirrusBitMask).eq(0))
+  return image.updateMask(mask)
+      .select("B.*")
+      .copyProperties(image, ["system:time_start"])
+}
+/////////////////////
+
+
+/////////////////////
+//Another Level 1C cloud mask
+/////////////////////
+// var computeQAbits = function(image, start, end, newName) {
+//     var pattern = 0;
+
+//     for (var i=start; i<=end; i++) {
+//         pattern += Math.pow(2, i);
+//     }
+
+//     return image.select([0], [newName]).bitwiseAnd(pattern).rightShift(start);
+// };
+//
+// var S2mask = function(image) {
+
+//   var cloud_mask = image.select("QA60");
+//   var opaque = computeQAbits(cloud_mask, 10, 10, "opaque");
+//   var cirrus = computeQAbits(cloud_mask, 11, 11, "cirrus");
+//   var mask = opaque.or(cirrus);
+
+//   return image.updateMask(mask.not());
+// }
+/////////////////////
+
+
+/////////////////////
+//Level 2A cloud mask
+/////////////////////
+// function S2mask(image) {
+//   var cloudProb = image.select('MSK_CLDPRB');
+//   var snowProb = image.select('MSK_SNWPRB');
+//   var cloud = cloudProb.lt(10);
+//   var scl = image.select('SCL'); 
+//   var shadow = scl.eq(3); // 3 = cloud shadow
+//   var cirrus = scl.eq(10); // 10 = cirrus
+//   // Cloud probability less than 10% or cloud shadow classification
+//   var mask = cloud.and(cirrus.neq(1)).and(shadow.neq(1));
+//   return image.updateMask(mask);
+// }
+/////////////////////
+
+var filtered = S2
+  .filter(ee.Filter.date('2015-01-01', '2021-11-01'))
+  .filter(ee.Filter.bounds(StudyArea))  
+  .map(S2mask);
+  
+/////////////////////
+//Step 3: Function to calculate vegetation indices EVI and NDVI
+/////////////////////
+var addIndices=function(image){
+  var NDVI = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  var EVI = image.expression(
+      '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))', {
+      'NIR' : image.select('B8').divide(10000),
+      'RED' : image.select('B4').divide(10000),
+      'BLUE': image.select('B2').divide(10000)}).rename('EVI');
+  return image.addBands(NDVI).addBands(EVI);
+};
+
+// Map the function over the collection
+var withIndices = filtered.map(addIndices);
+
+// List images in the collection
+var listOfImages = withIndices.toList(withIndices.size());
+print(listOfImages)
+
+// Select image for viewing (and for cloud cover checking, other quality control)
+// var img1 = ee.Image(listOfImages.get(0));
+// Map.addLayer(img1,{},ee.String(img1.get('id')));
+
+// Display time-series charts by YEAR. This is a workaround for 5000 element limit error 
+// when generating the full time series.
+
+var chart2016 = ui.Chart.image.seriesByRegion( {
+    imageCollection: withIndices.filter(ee.Filter.date('2016-01-01', '2017-01-01')), 
+    regions: geometry, 
+    reducer: ee.Reducer.mean(),
+    band: 'EVI',
+    scale: 10
+    })
+print(chart2016);
+
+
+
+////Chart EVI over all hectare plots within the study area 
+// var chart = ui.Chart.image.seriesByRegion({
+//   imageCollection: withEvi, 
+//   band: 'EVI',
+//   regions: col, 
+//   reducer: ee.Reducer.mean(),
+//   scale: 30
+// });
+// print(chart);
+
+// // Function to calculate average NDVI within the given geometry
+// var meanNDVI = function(image) {
+//   var stats = image.reduceRegion({
+//     reducer: ee.Reducer.mean(),
+//     geometry: StudyArea,
+//     scale: 100 
+//   });
+//   return stats.get('ndvi');
+// };
+
+// // Function to select all images for the given month and compute a mean composite
+// var monthNDVI = function(month) {
+//   var monthImages = withNDVI.filter(
+//     // Use calendarRange function to filter by month
+//     ee.Filter.calendarRange({start: month, field: 'month'}));
+//   // For simplicity, pick one image and compute mean NDVI
+//   // You can also take all images and take the mean value of the stack
+//   var mean = meanNDVI(ee.Image(monthImages.first()));
+//   // Round it to 2 decimals
+//   return ee.Number(mean).format('%.2f');
+// };
+
+// // List of months
+// var months = ee.List.sequence(1, 12);
+// // Map the function over the list
+// var NDVIByMonth = months.map(monthNDVI);
+
+// print(NDVIByMonth);
+
+
+//Visualize first image as RGB, NDVI, and EVI
+
+var firstimage = filtered.first();
+print(firstimage);
+// var firstNDVI = withNDVI.first().select('NDVI');
+// print(firstNDVI);
+var firstEvi = withIndices.first().select('EVI');
+print(firstEvi);
+
+// //Check distribution of index values
+// var histogram = ui.Chart.image.histogram({
+//   image: firstEVI,
+//   region: StudyArea,
+//   scale: 10,
+// //  minBucketWidth: 50
+// });
+// histogram.setOptions({
+//   title: 'Histogram of EVI values'
+// });
+
+//print(histogram);
+
+Map.centerObject(firstimage);
+
+var rgbVis = {
+  min: 0.0,
+  max: 3000,
+  bands: ['B4_mean', 'B3_mean', 'B2_mean'],
+};
+
+var palette = [
+  'FFFFFF', 'CE7E45', 'DF923D', 'F1B555', 'FCD163', '99B718',
+  '74A901', '66A000', '529400', '3E8601', '207401', '056201',
+  '004C00', '023B01', '012E01', '011D01', '011301'];
+
+var ndviVis = {min:0, max:0.5, palette: palette};
+
+var eviVis = {min:0, max:0.5, palette: palette};
+
+Map.addLayer(firstEvi, eviVis, 'First EVI image');
+//Map.addLayer(firstNDVI, ndviVis, 'First NDVI image');
+//Map.addLayer(firstimage, rgbVis, 'First Image');
+
+
+
+// Map.addLayer(point, {color: 'red'}, 'Saibadela');
+
+//############################
+// Function to Normalize Image
+// Pixel Values should be between 0 and 1
+// Formula is (x - xmin) / (xmax - xmin)
+//############################
+
+// function normalize(image){
+//   var bandNames = image.bandNames();
+//   // Compute min and max of the image
+//   var minDict = image.reduceRegion({
+//     reducer: ee.Reducer.min(),
+//     geometry: StudyAreas,
+//     scale: 20,
+//     maxPixels: 1e9,
+//     bestEffort: true,
+//     tileScale: 16
+//   });
+//   var maxDict = image.reduceRegion({
+//     reducer: ee.Reducer.max(),
+//     geometry: StudyAreas,
+//     scale: 20,
+//     maxPixels: 1e9,
+//     bestEffort: true,
+//     tileScale: 16
+//   });
+//   var mins = ee.Image.constant(minDict.values(bandNames));
+//   var maxs = ee.Image.constant(maxDict.values(bandNames));
+
+//   var normalized = image.subtract(mins).divide(maxs.subtract(mins))
+//   return normalized
+// }

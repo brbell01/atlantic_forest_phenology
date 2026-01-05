@@ -1,0 +1,99 @@
+//Layer imports
+var MataEscura_Hectares1 = ee.FeatureCollection("projects/af-phenology/assets/Hectares/1_MataEscura_Hectares1"),
+    MontePascoal_Hectares1 = ee.FeatureCollection("projects/af-phenology/assets/Hectares/2_MontePascoal_Hectares1"),
+    s2 = ee.ImageCollection("COPERNICUS/S2_SR"),
+    s2Clouds = ee.ImageCollection("COPERNICUS/S2_CLOUD_PROBABILITY"),
+    REBIO_Mata_Escura = ee.FeatureCollection("projects/af-phenology/assets/Parks/REBIO_Mata_Escura"),
+    PNH_Monte_Pascoal = ee.FeatureCollection("projects/af-phenology/assets/Parks/PNH_Monte_Pascoal"),
+    DW = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1');
+
+//Helper imports
+var helpers = require('users/brbell01/AF_Phenology:Helpers');
+var constants = require('users/brbell01/AF_Phenology:Constants');
+
+// Constants - Alter these!
+var Park = REBIO_Mata_Escura
+var Hectares = MataEscura_Hectares1 // MontePascoal_Hectares1
+var AREA_NAME = "REBIO Mata Escura"
+var START_DATE = "2018-07-01"// constants.STUDY_START_DATE;
+var END_DATE = "2019-01-01"// constants.STUDY_END_DATE;
+var MAX_CLOUD_PROBABILITY = 60
+
+// Create a filter for study dates and park bounds
+var filter = ee.Filter.and(
+    ee.Filter.bounds(Park.geometry().centroid()), 
+    ee.Filter.date(START_DATE, END_DATE));
+    
+// Process the Sentinel-2 collection
+// Join S2 SR with cloud probability dataset to add cloud mask.
+var s2WithCloudProperty = helpers.s2AddCloudProbability(s2, s2Clouds, filter);
+var s2CloudFiltered = s2WithCloudProperty.filterMetadata('CLOUDY_PIXEL_PERCENTAGE', 'less_than', MAX_CLOUD_PROBABILITY);
+var s2CloudMasked = helpers.s2MaskClouds(s2WithCloudProperty, MAX_CLOUD_PROBABILITY);
+
+// Construct a collection of corresponding Dynamic World and Sentinel-2 for
+// inspection.
+var dwCol = DW.filter(filter);
+var s2Col = s2.filter(filter);
+print(s2Col)
+
+// Join corresponding DW and S2 images (by system:index).
+var DwS2Col = ee.Join.saveFirst('s2_img').apply(dwCol, s2Col,
+    ee.Filter.equals({leftField: 'system:index', rightField: 'system:index'}));
+
+// Extract an example DW image and its source S2 image.
+var dwImage = ee.Image(DwS2Col.first());
+var s2Image = ee.Image(dwImage.get('s2_img'));
+
+// Create a visualization that blends DW class label with probability.
+// Define list pairs of DW LULC label and color.
+var CLASS_NAMES = [
+    'water', 'trees', 'grass', 'flooded_vegetation', 'crops',
+    'shrub_and_scrub', 'built', 'bare', 'snow_and_ice'];
+
+var VIS_PALETTE = [
+    '419BDF', '397D49', '88B053', '7A87C6',
+    'E49635', 'DFC35A', 'C4281B', 'A59B8F',
+    'B39FE1'];
+
+// Create an RGB image of the label (most likely class) on [0, 1].
+var dwRgb = dwImage
+    .select('label')
+    .visualize({min: 0, max: 8, palette: VIS_PALETTE})
+    .divide(255);
+
+// Get the most likely class probability.
+var top1Prob = dwImage.select(CLASS_NAMES).reduce(ee.Reducer.max());
+
+// Create a hillshade of the most likely class probability on [0, 1];
+var top1ProbHillshade =
+    ee.Terrain.hillshade(top1Prob.multiply(100))
+    .divide(255);
+
+// Combine the RGB image with the hillshade.
+var dwRgbHillshade = dwRgb.multiply(top1ProbHillshade);
+
+// Display the Dynamic World visualization with the source Sentinel-2 image.
+Map.centerObject(Park,12);
+Map.addLayer(
+    s2Image,
+    {min: 0, max: 3000, bands: ['B4', 'B3', 'B2']},
+    'Sentinel-2 L2A');
+Map.addLayer(
+    dwRgbHillshade,
+    {min: 0, max: 0.65},
+    'Dynamic World');
+    
+//add Park bounds and plots to visualization
+var empty = ee.Image().byte();
+var outline = empty.paint({
+  featureCollection: Park,  
+  color: 1,
+  width: 3
+}); 
+var outline2 = empty.paint({
+  featureCollection: Hectares,
+  color: 1,
+  width: 2
+}); 
+Map.addLayer(outline, {palette: '00FF00'}, 'geometry');   //park bounds
+Map.addLayer(outline2, {palette: 'FFFF00'}, 'geometry');   //plot bounds

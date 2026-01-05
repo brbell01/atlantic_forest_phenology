@@ -1,0 +1,162 @@
+// Linear modeling of time for Sentinel-2 time series
+// Estimate linear trend over time using pt = β0 + β1t + et, where e is a random error.
+// Reference: https://docs.google.com/document/d/1mNIRB90jwLuASO1JYas1kuOXCLbOoy1Z4NlV1qIXM10/edit#
+
+// Image and feature collection imports
+var Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/1_MataEscura_Hectares1"),
+    Park = ee.FeatureCollection("projects/af-phenology/assets/Parks/REBIO_Mata_Escura"),
+    AOI = Hectares.geometry()
+
+
+// Other imports
+var wrapper = require('users/brbell01/AF_Phenology:Sentinel-1/Wrapper');
+var helper = require('users/brbell01/AF_Phenology:Sentinel-1/Utilities');
+var helpers = require('users/brbell01/AF_Phenology:Helpers');
+var constants = require('users/brbell01/AF_Phenology:Constants');
+
+////// Build the Sentinel-1 image collection
+  
+// Define Sentinel-1 Parameters
+var parameter = {//1. Data Selection
+    START_DATE: "2018-01-01",
+    STOP_DATE: "2019-01-01",
+    POLARIZATION:'VVVH',
+    ORBIT: 'DESCENDING',
+    ORBIT_NUMBER: 82, //155
+    GEOMETRY: Hectares.first().geometry(),
+    APPLY_ADDITIONAL_BORDER_NOISE_CORRECTION: true,
+    //3.Speckle filter
+    APPLY_SPECKLE_FILTERING: true,
+    SPECKLE_FILTER_FRAMEWORK: 'MULTI',
+    SPECKLE_FILTER: 'LEE SIGMA',
+    SPECKLE_FILTER_KERNEL_SIZE: 15,
+    SPECKLE_FILTER_NR_OF_IMAGES: 5,
+    //4. Radiometric terrain normalization
+    APPLY_TERRAIN_FLATTENING: true,
+    DEM: ee.Image('USGS/SRTMGL1_003'),
+    TERRAIN_FLATTENING_MODEL: 'VOLUME',
+    TERRAIN_FLATTENING_ADDITIONAL_LAYOVER_SHADOW_BUFFER: 100,
+    //5. Output
+    FORMAT : 'DB',
+    CLIP_TO_ROI: false,
+    SAVE_ASSETS: false,
+    //6. Visualization
+    VIS_BAND_RATIO: 'VHVV_ratio' // or 'RVI'
+}
+
+// Constants
+var AREA_NAME = 'REBIO Mata Escura, MG',
+    START_DATE = parameter.START_DATE, // constants.STUDY_START_DATE,
+    END_DATE = parameter.STOP_DATE, // constants.STUDY_END_DATE,
+    BAND_NAME = 'VH' // parameter.VIS_BAND_RATIO
+
+//Preprocess the S1 collection
+var s1_preprocess = wrapper.s1_preproc(parameter);
+var s1 = s1_preprocess[0];
+s1_preprocess = s1_preprocess[1];
+
+//Filter to consistent orbit number
+s1 = s1.filter(ee.Filter.eq('relativeOrbitNumber_start', 
+    parameter.ORBIT_NUMBER));
+//print(s1,  "S1 collection - single orbit")
+s1_preprocess = s1_preprocess.filter(ee.Filter.eq('relativeOrbitNumber_start', 
+                parameter.ORBIT_NUMBER));
+                
+print(s1_preprocess,  "ARD processed S1 collection - single orbit")
+
+// Clip the image collection to the plot boundaries, calculate the median statistic
+var s1_preprocess = s1_preprocess.map(function(image){return image.clip(Park)});
+
+//function to create the constant images median and st. dev.
+var generateIndexCollection = function(indexName, imageCollection, featureCollection, regionName) {
+  
+  var feature = ee.Feature(featureCollection.geometry());
+  
+  // // Function to calculate median index on an image within the geometry
+  function medianIndex(image, geometry) {
+    var stats = image.reduceRegion({
+      reducer: ee.Reducer.median(),
+      geometry: geometry,
+      scale: 10,
+      maxPixels:1e10
+    });
+    
+      // set the veg index to -999 for null values
+    stats = ee.List([stats.get(indexName), -999])
+    .reduce(ee.Reducer.firstNonNull())
+
+    return stats;
+  }
+  // Function to calculate standard deviation of index on an image within the geometry
+  function sdIndex(image, geometry) {
+    var stats = image.reduceRegion({
+      reducer: ee.Reducer.stdDev(),
+      geometry: geometry,
+      scale: 10, 
+      maxPixels: 1e10
+    });
+    
+    // set the veg index to -999 for null values
+    stats = ee.List([stats.get(indexName), -999])
+          .reduce(ee.Reducer.firstNonNull())
+
+    return stats;
+  }
+  //return a dictionary of the median and stdevs for each image in the image collection 
+  return imageCollection.map(function (image) {
+      var time = image.get('system:time_start');
+      var median = ee.Number(medianIndex(image, feature.geometry()));
+      var median_image = ee.Image(median).double();
+      var sd = ee.Number(sdIndex(image, feature.geometry()));
+      var sd_image = ee.Image(sd).double();
+      return ee.ImageCollection.fromImages([median_image, sd_image])
+                    .toBands().set({time:time});
+    });
+};
+
+//Create the two band constant image collection
+var constantColVH = generateIndexCollection('VH', s1_preprocess, Hectares);
+
+//Create the two band constant image collection
+var constantColVV = generateIndexCollection('VV', s1_preprocess, Hectares);
+
+
+//Rename the bands in the VH collection
+var constantColVH = constantColVH.map(function (image) {
+            var b1 = image.select("0_constant").rename('VH_median');
+            var b2 = image.select("1_constant").rename('VH_sd');
+            return ee.Image.cat(b1, b2);
+});
+
+//Rename the bands in the VV collection
+var constantColVV = constantColVV.map(function (image) {
+            var b1 = image.select("0_constant").rename('VV_median');
+            var b2 = image.select("1_constant").rename('VV_sd');
+            return ee.Image.cat(b1, b2);
+});
+
+print('Constant median and st. dev. ' + BAND_NAME + ' collection', constantColVH);
+
+//Add the median/sd constant bands to our filtered S1 collection
+  var S1withMedian = s1_preprocess.combine({
+    secondary:constantColVH,
+//	overwrite:false,
+});
+
+//Add the median/sd constant bands to our filtered S1 collection
+  var S1withMedian = S1withMedian.combine({
+    secondary:constantColVV,
+//	overwrite:false,
+});
+
+print('Input S1 collection with constant median and st. dev. ' + BAND_NAME + ' bands', S1withMedian);
+
+var batch = require('users/fitoprincipe/geetools:batch')
+var assetfolder = 'projects/af-phenology/S1_mata_escura'
+var options = {
+  name: 'S1_{system_date}',
+  scale: 30,
+  maxPixels: 1e13
+}
+
+batch.Download.ImageCollection.toAsset(S1withMedian, assetfolder, options)

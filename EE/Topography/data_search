@@ -1,0 +1,114 @@
+// Visualize topographic slope and extract sample points from 1ha plots in various parks.
+
+// Geometry imports
+var BA = ee.Image("projects/af-phenology/assets/MAPBIOMAS/mapbiomas-brazil-collection-60-bahia-2020"),
+    MG = ee.Image("projects/af-phenology/assets/MAPBIOMAS/mapbiomas-brazil-collection-60-minasgerais-2020"),
+    parks = ee.FeatureCollection("projects/af-phenology/assets/Parks/UC_fed_junho_2020"),
+    AF = ee.FeatureCollection("projects/af-phenology/assets/Atlantic_Forest"),
+    MataEscura_Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/1_MataEscura_Hectares1"),
+    MontePascoal_Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/2_MontePascoal_Hectares1"),
+    RioDoce_Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/3_RioDoce_Hectares1"),
+    Sooretama_Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/4_Sooretama_Hectares1"),
+    REBIO_Sooretama = ee.FeatureCollection("projects/af-phenology/assets/Parks/REBIO_Sooretama"),
+    PNH_Monte_Pascoal = ee.FeatureCollection("projects/af-phenology/assets/Parks/PNH_Monte_Pascoal"),
+    REBIO_Mata_Escura = ee.FeatureCollection("projects/af-phenology/assets/Parks/REBIO_Mata_Escura"),
+    PE_Rio_Doce = ee.FeatureCollection("projects/af-phenology/assets/Parks/PE_Rio_Doce");
+
+// Analysis parameters
+var dataset = ee.Image('NASA/NASADEM_HGT/001');
+var elevation = dataset.select('elevation');
+var slope = ee.Terrain.slope(elevation);
+
+//Choose which park to analyze
+var park = PNH_Monte_Pascoal, // PE_Rio_Doce ; PNH_Monte_Pascoal ; REBIO_Mata_Escura ; REBIO_Sooretama
+    Hectares = MontePascoal_Hectares, // Sooretama_Hectares, // RioDoce_Hectares ; MontePascoal_Hectares ; MataEscura_Hectares
+    FILE_NAME = 'monte_pascoal'; // ; 'rio_doce' ; 'mata_escura' ; 'monte_pascoal' ; 'sooretama'
+
+// Add reducer output to the Features in the collection.
+var hectmeans = slope.reduceRegions({
+                        collection: Hectares,
+                        reducer: ee.Reducer.mean(),
+                        scale: 30,
+                      });
+
+Export.table.toDrive({
+  collection: hectmeans,
+  description: FILE_NAME + '_slope_means',
+  fileFormat: 'CSV'
+});
+
+// Add a white background image to the map.
+//var background = ee.Image(1);
+//Map.addLayer(background, {min: 0, max: 1});
+
+// Set elevation visualization properties.
+var elevationVis = {
+  min: 0,
+  max: 2000,
+};
+
+var slopeVis = {
+  min: 0,
+  max: 45,
+};
+
+var empty = ee.Image().byte();
+var parksboundary = empty.paint({
+  featureCollection: parks,
+  color: 1,
+  width: 2
+});
+
+var parkboundary = empty.paint({
+  featureCollection: park,
+  color: 1,
+  width: 2
+});
+
+var afboundary = empty.paint({
+  featureCollection: AF,
+  color: 1,
+  width: 3
+});
+
+var hectboundary = empty.paint({
+  featureCollection: Hectares,
+  color: 1,
+  width: 1
+});
+
+var palettes = require('users/gena/packages:palettes');
+var palette = palettes.crameri.batlow[50];
+
+Map.centerObject(park,10);
+Map.addLayer(MG, {}, 'MG');
+Map.addLayer(BA, {}, 'BA');
+Map.addLayer(elevation.updateMask(elevation.gt(0)), elevationVis, 'Elevation', false);
+Map.addLayer(slope, {min: 0, max: 25, palette: palette}, 'slope', false);
+
+var slopeRGB = slope.visualize({
+  min: 0,
+  max: 25,
+  palette: palette
+});
+
+var roi = park.geometry().centroid()
+
+slopeRGB = slopeRGB.clip(roi.buffer(30000))
+
+Map.addLayer(slopeRGB, null, 'slopeRGB');
+Map.addLayer(parksboundary, {palette: '00FF00'}, 'geometry');
+Map.addLayer(parkboundary, {palette: '00FF00'}, 'geometry');
+Map.addLayer(afboundary, {palette: 'FF0000'}, 'geometry');
+Map.addLayer(hectboundary, {palette: 'FF0000'}, 'geometry');
+
+var projection = slope.projection().getInfo();
+
+Export.image.toDrive({
+  image: slopeRGB,
+  description: FILE_NAME + '_slope_RGB',
+  crs: projection.crs,
+  crsTransform: projection.transform
+});
+
+

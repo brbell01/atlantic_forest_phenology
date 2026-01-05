@@ -1,0 +1,221 @@
+///////////////////////////////////////////////////////
+//// PART ONE: IMPORTS AND PARAMETER DEFINITIONS   ////
+///////////////////////////////////////////////////////
+
+// Import helper scripts
+var helpers = require('users/brbell01/AF_Phenology:Helpers');
+var constants = require('users/brbell01/AF_Phenology:Constants');
+
+// Geometry Imports
+var MataEscura_Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/1_MataEscura_Hectares1"),
+    MontePascoal_Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/2_MontePascoal_Hectares1"),
+    RioDoce_Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/3_RioDoce_Hectares1"),
+    Sooretama_Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/4_Sooretama_Hectares1"),
+    REBIO_Sooretama = ee.FeatureCollection("projects/af-phenology/assets/Parks/REBIO_Sooretama"),
+    PNH_Monte_Pascoal = ee.FeatureCollection("projects/af-phenology/assets/Parks/PNH_Monte_Pascoal"),
+    REBIO_Mata_Escura = ee.FeatureCollection("projects/af-phenology/assets/Parks/REBIO_Mata_Escura"),
+    PE_Rio_Doce = ee.FeatureCollection("projects/af-phenology/assets/Parks/PE_Rio_Doce");
+
+// Image and feature collection imports
+var S2 = ee.ImageCollection("COPERNICUS/S2"),  // S2 L1C for Cloud Displacement Index (CDI) bands.
+    S2c = ee.ImageCollection('COPERNICUS/S2_CLOUD_PROBABILITY'),
+    S2Sr = ee.ImageCollection('COPERNICUS/S2_SR');
+
+// Set study area and sampling plots
+var AREA_NAME =  'REBIO Sooretama, ES', // 'REBIO Sooretama, ES' , 'PE Rio Doce, MG'
+    FILE_NAME = 'sooretama', // 'mata_escura', // 'monte_pascoal' , 'sooretama'
+    START_DATE = '2019-01-01', 
+    END_DATE ='2020-01-01', 
+    Hectares = Sooretama_Hectares,
+    Park = REBIO_Sooretama,
+    AOI = Hectares.geometry(),
+    REDUCING_SCALE = 100;  // to cut down on processing time
+
+    var AOI = Hectares.geometry(), 
+    ALL_BANDS = {EVI2_BAND: 'EVI2' , EVI_BAND: 'EVI', NDVI_BAND: 'NDVI'},
+    REDUCING_SCALE = 100;
+
+////////////////////////////////////////////////////////////
+//// PART TWO: Define all S2 processing functions       ////
+////////////////////////////////////////////////////////////
+
+
+// Function to calculate median index within the given geometry
+var medianIndex = function (image, geometry) {
+  var stats = image.reduceRegion({
+    reducer: ee.Reducer.median(),
+    geometry: geometry,
+    scale: REDUCING_SCALE,
+    maxPixels: 1e10
+    });
+  return stats;
+}
+
+// Function to select all images for the given month in a year and compute a median composite
+var monthIndex = function (year, month, imageCollection) {
+    var list = ee.List([]);
+    var monthImages = imageCollection.filter(
+     ee.Filter.calendarRange({start: year, field: 'year'})
+     )
+     .filter(
+     ee.Filter.calendarRange({start: month, field: 'month'})
+     );
+  
+   year = ee.Number(year).format('%d');
+   month = ee.Number(month).format('%02d');
+  
+   var medianImage = monthImages.reduce(ee.Reducer.median());
+   var name = year.cat('-').cat(month).cat('-01');
+
+   medianImage = medianImage.set('date_range', name);
+   list = ee.Algorithms.If(medianImage.bandNames().size().gt(0), 
+   ee.List(list).add(medianImage), 
+   list);
+   return list;
+}
+
+//function to create constant images median and st. dev as bands
+var generateIndexCollection = function (indexName, imageCollection, fc) {
+  
+  //input can be feature or feature collection
+  var feature = ee.Feature(fc.geometry());
+  
+  // // Function to calculate median index on an image within the geometry
+  function medianIndex(image, geometry) {
+    var stats = image.reduceRegion({
+      reducer: ee.Reducer.median(),
+      geometry: geometry,
+      scale: REDUCING_SCALE,
+      maxPixels:1e10
+    });
+    
+      // set the veg index to -999 for null values
+    stats = ee.List([stats.get(indexName), -999])
+    .reduce(ee.Reducer.firstNonNull())
+
+    return stats;
+  }
+  // Function to calculate standard deviation of index on an image within the geometry
+  function sdIndex(image, geometry) {
+    var stats = image.reduceRegion({
+      reducer: ee.Reducer.stdDev(),
+      geometry: geometry,
+      scale: REDUCING_SCALE, 
+      maxPixels: 1e10
+    });
+    
+    // set the veg index to -999 for null values
+    stats = ee.List([stats.get(indexName), -999])
+          .reduce(ee.Reducer.firstNonNull())
+
+    return stats;
+  }
+  // return a dictionary of the plot median and stdevs
+  // for each image in the image collection 
+  return imageCollection.map(function (image) {
+      var time = image.get('system:time_start');
+      var median = ee.Number(medianIndex(image, feature.geometry()));
+      var median_image = ee.Image(median).double();
+      var sd = ee.Number(sdIndex(image, feature.geometry()));
+      var sd_image = ee.Image(sd).double();
+      return ee.ImageCollection.fromImages([median_image, sd_image])
+                     .toBands().set({time:time});
+    });
+};
+
+// Function for iteration of daily image mosaic over the range of dates
+var day_mosaics = function(date, newlist) {
+    // Cast
+    date = ee.Date(date)
+    newlist = ee.List(newlist)
+  
+    // Filter collection between date and the next day
+    var filtered = S2masked.filterDate(date, date.advance(1,'day'))
+  
+    // Make the mosaic
+    var image = ee.Image(filtered.mosaic())
+                  .copyProperties(filtered.first(), ['system:time_start'])
+  
+    // Add the mosaic to a list only if the collection has images
+    return ee.List(ee.Algorithms.If(filtered.size(), newlist.add(image), newlist))
+};
+
+///////////////////////////////////////////////////////
+//// PART THREE: BUILD THE SENTINAL-2 COLLECTION   ////
+///////////////////////////////////////////////////////
+    
+// S2 L1C for Cloud Displacement Index (CDI) bands.
+S2 = S2.filterDate(START_DATE, END_DATE).filterBounds(AOI);
+// S2Cloudless for the cloud probability band.
+S2c = S2c.filterDate(START_DATE, END_DATE).filterBounds(AOI);
+// S2 L2A for surface reflectance bands.
+S2Sr = S2Sr.filterDate(START_DATE, END_DATE).filterBounds(AOI);
+
+// print('Input S2 TOA Collection', S2);
+// print('Input S2 Cloud Probability Collection', S2c);
+// print('Input S2 Surface Reflectance Collection', S2Sr);
+
+// Join the cloud probability dataset to surface reflectance.
+var withCloudProbability = helpers.indexJoin(S2Sr, S2c, 'cloud_probability');
+// Join the L1C data to get the bands needed for CDI.
+var withS2L1C = helpers.indexJoin(withCloudProbability, S2, 'l1c');
+// Map the cloud masking function over the joined collection.
+var S2masked = ee.ImageCollection(withS2L1C.map(helpers.maskImage))
+// Add vegetation indices             
+              .map(helpers.S2AddIndices2);
+
+// Create daily mosaics for overlapping tiles acquired in the same
+// day...
+// Difference in days between start and finish
+var diff = ee.Date(END_DATE).difference(ee.Date(START_DATE), 'day')
+
+// Make a list of all dates
+var range = ee.List.sequence(0, diff.subtract(1)).map(function(day){return ee.Date(START_DATE).advance(day,'day')})
+
+// Iterate over the range to make a new list, and then cast the list to an imagecollection
+var S2mosaic = ee.ImageCollection(ee.List(range.iterate(day_mosaics, ee.List([]))))
+
+//Create the two band constant image collection
+var constantCol1 = generateIndexCollection(ALL_BANDS.EVI2_BAND, S2mosaic, Hectares);
+var constantCol2 = generateIndexCollection(ALL_BANDS.EVI_BAND, S2mosaic, Hectares);
+var constantCol3 = generateIndexCollection(ALL_BANDS.NDVI_BAND, S2mosaic, Hectares);
+
+//Rename the bands in the collection
+constantCol1 = constantCol1.map(function (image) {
+            var b1 = image.select("0_constant").rename(ALL_BANDS.EVI2_BAND + '_median');
+            var b2 = image.select("1_constant").rename(ALL_BANDS.EVI2_BAND + '_sd');
+            return ee.Image.cat(b1, b2);
+});
+constantCol2 = constantCol2.map(function (image) {
+    var b1 = image.select("0_constant").rename(ALL_BANDS.EVI_BAND + '_median');
+    var b2 = image.select("1_constant").rename(ALL_BANDS.EVI_BAND + '_sd');
+    return ee.Image.cat(b1, b2);
+});
+constantCol3 = constantCol3.map(function (image) {
+    var b1 = image.select("0_constant").rename(ALL_BANDS.NDVI_BAND + '_median');
+    var b2 = image.select("1_constant").rename(ALL_BANDS.NDVI_BAND + '_sd');
+    return ee.Image.cat(b1, b2);
+});
+
+print('Constant median and st. dev. collection (EVI2)', constantCol1);
+print('Constant median and st. dev. collection (EVI)', constantCol2);
+print('Constant median and st. dev. collection (NDVI)', constantCol3);
+
+//Add the median/sd constant bands to our filtered S2 collection
+S2mosaic = S2mosaic.combine({secondary:constantCol1});
+S2mosaic = S2mosaic.combine({secondary:constantCol2});
+S2mosaic = S2mosaic.combine({secondary:constantCol3});
+
+print('Input S2 collection with constant median and st. dev. bands', S2mosaic);
+
+// Plot the fitted model and the original data at the AOI.
+var plot = ui.Chart.image.series(
+    S2mosaic.select([ALL_BANDS.EVI2_BAND + '_median', ALL_BANDS.EVI_BAND + '_median', ALL_BANDS.NDVI_BAND + '_median']), AOI, ee.Reducer.median(), REDUCING_SCALE)
+      .setOptions({
+      title: 'S2 All Bands ' + AREA_NAME,
+      vAxis: {viewWindow: {min: -20, max:5}},
+      lineWidth: 1,
+      pointSize: 3
+      })
+
+print(plot)

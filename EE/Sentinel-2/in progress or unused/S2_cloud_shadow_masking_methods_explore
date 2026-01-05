@@ -1,0 +1,192 @@
+// This example demonstrates the use of the
+// COPERNICUS/S2_CLOUD_PROBABILITY dataset, the
+// ee.Algorithms.Sentinel2.CDI() method for computing a
+// cloud displacement index and directionalDistanceTransform()
+// for computing cloud shadows.
+//
+// See a similar script for the Python API here:
+// https://developers.google.com/earth-engine/tutorials/community/sentinel-2-s2cloudless
+//
+// Two other methods are included for comparison, including maskin by the S2 cloud-probability collection:
+// https://developers.google.com/earth-engine/datasets/catalog/COPERNICUS_S2_CLOUD_PROBABILITY
+// and the "Clear Sky" method:
+// https://gis.stackexchange.com/questions/426571/cloud-shadow-removal-for-sentinel-2
+
+
+var Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/1_MataEscura_Hectares1"),
+    S2 = ee.ImageCollection("COPERNICUS/S2"),  // S2 L1C for Cloud Displacement Index (CDI) bands.
+    S2c = ee.ImageCollection('COPERNICUS/S2_CLOUD_PROBABILITY'),
+    S2Sr = ee.ImageCollection('COPERNICUS/S2_SR'),
+    PARK = ee.FeatureCollection("projects/af-phenology/assets/Parks/REBIO_Mata_Escura");
+
+
+var plot = ee.FeatureCollection(
+  "projects/af-phenology/assets/Hectares/1_MataEscura/mataescura_area_13");
+// Import dependences
+var helpers = require('users/brbell01/AF_Phenology:Helpers');
+var constants = require('users/brbell01/AF_Phenology:Constants');
+
+var S2image = ee.Image('COPERNICUS/S2_SR/20181215T130239_20181215T130505_T24KTG');    
+
+var AOI = plot //ee.Geometry.Point(-122.269, 45.701);
+var start = constants.STUDY_START_DATE;
+var end = constants.STUDY_END_DATE;
+
+////// Build Sentinel-2 collection
+    
+// S2 L1C for Cloud Displacement Index (CDI) bands.
+S2 = S2.filterBounds(AOI).filterDate(start, end)
+//    .select(['B7', 'B8', 'B8A', 'B10']);
+// S2Cloudless for the cloud probability band.
+S2c = S2c.filterDate(start, end).filterBounds(AOI);
+// S2 L2A for surface reflectance bands.
+S2Sr = S2Sr.filterDate(start, end).filterBounds(AOI)
+//    .select(['B2', 'B3', 'B4', 'B5']);
+  
+
+// Join the cloud probability dataset to surface reflectance.
+var withCloudProbability = helpers.indexJoin(S2Sr, S2c, 'cloud_probability');
+
+// Join the L1C data to get the bands needed for CDI.
+var withS2L1C = helpers.indexJoin(withCloudProbability, S2, 'l1c');
+
+// Map the cloud masking function over the joined collection.
+var masked = ee.ImageCollection(withS2L1C.map(helpers.maskImage));
+
+
+// Yuki's cloud mask algorithm for comparison...
+// Join S2 SR with cloud probability dataset to add cloud mask.
+
+// Filter by study dates and plot bounds
+var filter = ee.Filter.and(
+    ee.Filter.bounds(AOI), 
+    ee.Filter.date(start, end));
+
+S2Sr = S2Sr.filter(filter)
+    .map(helpers.S2AddIndices);
+
+var s2WithCloudProperty = helpers.s2AddCloudProbability(S2Sr, S2c);
+var s2CloudFiltered = s2WithCloudProperty.filterMetadata('CLOUDY_PIXEL_PERCENTAGE', 'less_than', 60);
+var s2CloudMasked = helpers.s2MaskClouds(s2CloudFiltered, 60);
+
+
+//visualize
+var rgbVis = {
+    min: 0.0,
+    max: 3000,
+    bands: ['B4', 'B3', 'B2'],
+  };
+
+var maskVis = {
+	opacity:1,
+	bands: ["B4","B2","B2"],
+	min:200,
+	max:200,
+	gamma:1
+  };
+
+// // Uncomment for normal visualization
+// Map.centerObject(S2Sr.first(), 11)
+// Map.addLayer(S2Sr.first(), rgbVis, 'original S2 image');
+// Map.addLayer(s2CloudMasked.first(), maskVis, 'Yuki s2CloudMasked algorithm S2 image', false)
+// Map.addLayer(S2Sr.map(helpers.s2_clear_sky).first(), maskVis, 'clear_sky algorithm S2 image', false) ;
+// Map.addLayer(masked.first(), maskVis, 'cloud shadow S2 image');
+
+
+//splitscreen visualization
+
+var leftMap = ui.Map();
+var rightMap = ui.Map();
+
+var S2Sr_lyr = ui.Map.Layer(S2Sr.first(), rgbVis, 'original S2 image');
+var S2CloudMasked_lyr = ui.Map.Layer(s2CloudMasked.first(), maskVis, 'Yuki s2CloudMasked algorithm S2 image');
+var S2ClearSky_lyr = ui.Map.Layer(S2Sr.map(helpers.s2_clear_sky).first(), maskVis, 'clear_sky algorithm S2 image');
+var S2CLSHW_lyr = ui.Map.Layer(masked.first(), maskVis, 'CDI cloud shadow S2 image');
+
+// create image dictionary
+var images = {
+  'Method 1: Yuki s2CloudMasked algorithm': getImage(3),
+  'Method 2: clear_sky algorithm': getImage(2),
+  'Method 3: CDI cloud shadow': getImage(1)
+};
+
+function getImage(number) {
+  number = ee.Number(number)
+  var collection = ee.ImageCollection([  // collection of images
+  S2Sr.first(), 
+  masked.first(), 
+  S2Sr.map(helpers.s2_clear_sky).first(), 
+  s2CloudMasked.first() 
+  ]) 
+  var listOfImages = collection.toList(collection.size()); // list of images
+  var image = ee.Image(listOfImages.get(number)); // get individual image
+  return image.visualize(maskVis); //style
+}
+
+
+var left_layers = leftMap.layers() ; var right_layers = rightMap.layers() ;
+
+left_layers
+.add(S2CloudMasked_lyr)// Bottom layer: Yuki s2CloudMasked algorithm
+.add(S2ClearSky_lyr)   // Middle layer: Clear Sky Algorithm
+.add(S2CLSHW_lyr)      // Top layer: CDI cloud/shadow
+
+right_layers.add(S2Sr_lyr)
+
+var splitPanel = ui.SplitPanel({
+    firstPanel: leftMap,
+    secondPanel: rightMap,
+    orientation: 'horizontal',
+    wipe: true
+})
+
+ui.root.clear()
+
+ui.root.add(splitPanel)
+
+var linkPanel = ui.Map.Linker([leftMap,rightMap])
+
+leftMap.centerObject(S2Sr.first(), 10)
+
+leftMap.setControlVisibility(false);
+var leftSelector = addLayerSelector(leftMap, 0, 'top-left');
+
+// Add info
+var info = ui.Panel({
+  style: {
+    position: 'bottom-center',
+    padding: '8px 15px'
+  }
+});
+var info2 = ui.Label({
+  value: 'Split Panels of several cloud/shadow masking methods (left) and the original Sentinel-2 image (right)',
+  style: {
+    fontSize: '16px',
+    margin: '0 0 3px 0',
+    padding: '0'
+    }
+});
+info.add(info2);
+rightMap.add(info);
+
+
+// Adds a layer selection widget to the given map, to allow users to change
+// which image is displayed in the associated map.
+function addLayerSelector(mapToChange, defaultValue, position) {
+  var label = ui.Label('Select Image Masking Method');
+  // This function changes the given map to show the selected image.
+  function updateMap(selection) {
+    mapToChange.layers().reset()
+    mapToChange.layers().set(0, ui.Map.Layer(images[selection]));
+  }
+
+  // Configure a selection dropdown to allow the user to choose between images,
+  // and set the map to update when a user makes a selection.
+  var select = ui.Select({items: Object.keys(images), onChange: updateMap});
+  select.setValue(Object.keys(images)[defaultValue], true);
+
+  var controlPanel =
+      ui.Panel({widgets: [label, select], style: {position: position}});
+
+  mapToChange.add(controlPanel);
+}

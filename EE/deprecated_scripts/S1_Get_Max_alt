@@ -1,0 +1,155 @@
+/**** Start of imports. If edited, may not auto-convert in the playground. ****/
+var StudyArea = ee.FeatureCollection("users/brbell01/Masters/1_MataEscura_Hectares"),
+    VV_VisParam = {"opacity":1,"bands":["VV"],"min":0,"max":0.2,"gamma":1},
+    VH_VisParam = {"opacity":1,"bands":["VH"],"min":0,"max":0.1,"gamma":1},
+    VHVVratio_VisParam = {"opacity":1,"bands":["VHVVratio"],"min":0,"max":2,"gamma":1},
+    geometry = ee.FeatureCollection("projects/af-phenology/assets/PN_Mata_Escura");
+/***** End of imports. If edited, may not auto-convert in the playground. *****/
+
+var S1 = ee.ImageCollection("COPERNICUS/S1_GRD_FLOAT");
+var S1filtered = S1.filter(ee.Filter.date('2016-01-01', '2021-12-31'))
+      .filter(ee.Filter.bounds(StudyArea))
+
+//Select only VH and VV polarizations
+var VHVV = S1filtered.filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+        .filter(ee.Filter.eq('instrumentMode', 'IW'))
+        .select(['VH','VV']);
+
+function combinedPols(image) {
+  var VHVVratio = image.expression(
+    '4*a/(a+b)', {
+      'a': image.select('VH'),
+      'b': image.select('VV'),
+}).rename('VHVVratio')
+  return image.addBands(VHVVratio);
+}
+
+var ratioCollection = VHVV.map(combinedPols)
+
+// Define time range
+// FULL TS
+var startyear = 2016;
+var endyear = 2017;
+  
+var startmonth = 1  
+var endmonth = 12
+
+var startday = 1
+var endday = 31
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////
+
+var startdate = ee.Date.fromYMD(startyear,startmonth,startday);
+var enddate = ee.Date.fromYMD(endyear,endmonth,endday);
+
+// create list for years
+var years = ee.List.sequence(startyear,endyear);
+print(years)
+// create list for months
+var months = ee.List.sequence(1,12);
+// create list for pentads for each month
+var pentads = ee.List.sequence(1,26,5,6);
+print(pentads)
+
+var colname = 'VH Date Collection';
+var collection = VHVV
+  .filter(ee.Filter.calendarRange(startyear,endyear,'year'))
+  .filter(ee.Filter.calendarRange(startmonth,endmonth,'month'))
+  .sort('system:time_start')
+  .filterBounds(StudyArea)
+  .select("VH");
+
+//var colname = 'VV Date Collection';
+// var collection = VHVV
+//   .filter(ee.Filter.calendarRange(startyear,endyear,'year'))
+//   .filter(ee.Filter.calendarRange(startmonth,endmonth,'month'))
+//   .sort('system:time_start')
+//   .filterBounds(StudyArea)
+//   .select("VV");
+
+//var colname = 'VHVV Date Collection';
+// var collection = VHVV
+//   .filter(ee.Filter.calendarRange(startyear,endyear,'year'))
+//   .filter(ee.Filter.calendarRange(startmonth,endmonth,'month'))
+//   .sort('system:time_start')
+//   .filterBounds(StudyArea)
+//   .select("VHVV");
+  
+  
+var add_bands = function(image) {
+  image = ee.Image(image);
+  return image.addBands(ee.Image.constant(ee.Number.parse(image.date().format("D"))).rename('day').float());
+};
+
+//add the date band to the collection
+var collection_d = collection.map(add_bands)
+print(collection_d, colname)
+
+Map.addLayer(collection_d.first(), VH_VisParam, 'First date band')
+
+var LTA =  ee.ImageCollection.fromImages(
+  months.map(function (m) {
+  return pentads.map(function(d){
+    var w = collection_d.filter(ee.Filter.calendarRange(m, m, 'month'))
+            .filter(ee.Filter.calendarRange(d, d, 'day_of_month'))
+            .median();
+    return w.set('month', m)
+            .set('day', d)
+            .set('year', 2015)
+            });
+  }).flatten());
+  
+print(LTA,'LTA')
+
+var addtime_start = function(image){
+  image = ee.Image(image);
+  // return image.addBands(ee.Image.constant(ee.Number.parse(image.date().millis())).rename('day').float());
+  // return image.addBands(ee.Image.constant(ee.Number.parse(image.date().format("YYYYMMdd"))).rename('day').float());
+  return image.set('system:time_start', ee.Date.fromYMD(image.get('year'),image.get('month'),image.get('day')).millis());
+  };
+
+var LTA = LTA.map(addtime_start);
+print(LTA,'LTA')
+
+var addDate_lta = function(image) {
+  image = ee.Image(image);
+  // return image.addBands(ee.Image.constant(ee.Number.parse(image.date().millis())).rename('day').float());
+  // return image.addBands(ee.Image.constant(ee.Number.parse(image.date().format("YYYYMMdd"))).rename('day').float());
+  return image.addBands(ee.Image.constant(ee.Number.parse(image.date().format("D"))).rename('day').float());
+};
+
+var LTAdata_to_process = LTA.map(addDate_lta);
+print(LTAdata_to_process,'LTAdata_to_process')
+
+
+///////////////////////////////////////////////////////////////////////
+// THESE FUNCTIONS WORKS FOR A SINGLE YEAR
+var maxLTA = LTAdata_to_process.qualityMosaic('VH').select('day');
+print(maxLTA,'maxLTA')
+Map.addLayer(maxLTA, {min: 1, max: 365}, 'maxLTA')
+
+// var minLTA = LTAdata_to_process.map(
+//   function(img) {
+//     var date = img.select('day')
+//     return img.updateMask(date.gt(maxLTA))
+//   }).select('precipitation', 'day').reduce(ee.Reducer.min(2)).rename('precipitation','day')
+
+// var minLTA = minLTA.select(minLTA.bandNames().removeAll(["precipitation"]))
+// print(minLTA,'minLTA')
+// Map.addLayer(minLTA, {min: 1, max: 365}, 'minLTA')
+////////////////////////////////////////////////////////////////////////////
+
+
+// HERE IS AS I HAVE IMPLEMENTED FOR A TIME-SERIES WITH > 1 YEAR
+// Find the day of max for each year
+var max = ee.ImageCollection(
+    years.map(function (y) {
+      var start = ee.Date.fromYMD(y,startmonth,startday);
+      var stop = ee.Date.fromYMD(y,endmonth,endday);
+      var x = collection.filterDate(start,stop)
+      var w = x.qualityMosaic('VH').select('day')
+    return w.set({'year': y})
+}).flatten());
+print(max,'max')
+Map.addLayer(max, {min: 1, max: 365}, 'max')

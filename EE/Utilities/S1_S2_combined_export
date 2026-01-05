@@ -1,0 +1,30 @@
+// imports
+var s2Clouds = ee.ImageCollection("COPERNICUS/S2_CLOUD_PROBABILITY");
+var S2 = ee.ImageCollection("COPERNICUS/S2_SR");
+var Park = ee.FeatureCollection("projects/af-phenology/assets/Parks/REBIO_Mata_Escura");
+
+var helpers = require('users/brbell01/AF_Phenology:Helpers');
+var constants = require('users/brbell01/AF_Phenology:Constants');
+
+var START_DATE = constants.STUDY_START_DATE;
+var END_DATE = constants.STUDY_END_DATE;
+var MAX_CLOUD_PROBABILITY = 60
+
+
+// Filter by study dates and park bounds
+var filter = ee.Filter.and(
+    ee.Filter.bounds(Park.geometry()), 
+    ee.Filter.date(START_DATE, END_DATE));
+    
+S2 = S2.filter(filter)
+    .map(helpers.S2AddIndeces)
+    // .map(function (image) { return image.select(constants.EVI_NAME, constants.NDVI_NAME)});
+print(S2);
+
+// Join S2 SR with cloud probability dataset to add cloud mask.
+var s2WithCloudProperty = helpers.s2AddCloudProbability(S2, s2Clouds, filter);
+var s2CloudFiltered = s2WithCloudProperty.filterMetadata('CLOUDY_PIXEL_PERCENTAGE', 'less_than', MAX_CLOUD_PROBABILITY);
+var s2CloudMasked = helpers.s2MaskClouds(s2WithCloudProperty, MAX_CLOUD_PROBABILITY);
+
+
+

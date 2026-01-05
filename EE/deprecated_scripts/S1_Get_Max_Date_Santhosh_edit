@@ -1,0 +1,253 @@
+/**** Start of imports. If edited, may not auto-convert in the playground. ****/
+var StudyArea = ee.FeatureCollection("users/brbell01/Masters/1_MataEscura_Hectares"),
+    VV_VisParam = {"opacity":1,"bands":["VV"],"min":0,"max":0.2,"gamma":1},
+    VH_VisParam = {"opacity":1,"bands":["VH"],"min":0,"max":0.1,"gamma":1},
+    VHVVratio_VisParam = {"opacity":1,"bands":["VHVVratio"],"min":0,"max":2,"gamma":1};
+/***** End of imports. If edited, may not auto-convert in the playground. *****/
+// Find calendar day of year of maximum backscatter for an image collection representing 1 year 
+// between years 2015 and 2021
+
+var S1 = ee.ImageCollection("COPERNICUS/S1_GRD_FLOAT");
+
+
+Map.centerObject(StudyArea, 12)
+Map.addLayer(StudyArea, {}, "StudyArea", 1)
+
+//filter out edges from collection
+var S1filtered = S1.filter(ee.Filter.date('2015-01-01', '2021-12-31'))
+      .filter(ee.Filter.bounds(StudyArea))
+      // .map(function(image) {
+      //     var edge = image.lt(0);
+      //     var maskedImage = image.mask().and(edge.not());
+      //     return image.updateMask(maskedImage);
+      //   });
+
+// //filter out images from collection that don't completely cover the study area
+// var daily = S1filtered
+//   .map(function (image) {
+//     return image
+//       .set('date', image.date().format('yyyy-MM-dd'));
+//   });
+
+// var S1filtered = ee.ImageCollection(   //I still have partial images in the collection????
+//     ee.Join.saveAll('images').apply({
+//       primary: daily, 
+//       secondary: daily, 
+//       condition: ee.Filter.and(
+//         ee.Filter.equals({
+//           leftField: 'date',
+//           rightField: 'date'
+//         }),
+//         ee.Filter.equals({
+//           leftField: 'SPACECRAFT_NAME',
+//           rightField: 'SPACECRAFT_NAME'
+//         }),
+//         ee.Filter.equals({
+//           leftField: 'SENSING_ORBIT_NUMBER',
+//           rightField: 'SENSING_ORBIT_NUMBER'
+//         })
+//       )
+//     })
+//   )
+//   .map(function (image) {
+//     return ee.ImageCollection(ee.List(image.get('images')))
+//       .mosaic()
+//       .set('system:time_start', ee.Date(image.get('date')).millis());
+//   });
+
+      
+//Select only VH and VV polarizations
+var VHVV = S1filtered.filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+        .filter(ee.Filter.eq('instrumentMode', 'IW'))
+        .select(['VH','VV']);
+        
+// Add a VH/VV ratio band...
+// Write a function that takes a VH image, computes VH/VV for an image, adds it as a band, 
+// and combines component VH and VV polarizations
+
+function combinedPols(image) {
+  var VHVVratio = image.expression(
+    '4*a/(a+b)', {
+      'a': image.select('VH'),
+      'b': image.select('VV'),
+}).rename('VHVVratio')
+  return image.addBands(VHVVratio);
+}
+
+// Map the function over the VH collection
+var ratioCollection = VHVV.map(combinedPols)
+print(ratioCollection, 'Ratio Collection');
+
+//To extract day value for further calculations, add a date band to each image 
+//displaying the calendar day of year the image was acquired
+
+function addDateBand(image) {
+  // Get start time from image metadata and convert to day of year
+  var date = ee.Number.parse(ee.Date(image.get('system:time_start')).format('D')); //something wrong here
+
+  // make image band
+  var dateimage = ee.Image(date).double().rename('dayofyear');
+  return image.addBands(dateimage);
+}
+
+//map over collection
+var dateCollection = ratioCollection.map(addDateBand);
+print(dateCollection, 'S1 Collection with Date Band');
+
+//Add first images to map
+
+var firstS1 = dateCollection.first();
+
+Map.addLayer(firstS1.select('VV'),VV_VisParam,'VV',0);
+Map.addLayer(firstS1.select('VH'),VH_VisParam,'VH',0);
+Map.addLayer(firstS1.select('VHVVratio'),VHVVratio_VisParam,'VHVVratio',0);
+
+var firstS1smoothed_VV = MyLeeWrapper(firstS1.select('VV')); 
+var firstS1smoothed_VH = MyLeeWrapper(firstS1.select('VH'));
+var firstS1smoothed_VHVVratio = MyLeeWrapper(firstS1.select('VHVVratio'));
+Map.addLayer(firstS1smoothed_VV, VV_VisParam,'VV smoothed',1);
+Map.addLayer(firstS1smoothed_VH, VH_VisParam,'VH smoothed',1);
+Map.addLayer(firstS1smoothed_VHVVratio, VHVVratio_VisParam,'VHVVratio smoothed',1);
+
+// Create a function which reduces the image collection to a single multi-band 
+// image where each pixel is the date corresponding to the maximum dB value of the
+// collection.
+
+function maxdBdate(col) {
+  return col.reduce(ee.Reducer.max());  //...
+}
+
+// Map the function by year across all years.  The result is a collection containing
+// the N number of images, where N is the number of years in the original collection.
+
+var maxdBcol = dateCollection.map(maxdBdate) //....
+
+
+//############################
+// Speckle Filtering Functions
+//############################
+
+// Function to convert from dB
+function toNatural(img) {
+  return ee.Image(10.0).pow(ee.Image(img).select(0).divide(10.0));
+}
+
+//Function to convert to dB
+function toDB(img) {
+  return ee.Image(img).log10().multiply(10.0);
+}
+
+//Applying a Refined Lee Speckle filter as coded in the SNAP 3.0 S1TBX:
+
+//https://github.com/senbox-org/s1tbx/blob/master/s1tbx-op-sar-processing/src/main/java/org/esa/s1tbx/sar/gpf/filtering/SpeckleFilters/RefinedLee.java
+//Adapted by Guido Lemoine
+
+// by Guido Lemoine
+function RefinedLee(img) {
+  // img must be in natural units, i.e. not in dB!
+  // Set up 3x3 kernels 
+  var weights3 = ee.List.repeat(ee.List.repeat(1,3),3);
+  var kernel3 = ee.Kernel.fixed(3,3, weights3, 1, 1, false);
+
+  var mean3 = img.reduceNeighborhood(ee.Reducer.mean(), kernel3);
+  var variance3 = img.reduceNeighborhood(ee.Reducer.variance(), kernel3);
+
+  // Use a sample of the 3x3 windows inside a 7x7 windows to determine gradients and directions
+  var sample_weights = ee.List([[0,0,0,0,0,0,0], [0,1,0,1,0,1,0],[0,0,0,0,0,0,0], [0,1,0,1,0,1,0], [0,0,0,0,0,0,0], [0,1,0,1,0,1,0],[0,0,0,0,0,0,0]]);
+
+  var sample_kernel = ee.Kernel.fixed(7,7, sample_weights, 3,3, false);
+
+  // Calculate mean and variance for the sampled windows and store as 9 bands
+  var sample_mean = mean3.neighborhoodToBands(sample_kernel); 
+  var sample_var = variance3.neighborhoodToBands(sample_kernel);
+
+  // Determine the 4 gradients for the sampled windows
+  var gradients = sample_mean.select(1).subtract(sample_mean.select(7)).abs();
+  gradients = gradients.addBands(sample_mean.select(6).subtract(sample_mean.select(2)).abs());
+  gradients = gradients.addBands(sample_mean.select(3).subtract(sample_mean.select(5)).abs());
+  gradients = gradients.addBands(sample_mean.select(0).subtract(sample_mean.select(8)).abs());
+
+  // And find the maximum gradient amongst gradient bands
+  var max_gradient = gradients.reduce(ee.Reducer.max());
+
+  // Create a mask for band pixels that are the maximum gradient
+  var gradmask = gradients.eq(max_gradient);
+
+  // duplicate gradmask bands: each gradient represents 2 directions
+  gradmask = gradmask.addBands(gradmask);
+
+  // Determine the 8 directions
+  var directions = sample_mean.select(1).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(7))).multiply(1);
+  directions = directions.addBands(sample_mean.select(6).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(2))).multiply(2));
+  directions = directions.addBands(sample_mean.select(3).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(5))).multiply(3));
+  directions = directions.addBands(sample_mean.select(0).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(8))).multiply(4));
+  // The next 4 are the not() of the previous 4
+  directions = directions.addBands(directions.select(0).not().multiply(5));
+  directions = directions.addBands(directions.select(1).not().multiply(6));
+  directions = directions.addBands(directions.select(2).not().multiply(7));
+  directions = directions.addBands(directions.select(3).not().multiply(8));
+
+  // Mask all values that are not 1-8
+  directions = directions.updateMask(gradmask);
+
+  // "collapse" the stack into a singe band image (due to masking, each pixel has just one value (1-8) in it's directional band, and is otherwise masked)
+  directions = directions.reduce(ee.Reducer.sum());  
+
+  //var pal = ['ffffff','ff0000','ffff00', '00ff00', '00ffff', '0000ff', 'ff00ff', '000000'];
+  //Map.addLayer(directions.reduce(ee.Reducer.sum()), {min:1, max:8, palette: pal}, 'Directions', false);
+
+  var sample_stats = sample_var.divide(sample_mean.multiply(sample_mean));
+
+  // Calculate localNoiseVariance
+  var sigmaV = sample_stats.toArray().arraySort().arraySlice(0,0,5).arrayReduce(ee.Reducer.mean(), [0]);
+
+  // Set up the 7*7 kernels for directional statistics
+  var rect_weights = ee.List.repeat(ee.List.repeat(0,7),3).cat(ee.List.repeat(ee.List.repeat(1,7),4));
+
+  var diag_weights = ee.List([[1,0,0,0,0,0,0], [1,1,0,0,0,0,0], [1,1,1,0,0,0,0], 
+    [1,1,1,1,0,0,0], [1,1,1,1,1,0,0], [1,1,1,1,1,1,0], [1,1,1,1,1,1,1]]);
+
+  var rect_kernel = ee.Kernel.fixed(7,7, rect_weights, 3, 3, false);
+  var diag_kernel = ee.Kernel.fixed(7,7, diag_weights, 3, 3, false);
+
+  // Create stacks for mean and variance using the original kernels. Mask with relevant direction.
+  var dir_mean = img.reduceNeighborhood(ee.Reducer.mean(), rect_kernel).updateMask(directions.eq(1));
+  var dir_var = img.reduceNeighborhood(ee.Reducer.variance(), rect_kernel).updateMask(directions.eq(1));
+
+  dir_mean = dir_mean.addBands(img.reduceNeighborhood(ee.Reducer.mean(), diag_kernel).updateMask(directions.eq(2)));
+  dir_var = dir_var.addBands(img.reduceNeighborhood(ee.Reducer.variance(), diag_kernel).updateMask(directions.eq(2)));
+
+  // and add the bands for rotated kernels
+  for (var i=1; i<4; i++) {
+    dir_mean = dir_mean.addBands(img.reduceNeighborhood(ee.Reducer.mean(), rect_kernel.rotate(i)).updateMask(directions.eq(2*i+1)));
+    dir_var = dir_var.addBands(img.reduceNeighborhood(ee.Reducer.variance(), rect_kernel.rotate(i)).updateMask(directions.eq(2*i+1)));
+    dir_mean = dir_mean.addBands(img.reduceNeighborhood(ee.Reducer.mean(), diag_kernel.rotate(i)).updateMask(directions.eq(2*i+2)));
+    dir_var = dir_var.addBands(img.reduceNeighborhood(ee.Reducer.variance(), diag_kernel.rotate(i)).updateMask(directions.eq(2*i+2)));
+  }
+
+  // "collapse" the stack into a single band image (due to masking, each pixel has just one value in it's directional band, and is otherwise masked)
+  dir_mean = dir_mean.reduce(ee.Reducer.sum());
+  dir_var = dir_var.reduce(ee.Reducer.sum());
+
+  // A finally generate the filtered value
+  var varX = dir_var.subtract(dir_mean.multiply(dir_mean).multiply(sigmaV)).divide(sigmaV.add(1.0));
+
+  var b = varX.divide(dir_var);
+
+  var result = dir_mean.add(b.multiply(img.subtract(dir_mean)));
+  return(result.arrayFlatten([['sum']]));
+}
+
+function MyLeeWrapper(img) {
+  var bands = img.bandNames();
+  return bands.map(function(img) {
+    return ee.Image(toDB(RefinedLee(toNatural(img))));
+  });
+    
+}
+
+var S1smoothed = dateCollection.map(MyLeeWrapper);
+print(S1smoothed, "Smoothed S1 Collection (Lee Filter)");
+
+//Test speckle filter function on first image
+//Map.addLayer(dateCollection.first().select('VV').MyLeeWrapper(), VV_VisParam,'VV smoothed test')

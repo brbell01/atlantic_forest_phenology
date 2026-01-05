@@ -1,0 +1,255 @@
+var Location =
+    ee.Geometry.Point([-40.13259489474689, -19.003894281271126]),
+    Park = ee.FeatureCollection("projects/af-phenology/assets/Parks/REBIO_Sooretama"),
+    Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/4_Sooretama_Hectares1");
+
+Park = Park.geometry()
+
+// -------------------------------------------------------------------------------------- 
+// Demo 2: Show calculation of the NDVI, NIRv and kNDVI in the (beautiful) Valencia area, and 
+//         compare results with the LAI product from MODIS. In particular we illustrate the indices on a 
+//         rice crop pixel in the Albufera natural park, which shows a clear phenology.  
+//
+//  * Some preprocessing is done before application of the indices:
+//        - apply the MODIS cloud and Land mask
+//        - select the time period and study area
+//        - Scale MODIS data to reflectance values
+//
+//  * This demo restricts to the use of the RBF kernel in kNDVI, which is defined as follows:
+//  
+//        kNDVI = tanh((NIR-red)^2/(2*sigma)^2), 
+//
+//    where the lengthscale parameter sigma controls the sensitivity to densely/sparsely 
+//    vegetated pixel/region, and can be either fixed a priori or estimated from the observations themselves.
+//    Remember that sigma plays a critical role in the index (see discussions in the paper and especially 
+//    in the supplementary materials S1 & S2 for mathematical and ecophysiological justifications.
+// 
+//  * In this second demo, we estimate the sigma automatically from the region pixels by computing the 
+//    the median distance between NIR and red reflectances in the dictionary.
+//
+//  * Important notes:
+//        1) Working with radiances or reflectances changes the value of sigma, so we strongly recommend to either 
+//             (a) normalize the data before fixing the sigma value (e.g. sigma=0.15), or
+//             (b) estimate the sigma value directly from data by the average distance criterion (see discussion above)
+//
+//        2) In remote sensing of the vegetation, we are very often dealing with noise, clouds and water bodies that hamper the 
+//           direct application of any vegetation index. Since kNDVI depends on sigma, one should carefully 
+//           either remove those cases from the estimation of the sigma (see demo 2), or alternatively replace 
+//           the mean with the median.
+//
+//        3) Note that the value of the kNDVI is bounded to [0,1] by construction. It is recommended to apply kNDVI 
+//           for vegetated pixels only, so it is advisable to mask water/snow pixels. 
+//
+
+var palette = ['FFFFFF', 'CE7E45', 'DF923D', 'F1B555', 'FCD163', '99B718',
+               '74A901', '66A000', '529400', '3E8601', '207401', '056201',
+               '004C00', '023B01', '012E01', '011D01', '011301'];
+
+// -------------------------------------------------------------------------------------- 
+// 1- MODIS cloud masking.
+// -------------------------------------------------------------------------------------- 
+
+/*
+ * A function that returns an image containing just the specified QA bits.
+ *
+ * Args:
+ *   image - The QA Image to get bits from.
+ *   start - The first bit position, 0-based.
+ *   end   - The last bit position, inclusive.
+ *   name  - A name for the output image.
+ */
+var getQABits = function(image, start, end, newName) {
+    // Compute the bits we need to extract.
+    var pattern = 0;
+    for (var i = start; i <= end; i++) {
+       pattern += Math.pow(2, i);
+    }
+    // Return a single band image of the extracted QA bits, giving the band
+    // a new name.
+    return image.select([0], [newName])
+                  .bitwiseAnd(pattern)
+                  .rightShift(start);
+};
+
+// A function to mask out pixels that did not have observations.
+var maskEmptyPixels = function(image) {
+  // Find pixels that had observations.
+  var withObs = image.select('num_observations_1km').gt(0);
+  return image.updateMask(withObs);
+};
+
+// mask mod15 function
+var maskmod15 = function(image1) {
+  var maskbad = ((image1.select('FparLai_QC')).eq(0))
+  .or((image1.select('FparLai_QC')).eq(2))
+  .or((image1.select('FparLai_QC')).eq(32))
+  .or((image1.select('FparLai_QC')).eq(34));
+  return image1.mask(maskbad);
+
+};
+
+// A function to mask out cloudy pixels.
+var maskClouds = function(image) {
+  // Select the QA band.
+  var QA = image.select('state_1km');
+  // Get the internal_cloud_algorithm_flag bit.
+  // var internalCloud = getQABits(QA, 10, 10, 'internal_cloud_algorithm_flag');
+  // 10 is cloud shadow!
+  // Get the cloud_state bits and find cloudy areas.
+  var internalCloud = getQABits(QA, 0, 1, 'cloud_state').expression("b(0) == 1 || b(0) == 2");
+  image = image.addBands(internalCloud);
+  return image.updateMask(internalCloud.eq(0));
+};
+
+// A function to mask out no Land pixels.
+var masknoLand = function(image) {
+  // Select the QA band.
+  var QA = image.select('state_1km');
+  // Get the internal_cloud_algorithm_flag bit.
+  // var internalCloud = getQABits(QA, 10, 10, 'internal_cloud_algorithm_flag');
+  // 10 is cloud shadow!
+  // Get the cloud_state bits and find cloudy areas.
+  var internalCloud = getQABits(QA, 3, 5, 'Land/water flag').expression("b(0) > 1 || b(0) == 0 ");
+  image = image.addBands(internalCloud);
+  return image.updateMask(internalCloud.eq(0));
+};
+
+
+// -------------------------------------------------------------------------------------- 
+// 2- Select your image collection
+// -------------------------------------------------------------------------------------- 
+var collection = ee.ImageCollection('MODIS/006/MOD09GA')
+                   .filterDate('2018-01-01', '2019-01-11'); 
+
+var MODIS_LAI = ee.ImageCollection("MODIS/006/MCD15A3H")
+  .filterDate('2018-01-01', '2019-01-11').map(maskmod15).select('Lai');
+
+// print(MODIS_LAI);
+
+// Clip the geometry using a map function
+function clipImage(image) {
+  return image.clip(Park);
+}
+var collection = collection.map(clipImage);
+
+// Mask out no land areas and areas that were not observed.
+collection = collection.map(maskEmptyPixels).map(masknoLand);
+
+// Map the cloud masking function over the collection.
+var collectionCloudMasked = collection.map(maskClouds);
+
+// -------------------------------------------------------------------------------------- 
+// 3- Set MODIS in reflectance values 
+//    This is important to have some intuition about the sigma parameter in the RBF kernel
+// -------------------------------------------------------------------------------------- 
+collectionCloudMasked = collectionCloudMasked.select(
+  ['sur_refl_b01', 'sur_refl_b02', 'sur_refl_b03', 'sur_refl_b04'])
+  .map(function(image) {
+    //return image.multiply(ee.Image.constant(1e-4))
+    //            .copyProperties(image, image.propertyNames());
+    return image.multiply(ee.Image.constant(1e-4))
+                .set({'system:time_start': image.get('system:time_start')});
+  });
+
+var vizParams = {
+  bands: ["sur_refl_b01","sur_refl_b04","sur_refl_b03"],
+  min: 0, max: 0.15
+};
+Map.centerObject(Park, 12);
+//Map.addLayer(collectionCloudMasked, vizParams, 'Image');
+
+// -------------------------------------------------------------------------------------- 
+// NDVI
+// -------------------------------------------------------------------------------------- 
+
+var addNDVI = function(image) {
+  var red = image.select('sur_refl_b01');
+  var nir = image.select('sur_refl_b02');
+  var ndvi = nir.subtract(red).divide(nir.add(red)).select([0],['ndvi']);
+  return image.addBands(ndvi);
+};
+
+// -------------------------------------------------------------------------------------- 
+// NIRv
+// -------------------------------------------------------------------------------------- 
+
+var addNIRV = function(image) {
+  var red = image.select('sur_refl_b01');
+  var nir = image.select('sur_refl_b02');
+  var nirv = ((nir.subtract(red).divide(nir.add(red))).subtract(0.08))
+             .multiply(nir).select([0],['nirv']);
+  return image.addBands(nirv);
+};
+
+// -------------------------------------------------------------------------------------- 
+// kNDVI
+// -------------------------------------------------------------------------------------- 
+
+var addKNDVI = function(image) {
+  var red = image.select('sur_refl_b01');
+  var nir = image.select('sur_refl_b02');
+  var D2 = nir.subtract(red).pow(2).select([0],['d2']); // Compute D2 and rename it to d2
+  
+  // The sigma value is fixed to the median distance between NIR and red reflectances in the dictionary
+  var sigma = nir.add(red).multiply(0.5).reduceRegion(ee.Reducer.median(), Park).toImage();
+  
+  // kDNVI
+  var kndvi = D2.divide(sigma).divide(sigma).divide(4.0).tanh().select([0], ['kndvi']);
+
+  return image.addBands(kndvi);
+};
+
+// -------------------------------------------------------------------------------------- 
+// Plot results
+// -------------------------------------------------------------------------------------- 
+
+var collectionNDVI = collectionCloudMasked.map(addNDVI);
+collectionNDVI = collectionNDVI.map(addNIRV);
+collectionNDVI = collectionNDVI.map(addKNDVI);
+
+var mean_ndvi = collectionNDVI.select(['ndvi']).mean();
+var mean_nirv = collectionNDVI.select(['nirv']).mean();
+var mean_kndvi = collectionNDVI.select(['kndvi']).mean();
+
+Map.addLayer(mean_ndvi, {'min': 0, 'max': 1, 'palette': palette}, 'NDVI');
+Map.addLayer(mean_nirv, {'min': 0, 'max': 1, 'palette': palette}, 'NIRv');
+Map.addLayer(mean_kndvi, {'min': 0, 'max': 1, 'palette': palette}, 'kNVDI');
+Map.addLayer(Hectares, {}, "Plot Locations")
+Map.addLayer(Location, {}, "Sample Location")
+
+// Create an image time series chart.
+var chart = ui.Chart.image.series({
+  imageCollection: collectionNDVI.select(['ndvi','nirv','kndvi']),
+  region: Location,
+  reducer: ee.Reducer.first(),
+  scale: 500
+}).setOptions({ title: '', hAxis: {title: 'Time'}});
+
+print(chart)
+// Add the chart to the map.
+chart.style().set({
+  position: 'bottom-right', width: '400px', height: '300px'
+});
+// Map.add(chart);
+
+// Create an image time series chart.
+var chart2 = ui.Chart.image.series({
+  imageCollection: MODIS_LAI.select('Lai'),
+  region: Location,
+  reducer: ee.Reducer.first(),
+  scale: 500
+}).setOptions({
+  title: '',
+  vAxis: {title: 'LAI * 10'}, hAxis: {title: 'Time'}
+          
+});
+
+print(chart2)
+
+// Add the chart to the map.
+chart2.style().set({
+  position: 'bottom-left',
+  width: '400px',
+  height: '300px'
+});
+// Map.add(chart2);

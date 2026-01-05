@@ -1,0 +1,242 @@
+//Import helper scripts
+
+var wrapper = require('users/brbell01/AF_Phenology:Sentinel-1/Wrapper');
+var helper = require('users/brbell01/AF_Phenology:Sentinel-1/Utilities');
+var helpers = require('users/brbell01/AF_Phenology:Helpers');
+var constants = require('users/brbell01/AF_Phenology:Constants');
+
+//Import study area and sampling plots
+
+var AREA_NAME = 'REBIO Mata Escura 1-Ha Plots',
+    Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/1_MataEscura_Hectares_new"),
+    Park = ee.FeatureCollection("projects/af-phenology/assets/Parks/REBIO_Mata_Escura"),
+    geometry = ee.Feature(Hectares.first()).geometry();
+
+// Define Sentinel-1 Parameters
+
+var parameter = {//1. Data Selection
+    START_DATE: "2020-01-01",
+    STOP_DATE: "2022-01-01",
+    POLARIZATION:'VVVH',
+    ORBIT: 'DESCENDING',
+    ORBIT_NUMBER: 82,  //155
+    GEOMETRY: geometry,
+    APPLY_ADDITIONAL_BORDER_NOISE_CORRECTION: true,
+    //3.Speckle filter
+    APPLY_SPECKLE_FILTERING: true,
+    SPECKLE_FILTER_FRAMEWORK: 'MULTI',
+    SPECKLE_FILTER: 'LEE SIGMA',
+    SPECKLE_FILTER_KERNEL_SIZE: 15,
+    SPECKLE_FILTER_NR_OF_IMAGES: 5,
+    //4. Radiometric terrain normalization
+    APPLY_TERRAIN_FLATTENING: true,
+    DEM: ee.Image('USGS/SRTMGL1_003'),
+    TERRAIN_FLATTENING_MODEL: 'VOLUME',
+    TERRAIN_FLATTENING_ADDITIONAL_LAYOVER_SHADOW_BUFFER: 100,
+    //5. Output
+    FORMAT : 'DB',
+    CLIP_TO_ROI: false,
+    SAVE_ASSETS: false,
+    //6. Visualization
+    VIS_BAND_RATIO: 'VHVV_ratio' // or 'RVI'
+}
+
+
+//Preprocess the S1 collection
+var s1_preprocess = wrapper.s1_preproc(parameter);
+
+var s1 = s1_preprocess[0];
+s1_preprocess = s1_preprocess[1];
+
+//Filter to consistent orbit number
+//s1 = s1.filter(ee.Filter.eq('relativeOrbitNumber_start', 
+//s1.first().getNumber('relativeOrbitNumber_start')));
+s1_preprocess = s1_preprocess.filter(ee.Filter.eq('relativeOrbitNumber_start', 
+s1_preprocess.first().getNumber('relativeOrbitNumber_start')));
+//print(s1_preprocess,  "ARD processed S1 collection - single orbit")
+
+if (parameter.POLARIZATION=='VVVH'){
+    if (parameter.FORMAT=='DB'){
+   var s1_preprocess_view = s1_preprocess.map(helper.add_ratio_lin).map(helper.lin_to_db2);
+   var s1_view = s1.map(helper.add_ratio_lin).map(helper.lin_to_db2);
+   }
+   else {
+   var s1_preprocess_view = s1_preprocess.map(helper.add_ratio_lin);
+   var s1_view = s1.map(helper.add_ratio_lin);
+   }
+}
+
+print(s1_preprocess_view, "S1 ARD collection with Band Ratio");
+
+// Create Bimonthly-index dictyionaries, set them
+// for each year add on to it
+
+var START_YEAR = ee.Date(parameter.START_DATE).get('year');
+var STOP_YEAR = ee.Date(parameter.STOP_DATE).advance(-1, 'year').get('year');
+var MONTHS = ee.List.sequence(1, 12);
+var YEARS = ee.List.sequence(START_YEAR,STOP_YEAR);
+
+// // Function to calculate median index within the given geometry
+function medianIndex(image, geometry) {
+  // return ee.Dictionary();
+  var stats = image.reduceRegion({
+    reducer: ee.Reducer.median(),
+    geometry: geometry,
+    scale: 10,
+    tileScale: 16
+  });
+  return stats;
+}
+
+// Function to select all images for the given month in a year and compute two median composites
+function monthIndex(year, month, imageCollection) {
+  var list = ee.List([]);
+  var monthImages = imageCollection.filter(
+    ee.Filter.calendarRange({start: year, field: 'year'})
+    )
+    .filter(
+    ee.Filter.calendarRange({start: month, field: 'month'})
+    );
+    
+  var firstOfMonthImages = monthImages.filter(
+    ee.Filter.calendarRange({start: 1, end: 15, field: 'day_of_month'})
+    );
+    
+  var endOfMonthImages = monthImages.filter(
+    ee.Filter.calendarRange({start: 15, end: 31, field: 'day_of_month'})
+    );
+  year = ee.Number(year).format('%d');
+  month = ee.Number(month).format('%02d');
+  
+  var medianImage_1 = firstOfMonthImages.reduce(ee.Reducer.median());
+  // var median_1 = medianIndex(medianImage_1, geometry);
+  var name_1 = year.cat('-').cat(month).cat('-01');
+  // list = ee.Algorithms.If(median_1.contains(index_median_key),
+  // list.add([name_1, median_1.get(index_median_key)]),
+  // list);
+
+  var medianImage_2 = endOfMonthImages.reduce(ee.Reducer.median());
+  // var median_2 = medianIndex(medianImage_2, geometry);
+  var name_2 = year.cat('-').cat(month).cat('-15');
+  // list = ee.Algorithms.If(median_2.contains(index_median_key), 
+  // ee.List(list).add([name_2, medianImage_2.get(index_median_key)]), 
+  // list);
+  medianImage_1 = medianImage_1.set('date_range', name_1);
+  list = ee.Algorithms.If(medianImage_1.bandNames().size().gt(0), 
+  ee.List(list).add(medianImage_1), 
+  list);
+  medianImage_2 = medianImage_2.set('date_range', name_2);
+  list = ee.Algorithms.If(medianImage_2.bandNames().size().gt(0), 
+  ee.List(list).add(medianImage_2), 
+  list);
+  return list;
+}
+
+//function to get the average of a band over a month in a supplied region
+function getIndexByMonth(year, month, geometry, imageCollection) {
+  // filter by bounds
+  // var filtered = imageCollection.filterBounds(geometry);
+  
+  // Map the function over the list
+  return monthIndex(year, month, imageCollection, geometry);
+}
+
+// Returns a collection of bimonthly medians.
+// Includes property 'date_range' which indicates the start date
+
+var bimonthlyImages = ee.ImageCollection(YEARS.map(function (year) { 
+  return MONTHS.map(function (month) {
+    return getIndexByMonth(year, month, Park.geometry(), s1_preprocess_view);
+  })})
+  .flatten());
+
+print(bimonthlyImages);
+
+var setBimonthlyMedians = function(feature, imageCollection, indexName) {
+var propertyKey = 'bimonthly_' + indexName
+var medianIndexKey = indexName + '_median'
+var bimonthlyMedians = imageCollection.toList(100).map(function (image) {
+  var image = ee.Image(image)
+  var indexMedian = image.reduceRegion({
+    reducer: ee.Reducer.median(),
+    geometry: feature.geometry(),
+    scale: 10,
+  }).get(medianIndexKey)
+  
+  var date_range = image.get('date_range')
+  return ee.List([date_range, indexMedian])
+})
+return feature.set(propertyKey, bimonthlyMedians)
+}
+
+var hectaresWithBimonthlyIndices = Hectares
+.map( function (feature) {
+return setBimonthlyMedians(feature, bimonthlyImages, constants.VH_NAME)
+})
+.map( function (feature) {
+return setBimonthlyMedians(feature, bimonthlyImages, constants.VHVVratio_NAME)
+})
+
+print(hectaresWithBimonthlyIndices,  "Bimonthly Median Backscatter from 1-Ha Plots")
+
+// filter null values
+hectaresWithBimonthlyIndices = hectaresWithBimonthlyIndices.map(
+function (feature) {
+  var bimonthlyVHKey = 'bimonthly_VH'
+  var bimonthlyVHVVratioKey = 'bimonthly_VHVVratio'
+  
+  var bimonthlyVH = ee.List(feature.get(bimonthlyVHKey))
+  var filteredBimonthlyVH = bimonthlyVH.filter(ee.Filter.listContains('item', null).not())
+  return feature = feature.set('filtered_VH', filteredBimonthlyVH)
+  
+  //for some reason this next step is not working
+  var bimonthlyVHVVratio = ee.List(feature.get(bimonthlyVHVVratioKey))
+  var filteredBimonthlyVHVVratio = bimonthlyVHVVratio.filter(ee.Filter.listContains('item', null).not())
+  return feature = feature.set('filtered_VHVVratio', filteredBimonthlyVHVVratio)
+}
+)
+
+print(hectaresWithBimonthlyIndices, "Bimonthly Median Backscatter from 1-Ha Plots (filtered for null values)")
+
+
+// // Load an image.
+// var image = bimonthlyImages.filterMetadata('date_range', 'equals', parameter.START_DATE).first();
+// print(image);
+// Map.centerObject(parameter.GEOMETRY, 11);
+// Map.addLayer(image, {bands: 'VH_median', min: -25, max: -5}, parameter.START_DATE);
+
+// Add ROI
+var empty = ee.Image().byte();
+var parkboundary = empty.paint({featureCollection: Park, color: 1, width: 3});
+var ha_boundary = empty.paint({featureCollection: Hectares, color: 1, width: 3});
+Map.addLayer(parkboundary, {palette: '00FF00'}, 'Park');
+Map.addLayer(ha_boundary, {palette: '0000FF'}, '1-Ha Plots');
+
+// Export data
+// print(ui.Chart.feature.groups({
+//         features: hectaresWithBimonthlyIndices,
+//         xProperty: 'Hectare_ID', 
+//         yProperty: 'filtered_VH', 
+//         seriesProperty:'Bimonthly Median VH Backscatter from 1-Ha Plots'
+//         }))
+
+// print(ui.Chart.feature.byProperty({
+//     features: hectaresWithBimonthlyIndices, 
+//     xProperties: 'filtered_VH',
+//     seriesProperty: 'Bimonthly Median VH Backscatter from 1-Ha Plots'
+// }))
+
+// print(ui.Chart.feature.byProperty({
+//     features: 'hectaresWithBimonthlyIndices', 
+//     xProperties: 'filtered_VHVV_ratio',
+//     seriesProperty: 'Bimonthly Median VH/VV ratio Backscatter from 1-Ha Plots'
+// }))
+
+// Export.table.toDrive({
+//   collection: hectaresWithBimonthlyIndices,
+//   description: 'Bimonthly_Backscatter_Averages_from_1-Ha Plots',
+//   folder: 'earthengine',
+//   fileFormat: 'CSV',
+//   selectors: ['bimonthly_VH', 'bimonthly_VHVVratio']
+// });
+

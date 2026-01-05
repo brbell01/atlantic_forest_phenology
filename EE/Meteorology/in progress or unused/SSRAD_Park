@@ -1,0 +1,133 @@
+/**** Start of imports. If edited, may not auto-convert in the playground. ****/
+var table = ee.FeatureCollection("projects/af-phenology/assets/Parks/REBIO_Mata_Escura"),
+    table2 = ee.FeatureCollection("projects/af-phenology/assets/Parks/REBIO_Sooretama"),
+    table3 = ee.FeatureCollection("projects/af-phenology/assets/Parks/PNH_Monte_Pascoal"),
+    table4 = ee.FeatureCollection("projects/af-phenology/assets/Parks/PE_Rio_Doce");
+/***** End of imports. If edited, may not auto-convert in the playground. *****/
+var geometry = ee.FeatureCollection("projects/af-phenology/assets/Parks/REBIO_Mata_Escura");
+//var    geometry = ee.FeatureCollection("projects/af-phenology/assets/Parks/REBIO_Sooretama");
+//var    geometry = ee.FeatureCollection("projects/af-phenology/assets/Parks/PNH_Monte_Pascoal");
+//var    geometry = ee.FeatureCollection("projects/af-phenology/assets/Parks/PE_Rio_Doce");
+
+//Select the region
+var featureCollection = geometry;
+//var filter = ee.Filter.inList('NOM_EPCI', ['CA Ardenne Métropole']);
+var AOI = featureCollection//.filter(filter);
+Map.addLayer(AOI, {color: 'green'}, 'AOI');
+
+var startDate = ee.Date.fromYMD(2016,1,1);
+var endDate = ee.Date.fromYMD(2022,1,1);
+
+// Surface Solar Radiation
+var ssrad = ee.ImageCollection("ECMWF/ERA5_LAND/HOURLY")
+                .select('surface_net_solar_radiation')
+                .filter(ee.Filter.date(startDate, endDate));
+//print(ssrad)
+
+//Clipping to AOI
+var clip_ssrad = ssrad.mean().clip(AOI);
+
+////Plotting data
+////Chart 1: SSR Hourly data
+//var TS01 = ui.Chart.image.series(ssrad, AOI, ee.Reducer.mean(), 1000, 'system:time_start').setOptions({
+//          title: 'Surface net solar radiation (Hourly)',
+//          vAxis: {title: '[J/m2]'},
+//});
+//print(TS01);
+
+//Creating Daily data
+var count = ssrad.size();
+
+var ssrad_list = ssrad.toList(count);
+
+print(ssrad_list);
+
+var list = ee.List.sequence(0, count.subtract(1), 24);
+
+print(list);
+
+var ssrad_daily_list = list.map(function(ele){
+
+  var start = ee.Number(ele).int(); 
+  var end = ee.Number(ele).add(24).int();
+  
+  var date = ee.Image(ssrad_list.get(start)).get('system:time_start');
+
+  var new_list = ee.List([]);
+  var element = ee.ImageCollection(ee.List(ssrad_list.slice(start, end))).mean();
+
+  new_list = new_list.add(element.set('system:time_start', date));
+
+  return new_list;
+
+}).flatten();
+
+print(ssrad_daily_list);
+
+ssrad_daily_list = ee.ImageCollection(ssrad_daily_list);
+
+//Chart 2: SSR Daily data
+var TS02 = ui.Chart.image.series(ssrad_daily_list, AOI, ee.Reducer.mean(), 1000, 'system:time_start').setOptions({
+          title: 'Surface net solar radiation (Daily)',
+          vAxis: {title: '[J/m2]'},
+});
+print(TS02);
+
+// // Mean 2m air temperature
+// var era5_2mt = ee.ImageCollection('ECMWF/ERA5_LAND/HOURLY')
+//                   .select('temperature_2m')
+//                   .filter(ee.Filter.date(startDate, endDate));
+// print(era5_2mt);
+
+// // Convert mean temperature in K to C
+// var era5_2mt = era5_2mt.map(function(image) {
+//   return image.subtract(273.15).set(
+//     'system:time_start', image.get('system:time_start'));
+// });
+
+// //Clip
+// var clip_era5_2mt = era5_2mt.mean().clip(AOI);
+
+// //Chart 3
+// var TS03 = ui.Chart.image.series(era5_2mt, AOI, ee.Reducer.mean(), 1000, 'system:time_start').setOptions({
+//           title: 'Mean air temperature at 2m height (Hourly)',
+//           vAxis: {title: 'C'},
+// });
+// print(TS03);
+
+// var era5_2mt_list = era5_2mt.toList(count);
+
+// print(era5_2mt_list);
+
+// var era5_2mt_daily_list = list.map(function(ele){
+
+//   var start = ee.Number(ele).int(); 
+//   var end = ee.Number(ele).add(24).int();
+  
+//   var date = ee.Image(era5_2mt_list.get(start)).get('system:time_start');
+
+//   var new_list = ee.List([]);
+//   var element = ee.ImageCollection(ee.List(era5_2mt_list.slice(start, end))).mean();
+
+//   new_list = new_list.add(element.set('system:time_start', date));
+
+//   return new_list;
+
+// }).flatten();
+
+// print(era5_2mt_daily_list);
+
+// //Chart 4
+// var TS04 = ui.Chart.image.series(era5_2mt_daily_list, AOI, ee.Reducer.mean(), 1000, 'system:time_start').setOptions({
+//           title: 'Mean air temperature at 2m height (Daily)',
+//           vAxis: {title: 'C'},
+// });
+
+// print(TS04);
+
+Export.table.toDrive({
+  collection: ssrad_daily_list,
+  description: 'Surface net solar radiation (Daily), REBIO Mata Escura',
+  folder: 'phenology',
+  fileFormat: 'csv'
+});

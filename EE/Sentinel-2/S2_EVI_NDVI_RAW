@@ -1,0 +1,116 @@
+// Geometry Imports
+var MataEscura_Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/1_MataEscura_Hectares1"),
+    MontePascoal_Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/2_MontePascoal_Hectares1"),
+    RioDoce_Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/3_RioDoce_Hectares1"),
+    Sooretama_Hectares = ee.FeatureCollection("projects/af-phenology/assets/Hectares/4_Sooretama_Hectares1"),
+    REBIO_Sooretama = ee.FeatureCollection("projects/af-phenology/assets/Parks/REBIO_Sooretama"),
+    PNH_Monte_Pascoal = ee.FeatureCollection("projects/af-phenology/assets/Parks/PNH_Monte_Pascoal"),
+    REBIO_Mata_Escura = ee.FeatureCollection("projects/af-phenology/assets/Parks/REBIO_Mata_Escura"),
+    PE_Rio_Doce = ee.FeatureCollection("projects/af-phenology/assets/Parks/PE_Rio_Doce");
+
+//Import Sentinel-2 datasets
+var S2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED"),
+    s2Clouds = ee.ImageCollection("COPERNICUS/S2_CLOUD_PROBABILITY");
+    
+//Option to run on entire park
+//HECTARES = PARK
+
+//Import helper scripts
+var helpers = require('users/brbell01/AF_Phenology:Helpers');
+var constants = require('users/brbell01/AF_Phenology:Constants');
+
+// Set study area, period, and sampling plots
+var FILE_NAME = 'sooretama', // 'monte_pascoal', // 'rio_doce'
+    START_DATE = '2016-01-01', //  constants.STUDY_START_DATE,
+    END_DATE = '2022-01-01', // constants.STUDY_END_DATE,
+    HECTARES = Sooretama_Hectares,
+    PARK = REBIO_Sooretama,
+    MAX_CLOUD_PROBABILITY = 60
+
+//// Functions
+var generateIndexChart = function(indexName, imageCollection, featureCollection) {
+
+  // // Function to calculate median index within the given geometry
+  function medianIndex(image, geometry) {
+    var stats = image.reduceRegion({
+      reducer: ee.Reducer.median(),
+      geometry: geometry,
+      scale: 10,
+      bestEffort: true
+    });
+    
+    return stats.get(indexName);
+  }
+  // // Function to calculate standard deviation of index within the given geometry
+  function sdIndex(image, geometry) {
+    var stats = image.reduceRegion({
+      reducer: ee.Reducer.stdDev(),
+      geometry: geometry,
+      scale: 10, 
+      bestEffort: true
+    });
+    
+    return stats.get(indexName);
+  }
+
+  //function to get the median of a band over a month in a supplied region
+  function getMedianIndex(feature, imageCollection) {
+    // filter by bounds
+    var filtered = imageCollection.filterBounds(feature.geometry());
+    
+    var medians = filtered.toList(1000).map(function (image) {
+      image = ee.Image(image)
+      var median = medianIndex(image, feature.geometry());
+      var sd = sdIndex(image, feature.geometry());
+      var date = image.date()
+      return ee.List([date.format('y-M-d'), median, sd])
+    })
+    .filter(ee.Filter.listContains('item', null).not())
+    
+    var propertyKey = indexName
+    return feature.set(propertyKey, medians)
+  }
+  
+  var meanIndices = featureCollection.map(function(feature) { 
+        return getMedianIndex(feature, imageCollection); 
+        })
+        
+  return meanIndices
+}
+
+//////////////////////////////////////////////////////////////////////////
+//////////
+// Main
+/////////
+//////////////////////////////////////////////////////////////////////////
+
+// Filter by study dates and park bounds
+var filter = ee.Filter.and(
+    ee.Filter.bounds(PARK.geometry()), 
+    ee.Filter.date(START_DATE, END_DATE));
+    
+S2 = S2.filter(filter)    // Looks like this filter is redundant, 
+                          // since its run again within the 
+                          // s2AddCloudProbability function below?
+    .map(helpers.S2AddIndices);
+
+// Join S2 SR with cloud probability dataset to add cloud mask.
+var s2WithCloudProperty = helpers.s2AddCloudProbability(S2, s2Clouds, filter);
+//var s2CloudFiltered = s2WithCloudProperty.filterMetadata('CLOUDY_PIXEL_PERCENTAGE', 'less_than', MAX_CLOUD_PROBABILITY);
+var s2CloudMasked = helpers.s2MaskClouds(s2WithCloudProperty, MAX_CLOUD_PROBABILITY);
+
+var hect_table = generateIndexChart(constants.EVI_NAME, s2CloudMasked, HECTARES);
+    hect_table = generateIndexChart(constants.NDVI_NAME, s2CloudMasked, hect_table);
+
+print(hect_table)
+
+var year = ee.String(START_DATE).slice(0,4)
+var year1 = ee.String(END_DATE).slice(0,4)
+
+Export.table.toDrive({
+  collection: hect_table,
+  description: FILE_NAME + '_s2_1ha_' + year.getInfo() + '_' + year1.getInfo(),
+  folder: 'phenology',
+  fileFormat: 'GeoJSON',
+  selectors: ['Hectare_ID', constants.EVI2_NAME, constants.EVI_NAME, constants.NDVI_NAME]
+});

@@ -1,0 +1,169 @@
+//Import Sentinel-1 Image Collection
+var S1 = ee.ImageCollection("COPERNICUS/S1_GRD_FLOAT");
+
+//Import Study Area
+//var StudyArea = ee.FeatureCollection("users/brbell01/Masters/PNH_Monte_Pascoal");
+var StudyArea = ee.FeatureCollection("users/brbell01/Masters/PN_Mata_Escura");
+//var StudyArea = ee.FeatureCollection("users/brbell01/Masters/PE_Rio_Doce");
+//var StudyArea = ee.FeatureCollection("users/brbell01/Masters/REBIO_Sooretama");
+
+Map.centerObject(StudyArea);
+
+//filter out edges from collection
+var S1filtered = S1.filter(ee.Filter.date('2015-01-01', '2021-12-31'))
+      .filter(ee.Filter.bounds(StudyArea))
+      .map(function(image) {
+          var edge = image.lt(0);
+          var maskedImage = image.mask().and(edge.not());
+          return image.updateMask(maskedImage);
+        });
+
+print(S1filtered.toList(1000))
+
+//filter out edges from collection that are partial images
+var daily = S1filtered
+  .map(function (image) {
+    return image
+      .set('date', image.date().format('yyyy-MM-dd'));
+  });
+
+var S1filtered_joined = ee.ImageCollection(
+    ee.Join.saveAll('images').apply({
+      primary: daily, 
+      secondary: daily, 
+      condition: ee.Filter.and(
+        ee.Filter.equals({
+          leftField: 'date',
+          rightField: 'date'
+        }),
+        ee.Filter.equals({
+          leftField: 'SPACECRAFT_NAME',
+          rightField: 'SPACECRAFT_NAME'
+        }),
+        ee.Filter.equals({
+          leftField: 'SENSING_ORBIT_NUMBER',
+          rightField: 'SENSING_ORBIT_NUMBER'
+        })
+      )
+    })
+  )
+  .map(function (image) {
+    return ee.ImageCollection(ee.List(image.get('images')))
+      .mosaic()
+      .set('system:time_start', ee.Date(image.get('date')).millis());
+  });
+
+//add composite VHVVratio band 
+function combinedPols(image) {
+  var VHVVratio = image.expression(
+    '4*a/(a+b)', {
+      'a': image.select('VH'),
+      'b': image.select('VV'),
+}).rename('VHVVratio')
+
+  return image.addBands(VHVVratio);
+}
+
+var S1filtered_joined = S1filtered_joined.map(combinedPols)
+
+print(S1filtered_joined.toList(1000))
+
+//Visualize first image in the collection
+var S1first = S1filtered_joined.first().select(['VH']);
+var clipped = S1first.clip(StudyArea);
+Map.addLayer(S1first,{min: 0, max: 0.1}, 'First S1 Image')
+  
+//Plot histogram of backscatter values
+var histogram = ui.Chart.image.histogram({
+  image: clipped,
+  region: StudyArea,
+  scale: 10,
+//  minBucketWidth: 50
+});
+histogram.setOptions({
+  title: 'Histogram of backscatter values (dB)'
+});
+
+print(histogram);
+
+
+// Compute backscatter anomaly compared to time-series average
+var means = ee.ImageCollection(ee.List.sequence(1, 7)
+  .map(function(y) {
+    return S1filtered_joined.filter(ee.Filter.calendarRange(y, y, 'year'))
+        .mean()
+        .set('year', y);
+}));
+
+print(means)
+
+var start = ee.Date('2015-01-01');
+var years = ee.List.sequence(0, 6);
+var dates = years.map(function(index) {
+  return start.advance(index, 'year');
+});
+print(dates);
+
+// Group by year, and then reduce within groups by mean();
+// the result is an ImageCollection with one image for each
+// month.
+var byYear = ee.ImageCollection.fromImages(
+      dates.map(function(date) {
+        var beginning = date;
+        var end = ee.Date(date).advance(1, 'year');
+        var mean = S1filtered_joined.filterDate(beginning, end)
+                    .mean()
+                    .set('date', date);
+        
+        var year = ee.Date(date).get('year').add(1);
+        return mean.subtract(
+            means.filter(ee.Filter.eq('year', year)).first())
+            .set('date', date);
+}));
+
+//var augImage = ee.Image(byYear.filterMetadata('system:index', 'equals', '0').first());
+
+//Chart anomaly
+var chart = ui.Chart.image.series({
+  imageCollection: byYear, 
+  region: StudyArea, 
+  reducer: ee.Reducer.mean(), 
+  scale: 10000,
+  xProperty: 'date'
+});
+print(chart);
+
+//Function to visualize each S1 polarization band
+
+var Palette = ['000000', 'FFFFFF'];
+
+function visualize(image) {
+  var band = image.select(['VH'])
+//      .MyLeeWrapper()               //speckle filter not working
+      .clip(StudyArea);
+  var vis = band.visualize({bands:'VH', min:0, max:0.1, palette:Palette});
+  return vis.set('system:index', image.get('system:index'))
+}
+
+var visualized = byYear.map(visualize);
+
+Map.addLayer(visualized.first(),{}, 'First S1 Image');
+var empty = ee.Image().byte();
+var outline = empty.paint({
+  featureCollection: StudyArea,
+  color: 1,
+  width: 3
+});
+Map.addLayer(outline, {palette: '00FF00'}, 'StudyArea')
+
+//Export animation to GDrive
+Export.video.toDrive({
+  collection: visualized,
+  dimensions: 1024,
+  region: StudyArea,
+  description: 'video_export',
+  folder: 'earthengine',
+//  scale: 100,
+  framesPerSecond: 8,
+  maxPixels: 1e12}
+  )

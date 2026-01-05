@@ -1,0 +1,52 @@
+var geometry = ee.Geometry.MultiPolygon(
+    [[[[-39.40378, -16.86954],
+       [-39.40378, -16.88301],
+       [-39.39863, -16.88301],
+       [-39.39863, -16.86954]]],
+     [[[-39.37288, -16.87414],
+       [-39.37288, -16.88859],
+       [-39.36430, -16.88859],
+       [-39.36430, -16.87414]]],
+     [[[-39.34198, -16.86625],
+       [-39.34198, -16.87348],
+       [-39.33409, -16.87348],
+       [-39.33409, -16.86625]]]], null, false);
+
+var START_DATE = '2020-01-01',
+END_DATE = '2020-02-01'
+
+var raincol = ee.ImageCollection('NASA/GPM_L3/IMERG_V06')
+  .filterDate(START_DATE, END_DATE)
+
+raincol = raincol.select('precipitationCal')
+
+//function to remove masked images
+var filter_masked = function(img) {
+// unmask each image in the collection
+var unmasked = img.unmask(-999).eq(-999);
+// reduce histogram on each image and set  keys as properties (key '1' will be masked pixels)
+var rR = unmasked.reduceRegion({
+                          reducer: ee.Reducer.frequencyHistogram(),
+                          geometry: geometry,
+                          scale: 100,
+                          bestEffort: true
+                          });
+var newProperty = ee.Dictionary(rR.get('precipitationCal'));
+return img.set(newProperty)}
+
+// apply the reducer mask                
+var raincol = raincol.map(filter_masked)
+
+//filter precip collection to eliminate masked pixels
+var raincol = ee.ImageCollection(raincol).filter(ee.Filter.notNull(['1']).not())
+
+//rename precip property 
+raincol = raincol.map(function(image) {
+                var precipdict = ee.Dictionary(image.get('precipitationCal'))
+                    return ee.Algorithms.If(precipdict.contains('1')===true, 
+                    image.set('precipitationCal', precipdict.get('1')),
+                    image.set('precipitationCal', precipdict.get('0'))
+                    )
+              })
+              
+print(raincol)

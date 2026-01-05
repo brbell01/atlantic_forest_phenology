@@ -1,0 +1,411 @@
+//Import Sentinel-1 Image Collection
+var S1 = ee.ImageCollection("COPERNICUS/S1_GRD_FLOAT");
+
+print(ee.Image("COPERNICUS/S1_GRD_FLOAT/S1B_IW_GRDH_1SDV_20211126T082104_20211126T082129_029756_038D30_3B66"))
+
+//Import Study Area
+var StudyArea = ee.FeatureCollection("users/brbell01/Masters/PNH_Monte_Pascoal");
+// var StudyArea = ee.FeatureCollection("users/brbell01/Masters/PN_Mata_Escura");
+//var StudyArea = ee.FeatureCollection("users/brbell01/Masters/PE_Rio_Doce");
+//var StudyArea = ee.FeatureCollection("users/brbell01/Masters/REBIO_Sooretama");
+
+Map.centerObject(StudyArea);
+
+
+// var S1filtered = S1.filter(ee.Filter.date('2016-11-10', '2016-11-18'))
+//       .filter(ee.Filter.bounds(StudyArea));
+
+// print(S1filtered.toList(1000), 'original collection');
+
+// var unmaskedCol = S1filtered.map(function(img){
+//   // unmask each image in the collection
+//   var unmasked = img.unmask(-99).eq(-99);
+//   // reduce histogram on each image and set the keys as properties (key '1' will be masked pixels)
+//   var rR = unmasked.reduceRegion({reducer: ee.Reducer.frequencyHistogram(),
+//                               geometry: img.geometry(),
+//                               scale: 100,
+//                               bestEffort: true});
+//   var newProperties = ee.Dictionary(rR.get('VH'));
+//   return img.set(newProperties)
+  
+// })
+
+// //collection without masked pixels
+// var colNotMasked = ee.ImageCollection(unmaskedCol).filter(ee.Filter.notNull(['1']).not())
+// print(colNotMasked.toList(1000), 'notmasked');
+
+// //collection of images that have less than 200 pixeles masked
+// var colless200 = ee.ImageCollection(unmaskedCol).filterMetadata('1', 'less_than', 200);
+// print(colless200.toList(1000), 'colless200')
+
+
+//filter out edges from collection
+var S1filtered = S1.filter(ee.Filter.date('2015-01-01', '2021-11-01'))
+      .filter(ee.Filter.bounds(StudyArea))
+      .filter(ee.Filter.eq('relativeOrbitNumber_start', 82))
+      // .map(function(image){
+      //     var vhimage = image.select(['VH'])
+      //       .reduceRegion({reducer: ee.reduce.sum(),
+      //       geometry: StudyArea, 
+      //       scale: 10,
+      //       bestEffort: True});
+      //     return vhimage.filter(ee.Filter.gt('VH', '1e5'))
+      // });
+
+print(S1filtered.toList(1000))
+
+
+//filter out images from collection that don't completely cover the study area
+var daily = S1filtered
+  .map(function (image) {
+    return image
+      .set('date', image.date().format('yyyy-MM-dd'));
+  });
+
+var S1filtered_joined = ee.ImageCollection(
+    ee.Join.saveAll('images').apply({
+      primary: daily, 
+      secondary: daily, 
+      condition: ee.Filter.and(
+        ee.Filter.equals({
+          leftField: 'date',
+          rightField: 'date'
+        }),
+        ee.Filter.equals({
+          leftField: 'SPACECRAFT_NAME',
+          rightField: 'SPACECRAFT_NAME'
+        }),
+        ee.Filter.equals({
+          leftField: 'SENSING_ORBIT_NUMBER',
+          rightField: 'SENSING_ORBIT_NUMBER'
+        })
+      )
+    })
+  )
+  .map(function (image) {
+    return ee.ImageCollection(ee.List(image.get('images')))
+      .mosaic()
+      .set('system:time_start', ee.Date(image.get('date')).millis());
+  });
+
+
+//Add composite VHVVratio band 
+function combinedPols(image) {
+  var VHVVratio = image.expression(
+    '4*a/(a+b)', {
+      'a': image.select('VH'),
+      'b': image.select('VV'),
+}).rename('VHVVratio')
+
+  return image.addBands(VHVVratio);
+}
+
+var S1filtered_joined = S1filtered_joined.map(combinedPols)
+
+print(S1filtered_joined.toList(1000))
+
+//Visualize first image in the collection
+var S1first = S1filtered_joined.first().select(['VH']);
+var clipped = S1first.clip(StudyArea);
+Map.addLayer(clipped,{min: 0, max: 0.1}, 'First S1 Image')
+
+
+// //How many ascending pass images are there? [None]
+// var S1filtered_joined_asc = S1filtered_joined.filter(ee.Filter.eq('orbitProperties_pass', 'ASCENDING'))
+// print(S1filtered_joined_asc)
+
+//Check distribution of dB values
+var histogram = ui.Chart.image.histogram({
+  image: clipped,
+  region: StudyArea,
+  scale: 10,
+//  minBucketWidth: 50
+});
+histogram.setOptions({
+  title: 'Histogram of backscatter values (dB)'
+});
+
+print(histogram);
+
+
+//############################
+// Apply a Speckle Filter
+//############################
+
+
+// Function to convert from dB
+function toNatural(img) {
+  return ee.Image(10.0).pow(img.select(0).divide(10.0));
+}
+
+//Function to convert to dB
+function toDB(img) {
+  return ee.Image(img).log10().multiply(10.0);
+}
+
+//Applying a Refined Lee Speckle filter as coded in the SNAP 3.0 S1TBX:
+//https://github.com/senbox-org/s1tbx/blob/master/s1tbx-op-sar-processing/src/main/java/org/esa/s1tbx/sar/gpf/filtering/SpeckleFilters/RefinedLee.java
+//Adapted by Guido Lemoine
+//by Guido Lemoine
+
+function RefinedLee(img) {
+  // img must be in natural units, i.e. not in dB!
+  // Set up 3x3 kernels 
+  var weights3 = ee.List.repeat(ee.List.repeat(1,3),3);
+  var kernel3 = ee.Kernel.fixed(3,3, weights3, 1, 1, false);
+
+  var mean3 = img.reduceNeighborhood(ee.Reducer.mean(), kernel3);
+  var variance3 = img.reduceNeighborhood(ee.Reducer.variance(), kernel3);
+
+  // Use a sample of the 3x3 windows inside a 7x7 windows to determine gradients and directions
+  var sample_weights = ee.List([[0,0,0,0,0,0,0], [0,1,0,1,0,1,0],[0,0,0,0,0,0,0], [0,1,0,1,0,1,0], [0,0,0,0,0,0,0], [0,1,0,1,0,1,0],[0,0,0,0,0,0,0]]);
+
+  var sample_kernel = ee.Kernel.fixed(7,7, sample_weights, 3,3, false);
+
+  // Calculate mean and variance for the sampled windows and store as 9 bands
+  var sample_mean = mean3.neighborhoodToBands(sample_kernel); 
+  var sample_var = variance3.neighborhoodToBands(sample_kernel);
+
+  // Determine the 4 gradients for the sampled windows
+  var gradients = sample_mean.select(1).subtract(sample_mean.select(7)).abs();
+  gradients = gradients.addBands(sample_mean.select(6).subtract(sample_mean.select(2)).abs());
+  gradients = gradients.addBands(sample_mean.select(3).subtract(sample_mean.select(5)).abs());
+  gradients = gradients.addBands(sample_mean.select(0).subtract(sample_mean.select(8)).abs());
+
+  // And find the maximum gradient amongst gradient bands
+  var max_gradient = gradients.reduce(ee.Reducer.max());
+
+  // Create a mask for band pixels that are the maximum gradient
+  var gradmask = gradients.eq(max_gradient);
+
+  // duplicate gradmask bands: each gradient represents 2 directions
+  gradmask = gradmask.addBands(gradmask);
+
+  // Determine the 8 directions
+  var directions = sample_mean.select(1).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(7))).multiply(1);
+  directions = directions.addBands(sample_mean.select(6).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(2))).multiply(2));
+  directions = directions.addBands(sample_mean.select(3).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(5))).multiply(3));
+  directions = directions.addBands(sample_mean.select(0).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(8))).multiply(4));
+  // The next 4 are the not() of the previous 4
+  directions = directions.addBands(directions.select(0).not().multiply(5));
+  directions = directions.addBands(directions.select(1).not().multiply(6));
+  directions = directions.addBands(directions.select(2).not().multiply(7));
+  directions = directions.addBands(directions.select(3).not().multiply(8));
+
+  // Mask all values that are not 1-8
+  directions = directions.updateMask(gradmask);
+
+  // "collapse" the stack into a singe band image (due to masking, each pixel has just one value (1-8) in it's directional band, and is otherwise masked)
+  directions = directions.reduce(ee.Reducer.sum());  
+
+  //var pal = ['ffffff','ff0000','ffff00', '00ff00', '00ffff', '0000ff', 'ff00ff', '000000'];
+  //Map.addLayer(directions.reduce(ee.Reducer.sum()), {min:1, max:8, palette: pal}, 'Directions', false);
+
+  var sample_stats = sample_var.divide(sample_mean.multiply(sample_mean));
+
+  // Calculate localNoiseVariance
+  var sigmaV = sample_stats.toArray().arraySort().arraySlice(0,0,5).arrayReduce(ee.Reducer.mean(), [0]);
+
+  // Set up the 7*7 kernels for directional statistics
+  var rect_weights = ee.List.repeat(ee.List.repeat(0,7),3).cat(ee.List.repeat(ee.List.repeat(1,7),4));
+
+  var diag_weights = ee.List([[1,0,0,0,0,0,0], [1,1,0,0,0,0,0], [1,1,1,0,0,0,0], 
+    [1,1,1,1,0,0,0], [1,1,1,1,1,0,0], [1,1,1,1,1,1,0], [1,1,1,1,1,1,1]]);
+
+  var rect_kernel = ee.Kernel.fixed(7,7, rect_weights, 3, 3, false);
+  var diag_kernel = ee.Kernel.fixed(7,7, diag_weights, 3, 3, false);
+
+  // Create stacks for mean and variance using the original kernels. Mask with relevant direction.
+  var dir_mean = img.reduceNeighborhood(ee.Reducer.mean(), rect_kernel).updateMask(directions.eq(1));
+  var dir_var = img.reduceNeighborhood(ee.Reducer.variance(), rect_kernel).updateMask(directions.eq(1));
+
+  dir_mean = dir_mean.addBands(img.reduceNeighborhood(ee.Reducer.mean(), diag_kernel).updateMask(directions.eq(2)));
+  dir_var = dir_var.addBands(img.reduceNeighborhood(ee.Reducer.variance(), diag_kernel).updateMask(directions.eq(2)));
+
+  // and add the bands for rotated kernels
+  for (var i=1; i<4; i++) {
+    dir_mean = dir_mean.addBands(img.reduceNeighborhood(ee.Reducer.mean(), rect_kernel.rotate(i)).updateMask(directions.eq(2*i+1)));
+    dir_var = dir_var.addBands(img.reduceNeighborhood(ee.Reducer.variance(), rect_kernel.rotate(i)).updateMask(directions.eq(2*i+1)));
+    dir_mean = dir_mean.addBands(img.reduceNeighborhood(ee.Reducer.mean(), diag_kernel.rotate(i)).updateMask(directions.eq(2*i+2)));
+    dir_var = dir_var.addBands(img.reduceNeighborhood(ee.Reducer.variance(), diag_kernel.rotate(i)).updateMask(directions.eq(2*i+2)));
+  }
+
+  // "collapse" the stack into a single band image (due to masking, each pixel has just one value in it's directional band, and is otherwise masked)
+  dir_mean = dir_mean.reduce(ee.Reducer.sum());
+  dir_var = dir_var.reduce(ee.Reducer.sum());
+
+  // A finally generate the filtered value
+  var varX = dir_var.subtract(dir_mean.multiply(dir_mean).multiply(sigmaV)).divide(sigmaV.add(1.0));
+
+  var b = varX.divide(dir_var);
+
+  var result = dir_mean.add(b.multiply(img.subtract(dir_mean)));
+  return(result.arrayFlatten([['sum']]));
+}
+
+function MyLeeWrapper(img) {
+  return ee.Image(toDB(RefinedLee(toNatural(img))));
+}
+
+
+/////////////////////////////////////////
+////Export to image collection to Drive
+/////////////////////////////////////////
+
+// var geometryGradientBar = 
+//     /* color: #d63000 */
+//     /* displayProperties: [
+//       {
+//         "type": "rectangle"
+//       }
+//     ] */
+//     ee.Geometry.Polygon(
+//         [[[106.40599285362039, 11.312642905477976],
+//           [106.40599285362039, 11.204893914864659],
+//           [107.26841961143289, 11.204893914864659],
+//           [107.26841961143289, 11.312642905477976]]], null, false),
+
+// geometryLabel = /* color: #98ff00 */ee.Geometry.Point([106.46993299855095, 11.750301410433268]);
+
+var Palette = ['000000', 'FFFFFF'];
+
+//Function to visualize each S1 polarization band
+function visualize(image) {
+  var band = image.select(['VH'])
+//      .MyLeeWrapper()               //speckle filter not working
+      .clip(StudyArea);
+  var vis = band.visualize({bands:'VH', min:0, max:0.1, palette:Palette});
+  return vis.set('system:index', image.get('system:index'))
+}
+
+var visualized = S1filtered.map(visualize);
+
+Map.addLayer(visualized.first(),{}, 'First S1 Image smoothed');
+
+// var visParams = {bands: 'VH', min:0, max:0.1, palette:Palette}
+
+// // Add a color gradient bar with a label.
+// geometryGradientBar = geometryGradientBar; // <-- this is a drawn geometry;
+// var style = require('users/gena/packages:style');
+// var utils = require('users/gena/packages:utils');
+// var txt = require('users/gena/packages:text');
+
+// var min = 0;
+// var max = 1;
+// var textProperties = {
+//   fontSize: 32,
+//   textColor: 'ffffff',
+//   outlineColor: '000000',
+//   outlineWidth: 0,
+//   outlineOpacity: 0.6
+// };
+// var labels = ee.List.sequence(min, max);
+// var gradientBar = style.GradientBar.draw(geometryGradientBar, {
+//   min: min, max: max, palette: visParams.palette, labels: labels,
+//   format: '%.0f', text: textProperties
+// });
+
+// var label = 'S1_VH';
+// var scale = Map.getScale() * 1; // scale text font relative to the current map scale
+// geometryLabel = geometryLabel;  // <-- this comes from drawn point geometry
+// var text = text.draw(label, geometryLabel, scale, {fontSize: 32});
+
+// Create VH visualization images for use as animation frames.
+// Blend the gradient bar and label images to the VH images.
+// var VH_Vis = S1filtered_joined.map(function(img) {
+//   var m = ee.Number(img.get("month")).toInt()
+//   var y = ee.Number(img.get("year")).toInt()
+//   var label = ee.String(m).cat("-").cat(y)
+//   var text = txt.draw(label, geometryLabel, scale, {fontSize: 32});
+//   return img.visualize(visParams).clip(StudyArea).blend(text);
+// });
+
+// print(VH_Vis)
+
+// Define GIF visualization arguments.
+// var gifParams = {
+//   'region': StudyArea,
+//   'dimensions': 1024,
+// //  'crs': 'EPSG:32648',
+//   'framesPerSecond': 3,
+//   'format': 'gif'
+// };
+
+// Print the GIF URL to the console.
+// print(VH_Vis.getVideoThumbURL(gifParams));
+
+// Render the GIF animation in the console.
+// print(ui.Thumbnail(VH_Vis, gifParams));
+
+//Map.addLayer(visualized.median(), {}, 'Median composite')
+    
+// // Option 1: Convert collection to a gigantic image containing bands from all image
+// var visualizedBands = visualized.toBands()
+// Export.image.toDrive({
+//   image: visualizedBands,
+//   folder: folder,
+//   description: 'multiband_export',
+//   region: geometry,
+//   scale: scale
+// })
+
+//Option 2: Export the collection as a video
+Export.video.toDrive({
+  collection: visualized,
+  dimensions: 1024,
+  region: StudyArea,
+  description: 'video_export',
+  folder: 'earthengine',
+//  scale: 100,
+  framesPerSecond: 8,
+  maxPixels: 1e12}
+  )
+
+// // Option 3a: Use a client-side for loop. DONT DO THIS. See option 3b.
+// var size = visualized.size().getInfo();
+// for (var i = 0; i < size ; i++) {
+//     var image = ee.Image(visualized.toList(1, i).get(0));
+//     print(image)
+//     Export.image.toDrive({
+//       image: image,
+//       region: geometry,
+//       scale: 30,
+//       fileNamePrefix: image.get('system:index').getInfo(),
+//       folder: 'earthengine',
+//       description: 'Export_' + i
+//     })
+// }
+
+// // Option 3b: Export individual images, but do it asynchonously and 
+// // on press of a button rather than on load.
+// var doExport = function() {
+//   print('Working')
+//   var ids = visualized.aggregate_array('system:index');
+//   // evaluate() will not block the UI and once the result is available
+//   // will be passed-on to the callback function where we will call
+//   // Export.image.toDrive()
+//   ids.evaluate(function(imageIds) {
+//     print('Total number of images', imageIds.length)
+//     print('Exporting now... (see Tasks tab)')
+//     for(var i = 0; i < imageIds.length; i++) {
+      
+//       // Filter using the image id
+//       var image = ee.Image(visualized.toList(1, i).get(0));
+
+//       Export.image.toDrive({
+//         image: image,
+//         region: StudyArea,
+//         scale: 30,
+//         fileNamePrefix: imageIds[i],
+//         folder: 'earthengine',
+//         description: 'Export_' + i + '_' + imageIds[i]
+//       })
+//       }
+//   })
+  
+// }
+
+// print('Click button below to start export')
+// var button = ui.Button({label: 'Export', onClick: doExport})
+// print(button)
+

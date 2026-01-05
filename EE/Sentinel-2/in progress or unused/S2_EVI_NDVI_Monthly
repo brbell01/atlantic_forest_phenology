@@ -1,0 +1,198 @@
+/**** Start of imports. If edited, may not auto-convert in the playground. ****/
+var MATA_ESCURA_HECTARES = ee.FeatureCollection("projects/af-phenology/assets/Hectares/1_MataEscura_Hectares"),
+    S2 = ee.ImageCollection("COPERNICUS/S2"),
+    s2Clouds = ee.ImageCollection("COPERNICUS/S2_CLOUD_PROBABILITY"),
+    MATA_ESCURA_PARK = ee.FeatureCollection("projects/af-phenology/assets/Parks/REBIO_Mata_Escura");
+/***** End of imports. If edited, may not auto-convert in the playground. *****/
+// imports
+var helpers = require('users/brbell01/AF_Phenology:Helpers');
+var constants = require('users/brbell01/AF_Phenology:Constants');
+
+// Constants
+var AREA_NAME = 'Mata Escura'
+var S2_RED_BAND = 'B4';
+var S2_NIR_BAND = 'B8';
+
+var START_DATE = constants.STUDY_START_DATE;
+var END_DATE = constants.STUDY_END_DATE;
+var MAX_CLOUD_PROBABILITY = 60
+
+//// Functions
+
+var generateIndexChart = function(indexName, imageCollection, featureCollection, regionName) {
+  var MONTHS = ee.List.sequence(1, 12);
+  var MONTH_NAMES = ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12"];
+  
+  // Define a dictionary that associates property names with values and labels.
+  var monthInfo = {
+    '01': {v: 1, f: 'Jan'},
+    '02': {v: 2, f: 'Feb'},
+    '03': {v: 3, f: 'Mar'},
+    '04': {v: 4, f: 'Apr'},
+    '05': {v: 5, f: 'May'},
+    '06': {v: 6, f: 'Jun'},
+    '07': {v: 7, f: 'Jul'},
+    '08': {v: 8, f: 'Aug'},
+    '09': {v: 9, f: 'Sep'},
+    '10': {v: 10, f: 'Oct'},
+    '11': {v: 11, f: 'Nov'},
+    '12': {v: 12, f: 'Dec'}
+  };
+  
+  // Organize property information into objects for defining x properties and
+  // their tick labels.
+  var xPropValDict = {};  // Dictionary to codify x-axis property names as values.
+  var xPropLabels = [];   // Holds dictionaries that label codified x-axis values.
+  for (var key in monthInfo) {
+    var indexNameKey = key + '_' + indexName;
+    xPropValDict[indexNameKey] = monthInfo[key].v;
+    xPropLabels.push(monthInfo[key]);
+  }
+
+  // Function to calculate average index within the given geometry
+  function meanIndex(image, geometry) {
+    var stats = image.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: geometry,
+      scale: 10
+    });
+    return stats.get(indexName + "_mean");
+  }
+  
+  // Function to select all images for the given month and compute a mean composite
+  function monthIndex(month, imageCollection, geometry) {
+    
+    var monthImages = imageCollection.filter(
+      // Use calendarRange function to filter by month
+      ee.Filter.calendarRange({start: month, field: 'month'}));
+    var meanImage = monthImages.reduce(ee.Reducer.mean());
+    var mean = meanIndex(meanImage, geometry);
+    return ee.Number(mean);
+  }
+  
+  // Function to get the average of a band over a month in a supplied region
+  function getIndexByMonth(feature, imageCollection) {
+    // filter by bounds
+    var filtered = imageCollection.filterBounds(feature.geometry());
+    
+    // Map the function over the list
+    var indicesOfMonths = MONTHS.map(function(month) { return monthIndex(month, filtered, feature.geometry()); });
+    var IndexMonthNames = MONTH_NAMES.map(function (name) {return name + "_" + indexName});
+    var IndexByMonth = ee.Dictionary.fromLists(IndexMonthNames, indicesOfMonths);
+    var properties = feature.toDictionary().combine(IndexByMonth);
+    return ee.Feature(feature.geometry(), properties);
+  }
+  
+  var meanIndices = featureCollection.map(function(feature) { return getIndexByMonth(feature, imageCollection); })
+  
+  // Define the chart and print it to the console.
+  var combinedIndexChart = ui.Chart.feature
+                  .byProperty({
+                    features: meanIndices,
+                    xProperties: xPropValDict,
+                    seriesProperty: 'layer'
+                  })
+                  .setChartType('ColumnChart')
+                  .setOptions({
+                    title: 'Average ' + indexName + ' by Month (' + regionName + ')',
+                    hAxis: {
+                      title: 'Month',
+                      titleTextStyle: {italic: false, bold: true},
+                      ticks: xPropLabels
+                    },
+                    vAxis: {
+                      title: indexName,
+                      titleTextStyle: {italic: false, bold: true}
+                    },
+                    colors: ['604791', '1d6b99', '39a8a7', '0f8755', '76b349', 'f0af07', 'e37d05', 'cf513e', '96356f', '724173'],
+                  });
+  return combinedIndexChart;
+}
+
+var generate_EVI_NDVI_timeSeries = function(S2WithIndices, featureCollection, regionName) {
+  S2WithIndices = S2WithIndices.map(function(img) {
+    var doy = ee.Date(img.get('system:time_start')).getRelative('day', 'year');
+   return img.set('doy', doy);
+  });
+  
+  var chart =
+      ui.Chart.image
+          .series({
+            imageCollection: S2WithIndices
+            .filter(ee.Filter.date('2020-01-01', '2021-01-01'))
+            .select(['EVI', 'NDVI']),
+            region: featureCollection,
+            reducer: ee.Reducer.mean(),
+            scale: 10,
+            xProperty: 'system:time_start'
+          })
+          .setSeriesNames(['EVI', 'NDVI'])
+          .setOptions({
+            title: 'Average Vegetation Index Value by Date for ' + regionName,
+            hAxis: {title: 'Date', titleTextStyle: {italic: false, bold: true}},
+            vAxis: {
+              title: 'Vegetation index',
+              titleTextStyle: {italic: false, bold: true}
+            },
+            lineWidth: 5,
+            colors: ['e37d05', '1d6b99'],
+            curveType: 'function'
+          });
+  print(chart);
+  
+  var doyChart =
+      ui.Chart.image
+          .doySeries({
+            imageCollection: S2WithIndices
+            .select(['EVI', 'NDVI']),
+            region: featureCollection,
+            regionReducer: ee.Reducer.mean(),
+            scale: 10,
+            yearReducer: ee.Reducer.mean(),
+            startDay: 1,
+            endDay: 365
+          })
+          .setSeriesNames(['EVI', 'NDVI'])
+          .setOptions({
+            title: 'Average Vegetation Index Value by Day of Year for ' + regionName,
+            hAxis: {
+              title: 'Day of year',
+              titleTextStyle: {italic: false, bold: true}
+            },
+            vAxis: {
+              title: 'Vegetation index',
+              titleTextStyle: {italic: false, bold: true}
+            },
+            lineWidth: 2,
+            colors: ['e37d05', '1d6b99'],
+            // interpolateNulls: true
+            
+          });
+  print(doyChart);
+}
+
+//////////////////////////////////////////////////////////////////////////
+//////////
+//Main
+/////////
+//////////////////////////////////////////////////////////////////////////
+
+// Filter by study dates and park bounds
+var filter = ee.Filter.and(
+    ee.Filter.bounds(MATA_ESCURA_PARK.geometry()), 
+    ee.Filter.date(START_DATE, END_DATE));
+    
+S2 = S2.filter(filter)
+    .map(helpers.S2AddIndices);
+
+var regionName = 'Mata Escura';
+
+// Join S2 SR with cloud probability dataset to add cloud mask.
+var s2WithCloudProperty = helpers.s2AddCloudProbability(S2, s2Clouds, filter);
+var s2CloudFiltered = s2WithCloudProperty.filterMetadata('CLOUDY_PIXEL_PERCENTAGE', 'less_than', MAX_CLOUD_PROBABILITY);
+var s2CloudMasked = helpers.s2MaskClouds(s2WithCloudProperty, MAX_CLOUD_PROBABILITY);
+
+print(generateIndexChart(constants.EVI_NAME, s2CloudMasked, MATA_ESCURA_HECTARES, regionName));
+print(generateIndexChart(constants.NDVI_NAME, s2CloudMasked, MATA_ESCURA_HECTARES, regionName));
+
+generate_EVI_NDVI_timeSeries(s2CloudMasked, MATA_ESCURA_HECTARES, regionName);

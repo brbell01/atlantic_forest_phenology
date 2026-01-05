@@ -1,0 +1,52 @@
+/**** Start of imports. If edited, may not auto-convert in the playground. ****/
+var geometry = ee.FeatureCollection("projects/af-phenology/assets/Hectares/1_MataEscura/mataescura_area_1");
+/***** End of imports. If edited, may not auto-convert in the playground. *****/
+var S2 = ee.ImageCollection("COPERNICUS/S2")
+var geometry = ee.FeatureCollection("users/brbell01/Masters/1_MataEscura_Hectares");
+Map.addLayer(geometry, {color: 'red'}, 'Hectare 1')
+
+var rgb_vis = {min: 0, max: 0.3, bands: ['B4', 'B3', 'B2']};
+
+// Add a Metadata filter to select images with minimal clouds
+var filtered = S2.filterDate('2016-01-01', '2017-01-01')
+                  .filterBounds(geometry);
+Map.centerObject(geometry, 15);
+
+// Write a function that computes NDVI for an image and adds it as a band
+function addNDVI(image) {
+  var ndvi = image.normalizedDifference(['B8', 'B4']).rename('ndvi');
+  return image.addBands(ndvi);
+}
+
+// Map the function over the collection
+var withNDVI = filtered.map(addNDVI);
+
+// Function to calculate average NDVI within the given geometry
+var meanNDVI = function(image) {
+  var stats = image.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: geometry,
+    scale: 10
+  });
+  return stats.get('ndvi');
+};
+
+// Function to select all images for the given month and compute a mean composite
+var monthNDVI = function(month) {
+  var monthImages = withNDVI.filter(
+    // Use calendarRange function to filter by month
+    ee.Filter.calendarRange({start: month, field: 'month'}));
+  // For simplicity, pick one image and compute mean NDVI
+  // You can also take all images and take the mean value of the stack
+  var mean = meanNDVI(ee.Image(monthImages.first()));
+  // Round it to 2 decimals
+  return ee.Number(mean).format('%.2f');
+};
+
+// List of months
+var months = ee.List.sequence(1, 12);
+// Map the function over the list
+var NDVIByMonth = months.map(monthNDVI);
+
+print(NDVIByMonth);
+
