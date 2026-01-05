@@ -1,0 +1,86 @@
+---
+title: "S2 Phenology Processing from Earth Engine output"
+author: "J. Bruce Bell"
+date: "`r Sys.Date()`"
+---
+
+Import libraries
+```{r echo=FALSE}
+library(knitr)
+library(tidyr)
+library(lubridate)
+library(stringr)
+library(dplyr)
+library(purrr)
+library(data.table)
+library(tibble)
+library(geojsonio)
+library(sf)
+```
+
+Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Parameters
+```{r}
+#working directory
+setwd("/Users/brbell01/Google Drive/PHD/CUNY/Research/R/Phenology/raw/")
+wd <- getwd()
+
+#data descriptors
+studyarea_base <- "rio_doce" # "mata_escura" ; "monte_pascoal" ; "rio_doce" ; "sooretama"
+bandname <- "EVI2"  #"EVI"  ; "NDVI"
+
+#import s2 data
+filename_base <- paste0(wd, "/s2/1ha/second_run/", studyarea_base, "_s2_1ha")
+tables <- st_read(paste0(filename_base, "_2016_2022.geojson")) %>% st_drop_geometry()
+indexdata <- unlist(tables[bandname])
+IDs <- as.vector(tables$Hectare_ID)
+#IDs <- attr(indexdata, "names") %>% substring(5, length(.))
+```
+
+```{r}
+#define function to finish parsing the nested geojson strings
+geojson_to_df <- function(str) {
+              str %>% 
+              str_remove_all('\\"') %>% 
+              str_remove_all(" ") %>% 
+              str_remove_all("\\]") %>% 
+              str_remove_all("\\[") -> tab
+              return(read.table(text=tab, col.names = c("date", bandname
+                                ,paste0(bandname,"_sd")
+                                ), sep = ","))
+}
+```
+
+```{r}
+#loop through the geojson file list and merge time series samples together by Hectare_ID 
+indexdata <- lapply(indexdata,geojson_to_df) # process dataframes
+for (i in 1:length(indexdata)) {
+      indexdata[[i]]$date <- ymd(indexdata[[i]]$date) # format date
+      # group and average 2 samples taken by overlapping Sentinel-2 scenes (North & South).
+      # Alternatively, consider separating tables by scene to compare effect of viewing
+      # angle on index values.
+      indexdata[[i]] <- indexdata[[i]] %>% group_by(date) 
+      indexdata[[i]] <- indexdata[[i]] %>% summarize(mean = mean(.data[[bandname]], na.rm = TRUE)
+                                          , sd = mean(.data[[paste0(bandname,"_sd")]], na.rm = TRUE))
+        }         
+indexdata <- reduce(indexdata, full_join, by = "date") %>% arrange(date)  # merge by date
+
+colnames <- c() #set column names
+colnames <- lapply(1:length(IDs), function(id) {
+  IDpair <- c(paste0(bandname,"_hectareID_", as.character(IDs)[id])  
+              ,paste0(bandname,"_sd_hectareID_", as.character(IDs)[id])) 
+            colnames <- append(colnames, IDpair)
+            }) %>% 
+   unlist
+colnames <- c("date", colnames)
+names(indexdata) <- colnames
+```
+
+```{r}
+#write out processed file
+write.csv(indexdata, paste0(filename_base, "_", bandname, "_processed.csv"))
+```

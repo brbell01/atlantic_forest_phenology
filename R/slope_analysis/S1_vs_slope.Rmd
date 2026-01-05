@@ -10,28 +10,21 @@ knitr::opts_chunk$set(echo = TRUE)
 ```
 
 Imports
-```{r echo=FALSE}
-library(knitr)
-library(tidyr)
-library(lubridate)
-library(scales)
-library(ggthemes)
-library(ggtext)
-library(stringr)
-library(dplyr)
-library(ggplot2)
-library(data.table)
-library(tibble)
-library(sf)
-library(tidyquant)
-library(purrr)
-library(ggpubr)
+```{r include=FALSE}
+packages <- c("knitr", "tidyr", "lubridate", "scales", "ggthemes", "ggtext", "stringr", "dplyr", "ggplot2", "data.table", "tibble", "sf", "tidyquant", "purrr", "ggpubr")
+
+installed_packages <- rownames(installed.packages())
+for (package in packages) {
+  if (!(package %in% installed_packages)) {
+    install.packages(package)
+  }
+  library(package, character.only = TRUE)
+}
 ```
 
 ```{r}
 #working directory
-setwd("/Users/brbell01/Google Drive/PHD/CUNY/Research/R/Phenology/raw/s1/1ha/second_run/")
-wd <- getwd()
+wd <- "/Users/brbell01/Documents/git/atlantic_forest_phenology/R/raw/s1/1ha/second_run/"
 ```
 
 Import processed Sentinel-1 data tables
@@ -48,7 +41,7 @@ masterdata_list <- vector(mode = "list", length = 0)
 for (band in band.list) {
 indexdata <- slope_table <- data.frame(matrix(nrow=0, ncol=2)) ; names(slope_table) <- c("Hectare_ID", "value")
 for (studyarea_base in studyarea_list) {
-      table <- read.csv(paste0(wd, "/", studyarea_base, "_s1_1ha_", band, "_processed.csv"))
+      table <- read.csv(paste0(wd, studyarea_base, "_s1_1ha_", band, "_processed.csv"))
       table <- table[,!names(table) %in% c("X")] %>% mutate(date = ymd(date))
       table <- table %>% filter(date < as.Date('2017-01-01')) %>% gather("Hectare_ID", value, -date) %>% filter(!grepl('sd', Hectare_ID)) %>% group_by(Hectare_ID) %>% summarize(mean(value, na.rm=TRUE), sd(value,na.rm=TRUE)) %>% mutate(site_name = studyarea_base)
       names(table)[2] <- "value"  ; names(table)[3] <- "sd"
@@ -91,37 +84,78 @@ slope_table$slope_mean <- slope_table$slope_mean %>% as.numeric()
 
 ```
 
-Plots
+Plot Mean Backscatter
 ```{r}
 # Choose Index 
-index_data <- masterdata_list$VV
+index_data <- masterdata_list$RVI
+#join table 
+data <- left_join(index_data, slope_table, by=c("Hectare_ID","site_name"))
+
+index_data <- index_data %>% select(-sd)
+index_data <- index_data %>% mutate(RVI_mean = value)
+data <- data %>% mutate(RVI_mean = value)
+data <- left_join(data, index_data, by=c("Hectare_ID","site_name"))
+
+data <- data %>% select(-c(value.x, value.y, sd))
+
+#write.csv(data, file = "S1_vs_slope.csv")
+
+data <- data %>% filter(site_name == "rio_doce"| site_name == "sooretama")
+data$point_shape <- ifelse(data$site_name == "rio_doce", 16, 17)
+
+ggplot(data = data, aes(x = slope_mean, y = RVI_mean.x, color = site_name)) +
+  geom_point(aes(shape = factor(point_shape))) +  # Use different shapes for the points (16 and 17)
+  # geom_text(data = subset(data, sd > 1.2),
+  #          aes(label = Hectare_ID), size = 2.5, position = position_nudge(y = -0.07)) +
+  ylab("Mean RVI index") +
+  xlab("mean slope (degrees)") +
+  geom_smooth(method = "lm", se = FALSE,formula = y ~ x) +
+  stat_cor(aes(label = paste(..rr.label..)),  # add R^2 value
+           r.accuracy = 0.001,
+           label.x = 10) +
+  stat_regline_equation(aes(label = ..eq.label..),  # add equation to linear regression
+                        label.x = 5) +
+  theme_pubr() +
+  xlim(0, 15)
+```
+
+Plot Variance in Backscatter
+```{r}
+# Choose Index 
+index_data <- masterdata_list$RVI
 #join table 
 data <- left_join(index_data, slope_table, by=c("Hectare_ID","site_name"))
 
 index_data <- index_data %>% select(-value)
-index_data <- index_data %>% mutate(VV_sd = sd)
-data <- data %>% mutate(VH_sd = sd)
+index_data <- index_data %>% mutate(RVI_sd = sd)
+data <- data %>% mutate(RVI_sd = sd)
 data <- left_join(data, index_data, by=c("Hectare_ID","site_name"))
 
-data <- data %>% select(-c(sd.x, sd.y, label, value))
+data <- data %>% select(-c(sd.x, sd.y, value))
 
-write.csv(data, file = "S1_vs_slope.csv")
+#write.csv(data, file = "S1_vs_slope.csv")
 
-ggplot(data = data, aes(x=slope_mean, y=sd, color = site_name)) +
-  geom_point() +
-  geom_text(data=subset(data, sd > 1.2),
-            aes(label=Hectare_ID), size = 2.5, position = position_nudge(y = -0.07)) +
-  ylab("Variance (sd) in VH index value ") +
+data <- data %>% filter(site_name == "rio_doce"| site_name == "sooretama")
+data$point_shape <- ifelse(data$site_name == "rio_doce", 16, 17)
+
+ggplot(data = data, aes(x = slope_mean, y = RVI_sd.x, color = site_name)) +
+  geom_point(aes(shape = factor(point_shape))) +  # Use different shapes for the points (16 and 17)
+  # geom_text(data = subset(data, sd > 1.2),
+  #          aes(label = Hectare_ID), size = 2.5, position = position_nudge(y = -0.07)) +
+  ylab("Variance (sd) in RVI index value ") +
+  xlab("mean slope (degrees)") +
   geom_smooth(method = "lm", se = FALSE,formula = y ~ x) +
-  stat_cor(aes(label = paste(..rr.label..)), # add R^2 value
+  stat_cor(aes(label = paste(..rr.label..)),  # add R^2 value
            r.accuracy = 0.001,
-           label.x = 25) +
-  stat_regline_equation(aes(label = ..eq.label..), # add equation to linear regression
-                        label.x = 15) +
-  theme_pubr()
+           label.x = 10) +
+  stat_regline_equation(aes(label = ..eq.label..),  # add equation to linear regression
+                        label.x = 5) +
+  theme_pubr() +
+  xlim(0, 15)
 ```
+
 Save Plot
 ```{r}
-ggsave("S1_VH_vs_topographic_slope.png", units="in", width=7, height=7, dpi=300, device = 'png')
+ggsave("S1_RVI_vs_topographic_slope.png", units="in", width=7, height=7, dpi=300, device = 'png')
 ```
 

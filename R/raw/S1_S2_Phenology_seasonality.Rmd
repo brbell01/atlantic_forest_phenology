@@ -1,0 +1,1041 @@
+---
+title: "S1/S2 Phenology Seasonality"
+author: "J. Bruce Bell"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "/Users/brbell01/Documents/git/atlantic_forest_phenology/R/")
+```
+
+Imports
+```{r include=FALSE}
+# List of libraries
+libs <- c("knitr", "tidyr", "lubridate", "clock", "stringr", "dplyr", "ggplot2", "scales", "hrbrthemes", "purrr", "data.table", "tibble", "sf", "tidyquant", "circular", "readr", "DescTools", "padr", "xts", "zoo", "Kendall")
+
+# Loop through the vector and install and load each library if needed
+for (lib in libs) {
+  if (!require(lib, character.only = TRUE)) {
+    install.packages(lib)
+    library(lib, character.only = TRUE)
+  }
+}
+```
+
+Setup
+```{r}
+#set working directory
+wd <- getwd()
+
+# Choose indices and sites
+S1_band <-"RVI" 
+S2_band <- "EVI2"
+site_1 <- "rio_doce" ; site_2 <- "sooretama" # site_1 <- "mata_escura" ; site_2 <- "monte_pascoal" # 
+site.list <- c(site_1, site_2)
+
+#other params
+studyarea_bases <- c("mata_escura","monte_pascoal","rio_doce","sooretama")
+S1.band.list <- c("RVI", "VH", "VV")
+S2.band.list <- c("EVI2", "EVI", "NDVI")
+```
+
+(First run - generate seasonality table) Simple Harmonic Fit (Sentinel-1)
+```{r}
+# Read in seasonality data from harmonic analysis (S1)
+S1_path <- paste0(wd, "/raw/s1/1ha/harmonic/")
+S1_files <- dir(S1_path, full.names = T, pattern = "harmonic.csv")
+S1_season <- S1_files %>% map(read.csv, header=T)
+#loop through and extract seasonality metrics for each file
+for (file in 1:length(S1_season)) {
+  #fitted
+  fit_table <- S1_season[[file]][-c(2)]  # extract table from the file, drop unnecessary columns
+  names(fit_table)[1] <- "Date"    # rename date
+  fit_table <- fit_table %>% distinct() %>% mutate(Date = date_parse(Date, format = "%b %d, %Y")) # remove duplicates, reformat date
+  rownames(fit_table) <- fit_table$Date # format for xts class
+  fits_xts <- fit_table %>% select(-c(Date)) %>% xts(order.by = as.Date(rownames(fit_table)), "%Y-%m-%d") # xts convert
+  
+  #trend
+  y <- fit_table$fitted ; x <- fit_table$Date ; y <- predict(lm(y~x)) # extract trend
+  trend  <- data.frame(cbind(x,y)) ;  colnames(trend) <- c("Date","trend") ; trend$Date <- as.Date(trend$Date) # format trend
+  write.csv(trend, paste0(S1_files[[file]] %>% substr(1,nchar(.)-13),"_trend.csv")) # save trend
+  # xts convert
+  rownames(trend) <- trend$Date ; trend_xts  <- trend %>% select(-c(Date)) %>% xts(order.by = as.Date(rownames(trend)), "%Y-%m-%d") 
+  
+  #detrend
+  #fit_detrend <- fit_table %>% diff() %>% fortify() ; colnames(fit_detrend) <- c("Date","detrend")
+  #write.csv(fit_detrend, paste0(S1_files[[file]] %>% substr(1,nchar(.)-13),"_detrend.csv")) # save detrended file
+  
+  # use detrended hereafter for seasonality definition ; add trend values to final table
+  detrend_xts <- fits_xts - trend_xts  ; detrend <- detrend_xts %>% fortify() ; colnames(detrend) <- c("Date","detrended")
+  jan1 <- detrend$Date %>% year() %>% unique()  # list of years
+  date_breaks <- paste0(jan1, "-01-01") %>% as.Date()  # Jan. 1 of each year
+  seasonality <- data.frame(matrix(NA, nrow=1, ncol=3))  # format a blank seasonality table to hold metrics
+  dates <- matrix(rep("2017-01-01"),3) %>% t %>% data.frame() %>% mutate_all(as.Date)
+  seasonality <- seasonality %>% cbind(dates)  # append date columns
+  names(seasonality) <- c("season_start_val", "peak_val", "season_end_val", "season_start_date", "peak_date", "season_end_date") # col names
+  seasonality <- seasonality[-1,] # remove dummy values
+
+#define function which limits the dataframe to a single calendar year
+    single_year_filter <- function (dt)  {
+                dt %>% pad() %>% thicken(paste0(12, " days")) %>% select(-Date) %>% rename_at(ncol(.), ~"Date") %>% 
+                       mutate(Date = Date+1) %>% relocate(Date) %>% pad() %>%
+                       filter(between(Date, date_breaks[year], if_else(!is.na(date_breaks[year+1]), date_breaks[year+1], tail(fit_table$Date, n=1))))
+                 }
+  #loop through each year and get season peak, start, end dates from the detrended series, and values from the original time series 
+  for (year in 1:length(date_breaks)) {
+      dtable <- detrend %>% single_year_filter() %>% group_by(Date) %>% arrange(.by_group = TRUE, desc(detrended)) %>% distinct(Date, .keep_all = TRUE)
+      ttable <- trend %>% single_year_filter() %>% group_by(Date) %>% arrange(.by_group = TRUE, desc(trend)) %>% distinct(Date, .keep_all = TRUE)
+      otable <- fit_table %>% single_year_filter() %>% group_by(Date) %>% arrange(.by_group = TRUE, desc(fitted)) %>% distinct(Date, .keep_all = TRUE)
+      min_detr <- min(dtable$detrended, na.rm=T) # get season minimum detrended value
+      min_date <- dtable %>% filter(detrended == min_detr) # get season minimum date
+      min_date <- first(min_date[[1]])  # enforce single date
+      min <- otable %>% filter(Date == min_date) ; min <- min$fitted # get season minimum original fitted value
+      min_tr <- ttable %>% filter(Date == min_date) ; min_tr <- min_tr$trend # get trend value corresp to min. date
+      max_detr <- max(dtable$detrended, na.rm=T) # get season peak value
+      max_date <- dtable %>% filter(detrended == max_detr)  # get season peak date
+      max_date <- first(max_date[[1]]) # enforce single date
+      max <- otable %>% filter(Date == max_date) ; max <- max$fitted # get season peak original fitted value
+      max_tr <- ttable %>% filter(Date == max_date) ; max_tr <- max_tr$trend # get trend value corresp to min. date
+       # narrow season start window
+      if (min_date < max_date) {min_max <- otable %>% filter(between(Date, min_date, max_date))
+      } else {min_max <- otable %>% filter(between(Date, min_date, max_date + 365/2))}
+      mean <- Closest(min_max$fitted, (max_tr + min_tr)/2, na.rm = T)[1] # find season start value, enforce single value
+      s_start <- min_max %>% filter(fitted == mean) # get season start date
+      s_start <- ifelse(!is.na(mean), s_start$Date, NA) %>% as.Date() #get season start date with case for final year
+      #get season end date with cases for late peaks, early peaks, and final yr
+      if (!is.na(mean) && max_date > s_start) {s_end <- max_date - s_start + max_date %>% as.Date()
+        } else if (!is.na(mean) && max_date < s_start) {s_end <- s_start - max_date + min_date %>% as.Date() 
+        } else {s_end <- NA}
+      # find season end value, with final year case
+      if (!is.na(mean)) {
+        s_end_val <- fit_table %>% filter(between(Date, s_end-6, s_end+6))
+        } else {s_end <- NA}
+      if (!is.na(mean)) {  
+        s_end_val <- s_end_val$fitted %>% mean # enforce single value
+      } else {s_end_val <- NA}  
+      seasonality[nrow(seasonality) + 1,] <- list(mean, max, s_end_val, s_start, max_date, s_end)
+  }
+  
+  #lookup tables for original values (not the detrend values used above)
+  #fit_original <- fit_table %>% fortify() ; colnames(fit_table) <- c("Date","fitted")
+  #fit_original <- fit_original[,c("Date","fitted")]
+   
+  #pivot table for lookup 
+  #vals_long <- seasonality[,1:3] %>% pivot_longer(everything(), names_to = "val_type", values_to = "value")
+  #dates <- seasonality[,4:6]
+  #dates_long <- dates %>% pivot_longer(everything(), names_to = "date_type", values_to = "Date")
+  #join for lookup
+ # season_new <- cbind(vals_long,dates_long) %>% left_join(fit_original, by="Date")
+  #undo pivot
+ # new_vals <- season_new %>% select(c(val_type, fitted_original)) %>% mutate(grp = rep(1:3, each=6))
+ # new_vals <- cbind(grp = unique(new_vals$grp), unstack(new_vals, fitted_original ~ val_type)) %>% select(-grp)
+  
+  #gather new values
+ # seasonality <- cbind(dates, new_vals)
+  
+  # Add variables to seasonality table 
+  seasonality <- seasonality %>% mutate("Seas." = seq(1:length(season_start_val)))
+  seasonality <- seasonality %>% mutate("Ampl." = max-min)
+  seasonality <- seasonality %>% mutate("length_days" = ymd(season_end_date)-ymd(season_start_date))
+  
+  # Season definition 1: Peak to Jan. 1
+  seasonality <- seasonality %>% mutate("phase_peak" = 
+                             ifelse(year(peak_date) == year(season_start_date),
+                             ymd(peak_date) - floor_date(ymd(peak_date), unit="year"),
+                             ymd(peak_date) - floor_date(ymd(peak_date), unit="year") + 365))
+  
+  # write out seasonality file to disk
+  study_site_names <- rep(c("mata_escura","monte_pascoal","rio_doce","sooretama"), each=length(S1.band.list))
+  band_list <- rep(S1.band.list, length(study_site_names))
+  write.csv(seasonality, paste0(S1_path, study_site_names[[file]],"_s1_1ha_", band_list[[file]], "_seasonality_processed.csv"))
+}
+```
+
+(First run - generate seasonality table) Simple Harmonic Fit (Sentinel-2)
+```{r}
+start_date <- as.Date("2019-01-01")  # start analysis from this date
+# Read in seasonality data from harmonic analysis (S2)
+S2_path <- paste0(wd, "/raw/s2/1ha/harmonic/")
+S2_files <- dir(S2_path, full.names = T, pattern = "harmonic.csv")
+S2_season <- S2_files %>% map(read.csv, header=T)
+
+#define year filter function
+    year_filter <- function (dt)  {
+                dt %>% pad() %>% thicken(paste0(5, " days")) %>% select(-Date) %>% rename_at(ncol(.), ~"Date") %>% 
+                       mutate(Date = Date+1) %>% relocate(Date) %>% pad() %>% 
+                       filter(between(Date, date_breaks[year], if_else(!is.na(date_breaks[year+1]), date_breaks[year+1], tail(fit_table$Date, n=1))))
+                 }
+#loop through and extract seasonality metrics for each file
+for (file in 1:length(S2_season)) {
+  #fitted
+  fit_table <- S2_season[[file]][-c(2)]  # extract table from the file, drop unnecessary columns
+  names(fit_table)[1] <- "Date"    # rename date
+  fit_table <- fit_table %>% distinct() %>% mutate(Date = date_parse(Date, format = "%b %d, %Y")) # remove duplicates, reformat date
+  fit_table <- fit_table %>% filter(Date >= start_date)
+  rownames(fit_table) <- fit_table$Date # format for xts class
+  fits_xts <- fit_table %>% select(-c(Date)) %>% xts(order.by = as.Date(rownames(fit_table)), "%Y-%m-%d") # xts convert
+  
+  #trend
+  y <- fit_table$fitted ; x <- fit_table$Date ; y <- predict(lm(y~x)) # extract trend
+  trend  <- data.frame(cbind(x,y)) ;  colnames(trend) <- c("Date","trend") ; trend$Date <- as.Date(trend$Date) # format trend
+#  write.csv(trend, paste0(S2_files[[file]] %>% substr(1,nchar(.)-13),"_trend.csv")) # save trend
+  rownames(trend) <- trend$Date ; trend_xts  <- trend %>% select(-c(Date)) %>% xts(order.by = as.Date(rownames(trend)), "%Y-%m-%d") # xts convert
+  
+  #detrend
+  #fit_detrend <- fit_table %>% diff() %>% fortify() ; colnames(fit_detrend) <- c("Date","detrend")
+  #write.csv(fit_detrend, paste0(S2_files[[file]] %>% substr(1,nchar(.)-13),"_detrend.csv")) # save detrended file
+  
+  # use detrended hereafter for seasonality definition ; add trend values to final table
+  detrend_xts <- fits_xts - trend_xts  ; detrend <- detrend_xts %>% fortify() ; colnames(detrend) <- c("Date","detrended")
+  jan1 <- detrend$Date %>% year() %>% unique()  # list of years
+  date_breaks <- paste0(jan1, "-01-01") %>% as.Date()  # Jan. 1 of each year
+  seasonality <- data.frame(matrix(NA, nrow=1, ncol=3))  # format a blank seasonality table to hold metrics
+  dates <- matrix(rep("2017-01-01"),3) %>% t %>% data.frame() %>% mutate_all(as.Date)
+  seasonality <- seasonality %>% cbind(dates)  # append date columns
+  names(seasonality) <- c("season_start_val", "peak_val", "season_end_val", "season_start_date", "peak_date", "season_end_date") # col names
+  seasonality <- seasonality[-1,] # remove dummy values
+
+    #loop through each year and get season peak, start, end dates from the detrended series, and values from the original time series 
+  for (year in 1:length(date_breaks)) {
+      dtable <- detrend %>% year_filter() %>% group_by(Date) 
+                %>% arrange(.by_group = TRUE, desc(detrended)) %>% distinct(Date, .keep_all = TRUE)
+      ttable <- trend %>% year_filter() %>% group_by(Date) %>% 
+                arrange(.by_group = TRUE, desc(trend)) %>% distinct(Date, .keep_all = TRUE)
+      otable <- fit_table %>% year_filter() %>% group_by(Date) %>% 
+                arrange(.by_group = TRUE, desc(fitted)) %>% distinct(Date, .keep_all = TRUE)
+      min_detr <- min(dtable$detrended, na.rm=T) # get season minimum detrended value
+      min_date <- dtable %>% filter(detrended == min_detr) # get season minimum date
+      min_date <- first(min_date[[1]])  # enforce single date
+      min <- otable %>% filter(Date == min_date) ; min <- min$fitted # get season minimum original fitted value
+      min_tr <- ttable %>% filter(Date == min_date) ; min_tr <- min_tr$trend # get trend value corresp to min. date
+      max_detr <- max(dtable$detrended, na.rm=T) # get season peak value
+      max_date <- dtable %>% filter(detrended == max_detr)  # get season peak date
+      max_date <- first(max_date[[1]]) # enforce single date
+      max <- otable %>% filter(Date == max_date) ; max <- max$fitted # get season peak original fitted value
+      max_tr <- ttable %>% filter(Date == max_date) ; max_tr <- max_tr$trend # get trend value corresp to min. date
+       # narrow season start window
+      if (min_date < max_date) {min_max <- otable %>% filter(between(Date, min_date, max_date))
+      } else {min_max <- otable %>% filter(between(Date, min_date, max_date + 365))}
+      mean <- Closest(min_max$fitted, (max_tr + min_tr)/2, na.rm = T)[1] # find season start value, enforce single value
+      # get season start date
+      s_start <- min_max %>% filter(fitted == mean) 
+      #get season start date with case for final year
+      s_start <- ifelse(!is.na(mean), s_start$Date, NA) %>% as.Date()
+      #get season end date with cases for late peaks, early peaks, and final yr
+      if (!is.na(mean) && max_date > s_start) {s_end <- max_date - s_start + max_date %>% as.Date()
+        } else if (!is.na(mean) && max_date < s_start) {s_end <- s_start - max_date + min_date %>% as.Date() 
+        } else {s_end <- NA}
+      # find season end value, with final year case
+      if (!is.na(mean)) {
+        s_end_val <- fit_table %>% filter(between(Date, s_end-3, s_end+3))
+        } else {s_end <- NA}
+      if (!is.na(mean)) {  
+        s_end_val <- s_end_val$fitted %>% mean # enforce single value
+      } else {s_end_val <- NA}  
+      seasonality[nrow(seasonality) + 1,] <- list(mean, max, s_end_val, s_start, max_date, s_end)
+  }
+  
+  # Add variables to seasonality table 
+  seasonality <- seasonality %>% mutate("Seas." = seq(1:length(season_start_val)))
+  seasonality <- seasonality %>% mutate("Ampl." = max-min)
+  seasonality <- seasonality %>% mutate("length_days" = ymd(season_end_date)-ymd(season_start_date))
+  
+  # Season definition 1: Peak to Jan. 1
+  seasonality <- seasonality %>% mutate("phase_peak" = 
+                             ifelse(year(peak_date) == year(season_start_date),
+                             ymd(peak_date) - floor_date(ymd(peak_date), unit="year"),
+                             ymd(peak_date) - floor_date(ymd(peak_date), unit="year") + 365))
+
+  # write out seasonality file to disk
+  study_site_names <- rep(c("mata_escura","monte_pascoal","rio_doce","sooretama"), each=length(S2.band.list))
+  band_list <- rep(S2.band.list, length(study_site_names))
+  write.csv(seasonality, paste0(S2_path, study_site_names[[file]],"_s2_1ha_", band_list[[file]], "_seasonality_processed.csv"))
+}
+```
+
+Quick plot to show seasonality metrics reconstructed from harmonic table above
+```{r}
+  S1_path <- paste0(wd, "/raw/s1/1ha/harmonic/")
+  S1_files <- dir(S1_path, full.names = T, pattern = "harmonic.csv")
+  fit_table <- S1_files[1] %>% read.csv(header=T)
+  names(fit_table)[1] <- "Date"    # rename date
+  fit_table <- fit_table[-c(2)]  # extract table from the file, drop unnecessary columns
+  fit_table <- fit_table %>% distinct() %>% mutate(Date = date_parse(Date, format = "%b %d, %Y"))
+  rownames(fit_table) <- fit_table$Date # format for xts class
+  fits_xts <- fit_table %>% select(-c(Date)) %>% xts(order.by = as.Date(rownames(fit_table)), "%Y-%m-%d") # xts convert
+  
+  #trend
+  y <- fit_table$fitted ; x <- fit_table$Date ; y <- predict(lm(y~x)) # extract trend
+  trend  <- data.frame(cbind(x,y)) ;  colnames(trend) <- c("Date","trend") ; trend$Date <- as.Date(trend$Date) # format trend
+  rownames(trend) <- trend$Date ; trend_xts  <- trend %>% select(-c(Date)) %>% xts(order.by = as.Date(rownames(trend)), "%Y-%m-%d") # xts convert
+  
+  # use detrended hereafter for seasonality definition ; add trend values to final table
+  detrend_xts <- fits_xts - trend_xts  ; detrend <- detrend_xts %>% fortify() ; colnames(detrend) <- c("Date","detrended")
+  jan1 <- detrend$Date %>% year() %>% unique()  # list of years
+  date_breaks <- paste0(jan1, "-01-01") %>% as.Date()  # Jan. 1 of each year
+  seasonality <- data.frame(matrix(NA, nrow=1, ncol=3))  # format a blank seasonality table to hold metrics
+  dates <- matrix(rep("2017-01-01"),3) %>% t %>% data.frame() %>% mutate_all(as.Date)
+  seasonality <- seasonality %>% cbind(dates)  # append date columns
+  names(seasonality) <- c("season_start_val", "peak_val", "season_end_val", "season_start_date", "peak_date", "season_end_date") # col names
+  seasonality <- seasonality[-1,] # remove dummy values
+ 
+  year_filter <- function (dt)  {
+                dt %>% pad() %>% thicken(paste0(12, " days")) %>% select(-Date) %>% rename_at(ncol(.), ~"Date") %>% 
+                       mutate(Date = Date+1) %>% relocate(Date) %>% pad() %>% 
+                       filter(between(Date, date_breaks[year], if_else(!is.na(date_breaks[year+1]), date_breaks[year+1], tail(fit_table$Date, n=1))))
+                 }
+  #loop through each year and get season peak, start, end dates from the detrended series, and values from the original time series 
+  for (year in 1:length(date_breaks)) {
+      dtable <- detrend %>% year_filter() %>% group_by(Date) %>% arrange(.by_group = TRUE, desc(detrended)) %>% distinct(Date, .keep_all = TRUE)
+      ttable <- trend %>% year_filter() %>% group_by(Date) %>% arrange(.by_group = TRUE, desc(trend)) %>% distinct(Date, .keep_all = TRUE)
+      otable <- fit_table %>% year_filter() %>% group_by(Date) %>% arrange(.by_group = TRUE, desc(fitted)) %>% distinct(Date, .keep_all = TRUE)
+      min_detr <- min(dtable$detrended, na.rm=T) # get season minimum detrended value
+      min_date <- dtable %>% filter(detrended == min_detr) # get season minimum date
+      min_date <- first(min_date[[1]])  # enforce single date
+      min <- otable %>% filter(Date == min_date) ; min <- min$fitted # get season minimum original fitted value
+      min_tr <- ttable %>% filter(Date == min_date) ; min_tr <- min_tr$trend # get trend value corresp to min. date
+      max_detr <- max(dtable$detrended, na.rm=T) # get season peak value
+      max_date <- dtable %>% filter(detrended == max_detr)  # get season peak date
+      max_date <- first(max_date[[1]]) # enforce single date
+      max <- otable %>% filter(Date == max_date) ; max <- max$fitted # get season peak original fitted value
+      max_tr <- ttable %>% filter(Date == max_date) ; max_tr <- max_tr$trend # get trend value corresp to min. date
+       # narrow season start window
+      if (min_date < max_date) {min_max <- otable %>% filter(between(Date, min_date, max_date))
+      } else {min_max <- otable %>% filter(between(Date, max_date, min_date))}
+      mean <- Closest(min_max$fitted, (max_tr + min_tr)/2, na.rm = T)[1] # find season start value, enforce single value
+      s_start <- min_max %>% filter(fitted == mean)  # get season start date
+      s_start <- ifelse(!is.na(mean), s_start$Date, NA) %>% as.Date() #get season start date with case for final year
+      #get season end date with case for final yr
+      if (!is.na(mean) && max_date > s_start) {s_end <- max_date - s_start + max_date %>% as.Date()
+        } else if (!is.na(mean) && max_date < s_start) {s_end <- s_start - max_date + min_date %>% as.Date() 
+        } else {s_end <- NA}
+      # find season end value, with final year case
+      if (!is.na(mean)) {
+        s_end_val <- fit_table %>% filter(between(Date, s_end-6, s_end+6))
+        } else {s_end <- NA}
+      if (!is.na(mean)) {  
+        s_end_val <- s_end_val$fitted %>% mean # enforce single value
+      } else {s_end_val <- NA}  
+      seasonality[nrow(seasonality) + 1,] <- list(mean, max, s_end_val, s_start, max_date, s_end)
+  }
+  
+  #pivot table for lookup 
+  vals <- seasonality[,1:3] %>% pivot_longer(everything(), names_to = "val_type", values_to = "value")
+  dates <- seasonality[,4:6] %>% pivot_longer(everything(), names_to = "date_type", values_to = "Date")
+  seasonality_new <- cbind(vals,dates) ; rownames(seasonality_new) <- seasonality_new$Date # format for xts class
+  seasonality_xts <- seasonality_new %>% select(-c(Date)) %>% select("value") %>% xts(order.by = as.Date(rownames(seasonality_new)), "%Y-%m-%d")
+  
+
+  #plot
+  fits_xts %>% plot(col="blue")                # original fitted values
+  points(fits_xts, col="blue", cex = 1)
+  points(seasonality_xts, col="red", cex = 2)    # calculated seasonality metrics
+  lines(trend_xts, lty=2, lwd=2.5, col="red")
+
+    
+  #save to file
+  png(file="seasonality_metrics_methodology.png", width=1000, height=600)
+  fits_xts %>% plot(col="blue")                # original fitted values
+  points(fits_xts, col="blue", cex = 1)
+  points(seasonality_xts, col="red", cex = 2)    # calculated seasonality metrics
+  lines(trend_xts, lty=2, lwd=2.5, col="red")
+  dev.off()
+```
+
+Read in seasonality data. Run A (single harmonic modeled) or B (multiple harmonic modeled)
+
+A. Read in fitted and trend for time series S1/S2 plotting (single harmonic)
+```{r}
+hnumber <- "single"
+S1_start_date <- as.Date("2016-01-10")
+S2_start_date <- as.Date("2018-12-17")
+  
+# Read fitted time series and trend data files and append
+S1_dir <- "/raw/s1/1ha/harmonic/"
+S2_dir <- "/raw/s2/1ha/harmonic/"
+
+S1_fitted <- dir(paste0(wd, S1_dir), full.names = T, pattern = paste0(S1_band,"_2016_2022_harmonic.csv")) %>% map(read.csv, row.names = NULL)
+S1_trend <- dir(paste0(wd, S1_dir), full.names = T, pattern = paste0(S1_band,"_2016_2022_trend.csv")) %>% map(read.csv, row.names = NULL)
+S2_fitted <- dir(paste0(wd, S2_dir), full.names = T, pattern = paste0(S2_band,"_2016_2022_harmonic.csv")) %>% map(read.csv, row.names = NULL)
+S2_trend <- dir(paste0(wd, S2_dir), full.names = T, pattern = paste0(S2_band,"_2016_2022_trend.csv")) %>% map(read.csv, row.names = NULL)
+
+fittedlist <- list() ; trendlist <- list()
+
+#loop through each of the sites and grab the veg. index data
+for (site in site.list) {
+  #sentinel-1
+  S1_fitteddata <- vector(mode = "list", length = 0)
+  S1_table <- S1_fitted[[match(site,studyarea_bases)]]
+  S1_site_band <- paste0(site, "_", S1_band)
+  S1_fitteddata[[S1_site_band]] <- S1_table 
+  names(S1_fitteddata[[S1_site_band]]) <- c("Date", S1_band, "fitted")
+  S1_fitteddata[[S1_site_band]] <- S1_fitteddata[[S1_site_band]] %>% select(-all_of(S1_band)) %>%
+  mutate(Date = date_parse(Date, format = "%b %d, %Y")) %>% 
+  group_by(Date) %>% summarize(fitted = mean(fitted, na.rm = TRUE)) %>% ungroup()
+  
+  #sentinel-1 trend
+  S1_trenddata <- vector(mode = "list", length = 0)
+  S1_trendtable <- S1_trend[[match(site,studyarea_bases)]] %>% select(-X)
+  S1_trendtable <- data.frame(cbind(S1_trendtable$Date, S1_trendtable$trend)) # strange behavior but this is necessary for some reason
+  S1_trenddata[[S1_site_band]] <- S1_trendtable
+  names(S1_trenddata[[S1_site_band]]) <- c("Date", "trend")
+  S1_trenddata[[S1_site_band]] <- S1_trenddata[[S1_site_band]] %>% mutate(trend = as.numeric(trend))
+  S1_trenddata[[S1_site_band]] <- S1_trenddata[[S1_site_band]] %>% mutate(Date = as.Date(Date)) %>% 
+                                  group_by(Date) %>% summarize(trend = mean(trend, na.rm = TRUE)) %>% ungroup()
+
+  #sentinel-2
+  S2_fitteddata <- vector(mode = "list", length = 0)
+  S2_table <- S2_fitted[[match(site,studyarea_bases)]]
+  S2_site_band <- paste0(site, "_", S2_band)
+  S2_fitteddata[[S2_site_band]] <- S2_table 
+  names(S2_fitteddata[[S2_site_band]]) <- c("Date", S2_band, "fitted")
+  S2_fitteddata[[S2_site_band]] <- S2_fitteddata[[S2_site_band]] %>% select(-all_of(S2_band)) %>%
+  mutate(Date = date_parse(Date, format = "%b %d, %Y")) %>% group_by(Date) %>% summarize(fitted = mean(fitted, na.rm = TRUE)) %>% ungroup()
+
+  #sentinel-2 trend
+  S2_trenddata <- vector(mode = "list", length = 0)
+  S2_trendtable <- S2_trend[[match(site,studyarea_bases)]] %>% select(-X)
+  S2_trendtable <- data.frame(cbind(S2_trendtable$Date, S2_trendtable$trend)) # strange behavior but this is necessary for some reason
+  S2_trenddata[[S2_site_band]] <- S2_trendtable
+  names(S2_trenddata[[S2_site_band]]) <- c("Date", "trend")
+  S2_trenddata[[S2_site_band]] <- S2_trenddata[[S2_site_band]] %>% mutate(trend = as.numeric(trend))
+  S2_trenddata[[S2_site_band]] <- S2_trenddata[[S2_site_band]] %>% mutate(Date = as.Date(Date)) %>% 
+                                  group_by(Date) %>% summarize(trend = mean(trend, na.rm = TRUE)) %>% ungroup()
+  
+  #combine S1/S2
+  fittedlist[[site]] <- list(S1_fitteddata[[S1_site_band]], S2_fitteddata[[S2_site_band]])
+  trendlist[[site]] <- list(S1_trenddata[[S1_site_band]], S2_trenddata[[S2_site_band]])
+}
+# keep a copy for model comparison
+fittedlist -> single_harmonic_fittedlist
+```
+
+B. Read in fitted and trend Timesat outputs for time series S1/S2 plotting (multiple harmonic)
+```{r}
+hnumber <- "multiple"
+S1_orb82_start_date <- as.Date("2016-01-10")
+S1_orb155_start_date <- as.Date("2016-01-03")
+S2_start_date <- as.Date("2018-12-17")
+  
+# Read fitted time series and trend data files and append
+season_directory <- "/timesat/output/third_run/"
+TS_directory <- "/timesat/formatted_timeseries/third_run/"
+
+S1_fitted <- dir(paste0(wd, season_directory, "S1"), full.names = T, pattern = paste0(S1_band,"_STL_season.txt")) %>% map(fread, sep=" ")
+S1_trend <- dir(paste0(wd, season_directory, "S1"), full.names = T, pattern = paste0(S1_band,"_STL_trend.txt")) %>% map(fread, sep=" ")
+S2_fitted <- dir(paste0(wd, season_directory, "S2"), full.names = T, pattern = paste0(S2_band,"_STL_season.txt")) %>% map(fread, sep=" ")
+S2_trend <- dir(paste0(wd, season_directory, "S2"), full.names = T, pattern = paste0(S2_band,"_STL_trend.txt")) %>% map(fread, sep=" ")
+
+fittedlist <- list() ; trendlist <- list()
+
+#loop through both of the sites and grab the veg. index data
+for (site in site.list) {
+  #sentinel-1 fitted
+  S1_fitteddata <- vector(mode = "list", length = 0)
+  S1_table <- S1_fitted[[match(site,studyarea_bases)]] %>% t() %>% data.frame()
+  colnames(S1_table) <- "fitted"
+  len <- S1_table[,1] %>% length()
+  if(site == "rio_doce") {
+    dates <- seq(S1_orb155_start_date, by = "12 days", length.out=len)
+  } else {
+    dates <- seq(S1_orb82_start_date, by = "12 days", length.out=len)}
+  S1_table <- S1_table %>% mutate(Date = dates) %>% relocate(Date)
+  S1_site_band <- paste0(site, "_", S1_band)
+  S1_fitteddata[[S1_site_band]] <- S1_table
+  #sentinel-1 trend
+  S1_trenddata <- vector(mode = "list", length = 0)
+  S1_trendtable <- S1_trend[[match(site,studyarea_bases)]] %>% t() %>% data.frame()
+  colnames(S1_trendtable) <- "trend"
+  len <- S1_trendtable[,1] %>% length()
+  S1_trendtable <- S1_trendtable %>% mutate(Date = dates) %>% relocate(Date)
+  S1_trenddata[[S1_site_band]] <- S1_trendtable
+  
+  #sentinel-2 fitted
+  S2_fitteddata <- vector(mode = "list", length = 0)
+  S2_table <- S2_fitted[[match(site,studyarea_bases)]] %>% t() %>% data.frame()
+  colnames(S2_table) <- "fitted"
+  len <- S2_table[,1] %>% length()
+  dates <- seq(S2_start_date, by = "5 days", length.out=len)
+  S2_table <- S2_table %>% mutate(Date = dates) %>% relocate(Date)
+  S2_site_band <- paste0(site, "_", S2_band)
+  S2_fitteddata[[S2_site_band]] <- S2_table
+  #sentinel-2 trend
+  S2_trenddata <- vector(mode = "list", length = 0)
+  S2_trendtable <- S2_trend[[match(site,studyarea_bases)]] %>% t() %>% data.frame()
+  colnames(S2_trendtable) <- "trend"
+  len <- S2_trendtable[,1] %>% length()
+  S2_trendtable <- S2_trendtable %>% mutate(Date = dates) %>% relocate(Date)
+  S2_trenddata[[S2_site_band]] <- S2_trendtable
+  
+  #combine S1/S2
+  fittedlist[[site]] <- list(S1_fitteddata[[S1_site_band]], S2_fitteddata[[S2_site_band]])
+  trendlist[[site]] <- list(S1_trenddata[[S1_site_band]], S2_trenddata[[S2_site_band]])
+}
+
+# keep a copy for model comparison
+fittedlist -> multiple_harmonic_fittedlist
+```
+
+A/B Plot full fitted times series S1/S2 (x = time, y = unscaled indices)
+```{r}
+#Define study site
+study_site <-"sooretama" # "sooretama" # "rio_doce" # "monte_pascoal" # "mata_escura"
+
+if (study_site == "rio_doce") {studyarea <-  "PE Rio Doce, MG"
+} else if (study_site == "sooretama") {studyarea <- "REBIO Sooretama, ES"
+} else if (study_site == "monte_pascoal") {studyarea <- "PNH Monte Pascoal, BA"
+} else if (study_site == "mata_escura") {studyarea <- "REBIO Mata Escura, MG"
+} else {studyarea <- "NA"}
+
+if (study_site == "rio_doce" | study_site == "mata_escura") {foresttype <- "seasonal semi-deciduous forest"
+} else if (study_site == "monte_pascoal" | study_site == "sooretama") {foresttype <- "broadleaf evergreen forest"
+} else {foresttype <- "NA"}
+
+S1fit <- fittedlist[[study_site]][[1]] %>% 
+            select(Date, colnames(fittedlist[[study_site]][[1]]) %>% str_which(.,"fitted") %>% first()) %>% distinct()
+S2fit <- fittedlist[[study_site]][[2]] %>% 
+            select(Date, colnames(fittedlist[[study_site]][[2]]) %>% str_which(.,"fitted") %>% last()) %>% distinct()
+
+data <- full_join(S1fit, S2fit, by="Date")
+
+xlims <- c(as.Date("2019-01-01"), as.Date("2021-12-31"))
+month_breaks <- date_seq(from = floor_date(xlims[1], unit="month"), to = floor_date(xlims[2], unit="month"), by = duration_months(1))
+mon_abbr <- month_breaks %>% format("%b") %>% substr(1,1)
+date_frame <- data.frame("Date" = month_breaks, mon_abbr) %>% as_tibble()
+
+data <- full_join(data, date_frame, by="Date") %>% arrange(Date)
+
+colnames(data) <- c("Date", "RVI_fitted", "EVI2_fitted", "mon_abbr")
+jan1 <- paste0(data$Date %>% year %>% unique, "-01-01") %>% as.Date()
+
+meanRVI <- mean(data$RVI_fitted, na.rm = T)
+meanEVI2 <- mean(data$EVI2_fitted, na.rm=T)
+data$EVI2_fitted_rescaled <- (data$EVI2_fitted - meanEVI2)/2 + meanRVI
+data <- data %>% select(-EVI2_fitted)
+long_data <- pivot_longer(data, cols = c(-Date, -mon_abbr), names_to = "Index_Type", values_to = "Value", names_prefix = "")
+long_data$Index_Type <- factor(long_data$Index_Type)
+
+S1legend <- paste0("all plots mean ", S1_band) ; S2legend <- paste0("all plots mean ", S2_band)
+colors <- c("all plots mean RVI" = "blue", "all plots mean EVI2" = "darkgreen")
+#linetypes <- c("all plots mean RVI" = "dashed", "all plots mean EVI2" = "dashed")
+
+colors <- c("darkgreen", "blue")
+
+
+#plot time series
+ggplot(data = long_data, aes(x=Date)) +  
+  geom_ma(size = 3, ma_fun = SMA, n = 12, aes(y = Value, color = Index_Type)) +
+ # geom_line(aes(y= EVI2_fitted+0.2859671, colour = "all plots mean EVI2"), linetypes = "dashed", na.rm = T) +
+ # geom_ma(ma_fun = SMA, n = 12, aes(y= RVI_fitted, colour = "all plots mean RVI"), linetypes = 1) +
+ # geom_ma(ma_fun = SMA, n = 10, aes(y= EVI2_fitted, colour = "all plots mean EVI2"), linetypes = 2) +
+  scale_color_manual(name = "", values= colors, labels = c(S2legend, S1legend)) +
+  theme_pubr() +
+#  scale_linetype_manual(name = "", values= "dashed") +
+#       theme_minimal(base_size = 14) +
+       scale_x_date(date_labels = mon_abbr
+               , limits = xlims
+               , date_breaks = "1 month"
+#               , minor_breaks = "1 day"
+               , expand = expansion(add = .05) 
+                ) +
+       scale_y_continuous(breaks = pretty_breaks()
+              , name = "Sentinel-1 RVI Index" 
+              , sec.axis = sec_axis(~((.-meanRVI)*2)+meanEVI2, name="Sentinel-2 EVI2 Index", breaks = pretty_breaks())) +
+       xlab("Month, Year") +
+       theme(legend.position = "top"
+             , axis.text.x = element_text(angle = 0)
+             , axis.line.y.left = element_line(color = "blue")
+             , axis.line.y.right = element_line(color = "darkgreen")
+             , axis.text.y = element_text(color = "blue")
+             , axis.title.y = element_text(color = "blue")
+             , axis.text.y.right = element_text(color = "darkgreen")
+             , axis.title.y.right = element_text(color = "darkgreen")) +
+       geom_vline(color = "red", alpha = 0.3, xintercept = jan1) +
+       geom_text(aes(x = as.Date(paste0(format(Date, "%Y"), "-01-01")), y = -Inf, label = format(Date, "%Y")), angle = 90, hjust = 0, vjust = 0, color = "black", size = 4) +
+      # geom_text(aes(y = 1, x=ymd(jan1[[1]]), label = paste0("Jan. 1, ", data$Date %>% year %>% unique)), color="red") +
+      # geom_text(aes(y = 1, x=ymd(jan1[[2]]), label = paste0("Jan. 1, ", data$Date %>% year %>% unique)), color="red") +
+      # geom_text(aes(y = 1, x=ymd(jan1[[3]]), label = paste0("Jan. 1, ", data$Date %>% year %>% unique)), color="red") +
+       ggtitle(paste0("Sentinel-1 & Sentinel-2 modeled seasonality over \n", studyarea, " (single harmonic)"))
+```
+
+Save plot
+```{r}
+ggsave(paste0(study_site, "_fitted_seasonality_", S1_band, "_", S2_band,"_", hnumber, "_harmonic.png"), units="in", width=10, height=5, dpi=300, device = 'png')
+```
+
+A/B Plot full fitted times series S1/S2 (x = time, y = rescaled indices)
+```{r}
+#Define study site
+site <-"rio_doce" # "sooretama" # "rio_doce" # "monte_pascoal" # "mata_escura"
+
+if (site == "rio_doce") {studyarea <-  "PE Rio Doce, MG"
+} else if (site == "sooretama") {studyarea <- "REBIO Sooretama, ES"
+} else if (site == "monte_pascoal") {studyarea <- "PNH Monte Pascoal, BA"
+} else if (site == "mata_escura") {studyarea <- "REBIO Mata Escura, MG"
+} else {studyarea <- "NA"}
+
+if (site == "rio_doce" | site == "mata_escura") {foresttype <- "seasonal semi-deciduous forest"
+} else if (site == "monte_pascoal" | site == "sooretama") {foresttype <- "broadleaf evergreen forest"
+} else {foresttype <- "NA"}
+
+S1fit <- fittedlist[[site]][[1]] %>% 
+            select(Date, colnames(fittedlist[[site]][[1]]) %>% str_which(.,"fitted") %>% first()) %>% distinct()
+S2fit <- fittedlist[[site]][[2]] %>% 
+            select(Date, colnames(fittedlist[[site]][[2]]) %>% str_which(.,"fitted") %>% last()) %>% distinct()
+
+#detrend and scale
+rownames(S1fit) <- S1fit$Date ; rownames(S2fit) <- S2fit$Date
+S1scaled <- S1fit %>% select(-c(Date)) %>% xts(order.by = as.Date(rownames(S1fit)), "%Y-%m-%d") %>% diff() %>% scale()
+S1scale <- scale(S1fit[[2]]) %>% attr("scaled:scale") ; S1center <- scale(S1fit[[2]])  %>% attr("scaled:center")
+S2scaled <- S2fit %>% select(-c(Date)) %>% xts(order.by = as.Date(rownames(S2fit)), "%Y-%m-%d") %>% diff() %>% scale()
+S2scale <- scale(S2fit[[2]]) %>% attr("scaled:scale") ; S2center <- scale(S2fit[[2]])  %>% attr("scaled:center")
+
+scaled <- merge(S1scaled, S2scaled)
+#  %>% pivot_longer(!Date, names_to = "series") %>% mutate(Date = as.Date(Date))
+
+#data <- data.frame(dates, S1fit, S2fit) 
+
+S1legend <- paste0("all plots mean", S1_band) ; S2legend <- paste0("all plots mean", S2_band)
+colors <- c("RVI_fitted" = "blue", "EVI2_fitted" = "darkgreen")
+linetypes <- c("RVI_fitted" = "dotted", "EVI2_fitted" = "dashed")
+
+xlims <- c(as.Date("2019-01-01"), as.Date("2022-01-01"))
+#ylims <- c(-10,10)
+
+scaled <- fortify(scaled) ; S1_adjust <- 0.8*scaled[,3]
+scaled <- scaled %>% mutate(S1_band = S1_adjust) ; scaled <- scaled[-3]
+colnames(scaled) <- c("Date", "RVI_fitted", "EVI2_fitted")
+jan1 <- paste0(scaled$Date %>% year %>% unique, "-01-01") %>% as.Date()
+scaled <- scaled %>% pivot_longer(names(scaled)[-1], names_to = "index")
+#read in rainfall data
+rainfall_filename <- paste0(str_to_title(site), "_IMERG_2016-2022_14day_sum.csv")  ;
+
+#Import max. hourly rate (reported daily) rainfall data ; rainfall is raw and filtered for values 
+raintable <- read.csv(paste0("/Users/brbell01/Google Drive/PHD/CUNY/Research/Data/Raster/IMERG/", rainfall_filename), header=T)
+
+raintable <- raintable %>% mutate(Date = date_parse(raintable$system.time_start, format = "%b %d, %Y")) %>% select(-system.time_start) %>% relocate(Date) %>% mutate(month = month(ymd(Date)), year = year(ymd(Date))) %>% group_by(month, year) %>% summarise(monthly_precip = sum(precipitationCal)) %>% ungroup() %>% mutate(Date = paste0(year,"-",month,"-01"))
+raintable$Date <- ymd(raintable$Date)
+
+precip_scaled <- scale(raintable$monthly_precip)[,1]
+raintable <-raintable %>% mutate(precip_scaled = precip_scaled)
+raintable <-raintable %>% mutate(precip_baseline = -1.5)
+
+#plot time series
+ggplot() +  
+ # geom_point(data = raintable, aes(x=Date, y=precip_scaled/2-1), shape = c("—"), size = 5) +
+  geom_segment(data = raintable, aes(x=Date, xend=Date, y=precip_scaled/2-1, yend=precip_baseline), size=5, alpha=0.4) +
+  geom_text(data = raintable, aes(x=Date, y=precip_scaled/2-1+0.05, label=monthly_precip %>% round), vjust=0.05) +
+  geom_ma(size = 3, ma_fun = SMA, n = 12, data = scaled, aes(x=Date, y=value, colour = index, linetype=index)) +
+#  geom_ma(size = 2, ma_fun = SMA, n = 12, data = scaled, aes(x=Date, y= EVI2_fitted*0.8, colour = "EVI2", linetype="dashed")) +
+  theme_light() +
+  scale_color_manual(name = "Legend", values= colors) +
+  scale_linetype_manual(name = "Legend", values= linetypes) +
+  scale_y_continuous(~.*S1scale+S1center) +
+  scale_x_date(date_labels = "%b, %Y"
+               , limits = xlims
+               , date_breaks = "3 month"
+#               , minor_breaks = "1 day"
+               , expand = expansion(add = 0)) +
+  scale_y_continuous(breaks = pretty_breaks()
+              , name = "Sentinel-1 RVI Index (detrended)" 
+              , sec.axis = sec_axis(~.*S2scale+S2center,name="Sentinel-1 EVI2 Index (detrended)"
+              , breaks = pretty_breaks())) +
+  xlab("Month, Year") +
+  theme(legend.position = "top", legend.title = element_blank(), legend.spacing.x = unit(1, 'cm')
+             , axis.text.x = element_text(angle = 45, color = "black") 
+             , panel.grid.major = element_blank()
+             , panel.grid.minor = element_blank()
+             , axis.text.y = element_text(color = "white")
+             , axis.title.y = element_text(color = "white", margin = margin(r=-15))
+             , axis.text.y.right = element_text(color = "white")
+             , axis.title.y.right = element_text(color = "white", margin = margin(l=-15))
+             , axis.line.y.left=element_line(color = "red")
+             , axis.line.y.right=element_line(color = "red")
+             , panel.border = element_blank()) +
+  geom_vline(color = "red", xintercept = jan1) +
+  # geom_text(aes(y = 1, x=ymd(jan1[[1]]), label = paste0("Jan. 1, ", data$Date %>% year %>% unique)), color="red") +
+  # geom_text(aes(y = 1, x=ymd(jan1[[2]]), label = paste0("Jan. 1, ", data$Date %>% year %>% unique)), color="red") +
+  # geom_text(aes(y = 1, x=ymd(jan1[[3]]), label = paste0("Jan. 1, ", data$Date %>% year %>% unique)), color="red") +
+  ggtitle(paste0("Sentinel-1 & Sentinel-2 modeled seasonality over \n", studyarea, " (", hnumber, " harmonic)"))
+```
+
+Save plot
+```{r}
+ggsave(paste0(site, "_fitted_seasonality_scaled_", S1_band, "_", S2_band,"_rainfall_un", hnumber, "_harmonic.png"), units="in", width=10, height=5, dpi=300, device = 'png')
+``` 
+
+Plotting: Check fit with raw data ; model comparison (x= time, y = scatter, single & multiple models)
+```{r}
+# Read original and fitted time series data files
+season_directory <- "/timesat/output/third_run/"
+S1_dir <- "/raw/s1/1ha/harmonic/"
+S2_dir <- "/raw/s2/1ha/harmonic/"
+full_sitelist <- c("mata_escura", "monte_pascoal", "rio_doce", "sooretama")
+S1_orb82_start_date <- as.Date("2016-01-10")
+S1_orb155_start_date <- as.Date("2016-01-03")
+S2_start_date <- as.Date("2018-12-17")
+
+S1_fitted_single <- dir(paste0(wd, S1_dir), full.names = T, pattern = paste0(S1_band,"_2016_2022_harmonic.csv")) %>% map(read.csv, row.names = NULL)
+S2_fitted_single <- dir(paste0(wd, S2_dir), full.names = T, pattern = paste0(S2_band,"_2016_2022_harmonic.csv")) %>% map(read.csv, row.names = NULL)
+S1_fitted_multiple <- dir(paste0(wd, season_directory, "S1"), full.names = T, pattern = paste0(S1_band,"_STL_season.txt")) %>% map(fread, sep=" ")
+S2_fitted_multiple <- dir(paste0(wd, season_directory, "S2"), full.names = T, pattern = paste0(S2_band,"_STL_season.txt")) %>% map(fread, sep=" ")
+
+S1fitted_single <- vector(mode = "list", length = 0) ; S2fitted_single <- vector(mode = "list", length = 0)
+S1fitted_multiple <- vector(mode = "list", length = 0) ; S2fitted_multiple <- vector(mode = "list", length = 0)
+for (site in site.list) {
+      #S1 single
+      S1fitted_single[[site]] <- S1_fitted_single[[match(site,full_sitelist)]]
+      S1fitted_single[[site]] <- S1fitted_single[[site]] %>% mutate(Date = date_parse(system.time_start, format = "%b %d, %Y")) %>% relocate(Date)
+      S1fitted_single[[site]] <- S1fitted_single[[site]] %>% select(-system.time_start) %>%
+            group_by(Date) %>% summarize(across(1:2, mean, na.rm=T, .names = "{.col}")) %>% ungroup()
+      #S1 multiple
+      S1fitted_multiple[[site]] <- S1_fitted_multiple[[match(site,full_sitelist)]]
+      S1fitted_multiple[[site]] <- S1fitted_multiple[[site]] %>% t() %>% data.frame()
+      colnames(S1fitted_multiple[[site]]) <- "fitted_multiple"
+      len <- S1fitted_multiple[[site]][,1] %>% length()
+      if(site == "rio_doce") { 
+        dates <- seq(S1_orb155_start_date, by = "12 days", length.out=len)
+      } else { 
+        dates <- seq(S1_orb82_start_date, by = "12 days", length.out=len)
+      }
+      S1fitted_multiple[[site]] <- S1fitted_multiple[[site]] %>% mutate(Date = dates) %>% relocate(Date)
+      
+      #S2 single
+      S2fitted_single[[site]] <- S2_fitted_single[[match(site,full_sitelist)]]
+      S2fitted_single[[site]] <- S2fitted_single[[site]] %>% mutate(Date = date_parse(system.time_start, format = "%b %d, %Y")) %>% relocate(Date)
+      S2fitted_single[[site]] <- S2fitted_single[[site]] %>% select(-system.time_start) %>%
+            group_by(Date) %>% summarize(across(1:2, mean, na.rm=T, .names = "{.col}")) %>% ungroup()
+      
+      #S2 multiple
+      S2fitted_multiple[[site]] <- S2_fitted_multiple[[match(site,full_sitelist)]]
+      S2fitted_multiple[[site]] <- S2fitted_multiple[[site]] %>% t() %>% data.frame()
+      colnames(S2fitted_multiple[[site]]) <- "fitted_multiple"
+      len <- S2fitted_multiple[[site]][,1] %>% length()
+      dates <- seq(S2_start_date, by = "5 days", length.out=len)
+      S2fitted_multiple[[site]] <- S2fitted_multiple[[site]] %>% mutate(Date = dates) %>% relocate(Date)
+}
+
+#Construct multiple time series dataframe for each site 
+S1series <- vector(mode = "list", length = 0)
+S2series <- vector(mode = "list", length = 0)
+for (site in site.list) {
+  #S1
+  S1series[[site]] <- merge.zoo(read.zoo(S1fitted_single[[site]]), 
+                                read.zoo(S1fitted_multiple[[site]]))
+  names(S1series[[site]]) <- c(names(S1fitted_single[[site]][-1]), "fitted_multiple")
+  #S2
+  S2series[[site]] <- merge.zoo(read.zoo(S2fitted_single[[site]]), 
+                                read.zoo(S2fitted_multiple[[site]]))
+  names(S2series[[site]]) <- c(names(S2fitted_single[[site]][-1]), "fitted_multiple")
+}
+
+#define outlier function
+remove_outliers <- function(x, na.rm = TRUE, ...) {
+  qnt <- quantile(x, probs=c(.1, .9), na.rm = na.rm, ...)
+  H <- 1.5 * IQR(x, na.rm = na.rm)
+  y <- x
+  y[x < (qnt[1] - H)] <- NA
+  y[x > (qnt[2] + H)] <- NA
+  y
+}
+
+
+# choose site to plot
+site <- "rio_doce"
+
+
+
+#par(mfrow = c(2, 1))
+S1series[[site]] %>% na.approx() %>% plot(type = c("p", "l", "l"), screens = 1, col = c("blue", "orange", "purple"), cex = 0.6, pch=20, ylab="", xlab="", cex.axis = 1.5, main = "")
+mtext(expression(bold("Sentinel-1 RVI")), side = 2, line = 2.2, col = "blue" , adj=0.5, cex = 1.7)
+mtext("Date", side = 1, line = 4, cex = 2)
+
+S2series[[site]] %>% na.approx() %>% plot(type = c("p", "l", "l"), screens = 1, col = c("darkgreen", "orange", "purple"), cex = 0.6, pch=20, ylim = c(0.2,0.6), ylab="", xlab="", cex.axis = 1.5, main = "")
+mtext(expression(bold("Sentinel-2 EVI2")), side = 2, line = 2.2, col = "darkgreen", adj=0.5, cex = 1.7)
+mtext("Date", side = 1, line = 4, cex = 2)
+
+```
+
+A/B. Plot setup - annual fitted time series S1/S2 (normal (Jan.-Dec.) and recentered (April-March))
+```{r}
+#Define study site
+study_site <-"sooretama" # "sooretama" # "rio_doce" # "monte_pascoal" # "mata_escura"
+
+if (study_site == "rio_doce") {studyarea <-  "PE Rio Doce, MG"
+} else if (study_site == "sooretama") {studyarea <- "REBIO Sooretama, ES"
+} else if (study_site == "monte_pascoal") {studyarea <- "PNH Monte Pascoal, BA"
+} else if (study_site == "mata_escura") {studyarea <- "REBIO Mata Escura, MG"
+} else {studyarea <- "NA"}
+
+if (study_site == "rio_doce" | study_site == "mata_escura") {foresttype <- "seasonal semi-deciduous forest"
+} else if (study_site == "monte_pascoal" | study_site == "sooretama") {foresttype <- "broadleaf evergreen forest"
+} else {foresttype <- "NA"}
+
+S1fit <- fittedlist[[study_site]][[1]] %>% data.frame(); S2fit <- fittedlist[[study_site]][[2]] %>% data.frame()
+S1tr <- trendlist[[study_site]][[1]] %>% data.frame(); S2tr <- trendlist[[study_site]][[2]] %>% data.frame()
+
+#detrend and scale
+rownames(S1fit) <- S1fit$Date ; rownames(S2fit) <- S2fit$Date
+rownames(S1tr) <- S1tr$Date ; rownames(S2tr) <- S2tr$Date
+
+#Sentinel-1 convert fit and trend to xts 
+S1fit_xts <- S1fit %>% select(-c(Date)) %>% xts(order.by = as.Date(rownames(S1fit), "%Y-%m-%d"))
+S1tr_xts <- S1tr %>% select(-c(Date)) %>% xts(order.by = as.Date(rownames(S1tr), "%Y-%m-%d"))
+
+#Sentinel-2 convert fit and trend to xts 
+S2fit_xts <- S2fit %>% select(-c(Date)) %>% xts(order.by = as.Date(rownames(S2fit), "%Y-%m-%d"))
+S2tr_xts <- S2tr %>% select(-c(Date)) %>% xts(order.by = as.Date(rownames(S2tr), "%Y-%m-%d"))
+S1detr_xts <- S1fit_xts - S1tr_xts ; S2detr_xts <- S2fit_xts - S2tr_xts
+
+S1scaled <- S1detr_xts %>% scale()
+S1scale <- scale(S1detr_xts) %>% attr("scaled:scale") ; S1center <- scale(S1detr_xts)  %>% attr("scaled:center")
+S2scaled <- S2detr_xts %>% scale()
+S2scale <- scale(S2detr_xts) %>% attr("scaled:scale") ; S2center <- scale(S2detr_xts)  %>% attr("scaled:center")
+scaled <- merge(S1scaled, S2scaled) 
+#  %>% pivot_longer(!Date, names_to = "series") %>% mutate(Date = as.Date(Date))
+
+#data <- data.frame(dates, S1fit, S2fit) 
+
+S1legend <- paste0("all plots mean", S1_band) ; S2legend <- paste0("all plots mean", S2_band)
+colors <- c("all plots mean annual RVI" = "blue", "all plots mean annual EVI2" = "dark green")
+linetypes <- c("all plots mean annual RVI" = "solid", "all plots mean annual EVI2" = "solid")   # doesn't seem to be working
+
+xlims <- c(as.Date("2019-01-01"), as.Date("2022-01-01"))
+#ylims <- c(-10,10)
+
+scaled <- fortify(scaled)
+colnames(scaled)[] <- c("Date", paste0(S1_band, "_fitted"), paste0(S2_band, "_fitted"))
+jan1 <- paste0(scaled$Date %>% year %>% unique, "-01-01") %>% as.Date()
+
+scaled_means <- scaled  # %>% filter(between(Date, xlims[1], xlims[2])) %>% mutate(year = year(Date))
+scaled_means <- scaled_means %>% mutate(doy = ymd(paste0("1901-", month(Date), "-", day(Date)))) %>% group_by(doy) %>% summarise_all(.funs = c(mean="mean"), na.rm = TRUE) %>% pad(by='doy') 
+scaled_means$RVI_fitted_mean[is.nan(scaled_means$RVI_fitted_mean)]<-NA
+scaled_means$EVI2_fitted_mean[is.nan(scaled_means$EVI2_fitted_mean)]<-NA
+
+# reorder table to center the peak in the plot
+scaled_means_high <- scaled_means %>% filter(doy >= as.Date("1901-04-01"))  # April 1st cutoff
+scaled_means_low <- scaled_means %>% filter(doy < as.Date("1901-04-01"))
+scaled_means_reorder <- rbind(scaled_means_high, scaled_means_low) %>% select(-Date_mean)
+
+#import ggplot themes (for "ipsum" theme)
+hrbrthemes::update_geom_font_defaults()
+
+#create x-axis labels
+months <- as.Date(scaled_means_reorder$doy, origin = "1901-01-01") %>% month()
+labels <- month.name[months] %>% substr(1,3) %>% paste0("-01") %>% data.frame(cbind(1:length(months)), row.names = NULL) ; colnames(labels) <- c("label", "id")
+numbers <- labels %>% group_by(label) %>% summarise(number = n(), sum = sum(id)) %>% arrange(sum)
+labels <- numbers %>% rowwise() %>% mutate(nice_labels = list(c(label, rep(NA, len=number-1)))) %>% unnest_longer(nice_labels) %>% select(nice_labels)
+
+scaled_means_reorder <- cbind(scaled_means_reorder,labels) %>% rownames_to_column() %>% mutate(nice_labels = replace_na(nice_labels, " "))
+scaled_means_reorder$rowname <- factor(scaled_means_reorder$rowname, levels = scaled_means_reorder$rowname, ordered = T)
+
+scaled_means_reorder["group"] <- rep(1,length(scaled_means_reorder$rowname))
+scaled_means_reorder <- scaled_means_reorder %>% select(-doy)
+```
+
+A/B. Plot mean annual fitted time series S1/S2 (normal)
+```{r}
+# plot mean annual
+data <- scaled %>% mutate(doy = ymd(paste0("1901-", month(Date), "-", day(Date))))
+ggplot() +  
+  geom_ma(ma_fun = ZLEMA, n = 20, data= scaled_means[!is.na(scaled_means$RVI_fitted_mean),]
+            , aes(group =1, x=doy, y= RVI_fitted_mean, colour = "all plots mean annual RVI", linetype = "solid"), size = 0.8) +
+ # geom_ma(ma_fun = ZLEMA, n = 20, data = scaled_means[!is.na(scaled_means$EVI2_fitted_mean),]
+ #           , aes(group =1, x=doy, y= EVI2_fitted_mean, colour = "all plots mean annual EVI2", linetype = "solid"), size = 0.8) +
+  #geom_line(data= scaled_means[!is.na(scaled_means$RVI_fitted_mean),]   # strange that the line geom gives correct linetype
+  #          , aes(group =1, x=doy, y= RVI_fitted_mean, colour = "all plots mean annual RVI"), size = 0.8) +
+  #geom_line(data = scaled_means[!is.na(scaled_means$EVI2_fitted_mean),]
+  #          , aes(group =1, x=doy, y= EVI2_fitted_mean, colour = "all plots mean annual EVI2"), size = 0.8) +
+  #geom_point(data = data, aes(x=doy, y= RVI_fitted, colour = "all plots mean annual RVI"), size = 0.3, alpha = 0.4) +
+  #geom_point(data = data, aes(x=doy, y= EVI2_fitted, colour = "all plots mean annual EVI2"), size = 0.3, alpha = 0.4) +
+  #geom_path(aes(x=rowname, y= EVI2_fitted_mean, colour = "all plots mean EVI2"), size = 0.8) +
+  geom_vline(color = "black", alpha = 0.1, xintercept = jan1) +
+  #geom_line(data= scaled_means[!is.na(scaled_means$RVI_fitted_mean),]
+  #          , aes(group =1, x=rowname, y= RVI_fitted_mean, colour = "all plots mean RVI"), size = 0.8) +
+  #geom_line(data = scaled_means[!is.na(scaled_means$EVI2_fitted_mean),]
+  #          , aes(group =1, x=rowname, y= EVI2_fitted_mean, colour = "all plots mean EVI2"), size = 0.8) +
+  scale_color_manual(name = " ", values= colors) +
+  #scale_linetype_manual(values= linetypes) +
+  theme_bw() +
+  scale_x_date(name = "Day of Year", date_labels = "%b-%d", date_breaks = "1 month", expand = expansion(add = .05)) +
+  scale_y_continuous(~.*S1scale+S1center, breaks = pretty_breaks()
+              , name = "Sentinel-1 RVI Index (detrended)" 
+              , sec.axis = sec_axis(~.*S2scale+S2center, name="Sentinel-2 EVI2 Index (detrended)"
+              , breaks = pretty_breaks())) +
+  theme(legend.position = "top", 
+         panel.grid.major.x = element_blank(),
+         axis.text.y = element_text(color = "blue"),
+         axis.text.x = element_text(vjust = 0.5, angle = 60),
+         axis.title.y = element_text(color = "blue"),
+         axis.text.y.right = element_text(color = "dark green"),
+         axis.title.y.right = element_text(color = "dark green"),
+         panel.grid.major.y =  element_blank(),
+         panel.grid.minor = element_blank()) +
+   ggtitle(paste0("Annual means (", year(xlims)[1], "-", year(xlims)[2], ") of modeled seasonality (", hnumber, " harmonic)\nover ", foresttype, ", ", studyarea, " "))
+```
+
+Save normal plot
+```{r}
+ggsave(paste0(study_site, "_mean_annual_seasonality_", S1_band, "_", S2_band,"_", hnumber, "_harmonic.png"), units="in", width=10, height=5, dpi=300, device = 'png')
+```
+
+A/B. Plot annual fitted time series S1/S2 (recentered)
+```{r}
+# plot mean annual, reordered
+ggplot() +  
+  geom_ma(ma_fun = ZLEMA, n = 20, data= scaled_means_reorder[!is.na(scaled_means_reorder$RVI_fitted_mean),]
+            , aes(group =1, x=rowname, y= RVI_fitted_mean, colour = "all plots mean annual RVI"), size = 0.8) +
+  geom_ma(ma_fun = ZLEMA, n = 20, data = scaled_means_reorder[!is.na(scaled_means_reorder$EVI2_fitted_mean),]
+            , aes(group =1, x=rowname, y= EVI2_fitted_mean, colour = "all plots mean annual EVI2"), size = 0.8) +
+  #geom_path(aes(x=rowname, y= EVI2_fitted_mean, colour = "all plots mean EVI2"), size = 0.8) +
+  geom_vline(color = "black", alpha = 0.1, xintercept = c(0, cumsum(numbers$number))) +
+  #geom_line(data= scaled_means_reorder[!is.na(scaled_means_reorder$RVI_fitted_mean),]   # strange that the line geom gives correct linetype
+  #          , aes(group =1, x=rowname, y= RVI_fitted_mean, colour = "all plots mean RVI"), size = 0.8) +
+  #geom_line(data = scaled_means_reorder[!is.na(scaled_means_reorder$EVI2_fitted_mean),]
+  #          , aes(group =1, x=rowname, y= EVI2_fitted_mean, colour = "all plots mean EVI2"), size = 0.8) +
+  scale_color_manual(name = " ", values= colors) +
+  #scale_linetype_manual(values= linetypes) +
+  theme_bw() +
+  scale_x_discrete(labels = scaled_means_reorder$nice_labels
+                   , name = "Day of Year"
+                 #  , breaks = c(0, cumsum(numbers$number))  # fix with secondary axis???
+                   ) +
+  scale_y_continuous(~.*S1scale+S1center, breaks = pretty_breaks()
+              , name = "Sentinel-1 RVI Index (detrended)" 
+              , sec.axis = sec_axis(~.*S2scale+S2center, name="Sentinel-2 EVI2 Index (detrended)"
+              , breaks = pretty_breaks())) +
+  theme(legend.position = "top", 
+         panel.grid.major.x = element_blank(),
+         axis.text.y = element_text(color = "blue"),
+         axis.text.x = element_text(vjust = 0.5, angle = 60),
+         axis.title.y = element_text(color = "blue"),
+         axis.text.y.right = element_text(color = "dark green"),
+         axis.title.y.right = element_text(color = "dark green"),
+         panel.grid.major.y =  element_blank(),
+         panel.grid.minor = element_blank()) +
+   ggtitle(paste0("Annual means (", year(xlims)[1], "-", year(xlims)[2], ") of modeled seasonality (", hnumber, " harmonic)\nover ", foresttype, ", ", studyarea, " "))
+```
+
+Save recentered plot
+```{r}
+ggsave(paste0(study_site, "_mean_annual_seasonality_", S1_band, "_", S2_band,"_", hnumber, "_harmonic_recentr.png"), units="in", width=10, height=5, dpi=300, device = 'png')
+```
+
+Other plots...
+
+(plot entire time series - fits)
+```{r}
+ggplot(data = scaled, aes(x=Date)) +  
+  geom_ma(ma_fun = SMA, n = 20, aes(y= RVI_fitted, colour = "all plots mean RVI")) +
+  geom_ma(ma_fun = SMA, n = 20, aes(y= EVI2_fitted, colour = "all plots mean EVI2")) +
+  #geom_line(aes(y= RVI_fitted, colour = "all plots mean RVI")) +
+  #geom_line(aes(y= EVI2_fitted, colour = "all plots mean EVI2")) +
+  geom_vline(color = "red", alpha = 0.3, xintercept = jan1) +
+  scale_color_manual(name = "Legend", values= colors) +
+  #scale_linetype_manual(values= linetypes) +
+  theme_bw() +
+  scale_x_date(date_labels = "%b,%Y", limits = xlims, date_breaks = "3 month", expand = expansion(add = .05)) +
+  scale_y_continuous(~.*S1scale+S1center, breaks = pretty_breaks()
+              , name = "Sentinel-1 RVI Index (detrended)"
+              , sec.axis = sec_axis(~.*S2scale+S2center, name="Sentinel-1 EVI2 Index (detrended)"
+              , breaks = pretty_breaks())) +
+  xlab("Month, Year") +
+  theme(legend.position = "top", 
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  axis.text.y = element_text(color = "blue"),
+  axis.text.x = element_text(vjust = 0.5, angle = 60),
+  axis.title.y = element_text(color = "blue"),
+  axis.text.y.right = element_text(color = "dark green"),
+  axis.title.y.right = element_text(color = "dark green")) +
+  ggtitle(paste0("Sentinel-1 & Sentinel-2 modeled seasonality over \n", site, " (multiple harmonic)"))
+```
+
+Split data using season definition defined above (A or B)
+```{r}
+plotdata.stats <- plotdata %>% 
+              mutate(day = yday(date)) %>%  #create a month factor
+              mutate(season=cut(day, #create season factor
+              breaks=season_def,  #define seasons by day of year 
+              labels=c("wet","dry","wet"))) %>%  
+              mutate(year = year(date)) %>%  #create a year factor
+              mutate(Hectare_ID = substring(Hectare_ID, 14)) %>%
+              group_by(Hectare_ID) %>%    #group and reorder ascending
+              mutate(mean = mean(value, na.rm = TRUE)) %>% arrange(mean) %>%
+             # mutate(sortorder = rep(seq(1:length(IDs)), length.out = length(Hectare_ID))) %>%
+              ungroup()
+
+plotdata.stats <- data.frame(value = plotdata.stats$value,      #rearrange
+                             Hectare_ID = factor(plotdata.stats$Hectare_ID),
+                             season = factor(plotdata.stats$season), 
+                             year = factor(plotdata.stats$year)
+#                             ,sortorder = factor(indexdata.stats$sortorder)
+)
+```
+
+Plot seasonality by 1-ha plot
+```{r}
+#take a random sample 
+selectedrows <- sample.int(plotdata.stats$Hectare_ID %>% unique() %>% length(), 30, replace = F)
+plotdata.stats <- plotdata.stats[is.element(plotdata.stats$Hectare_ID, selectedrows),]
+
+#plot seasonal comparison
+xlabs <- plotdata.stats$Hectare_ID %>% unique() %>% as.character()
+ylims <- c(-16,-10)
+#check boxplots
+colors = c("wet" = "blue", "dry" = "orange")
+plotdata.stats %>% na.omit() %>% 
+  ggplot(aes(y=value, x=Hectare_ID, color = season, fill = season)) + 
+    geom_boxplot(outlier.size=0.5, outlier.colour = NULL, show.legend = FALSE) + 
+    scale_fill_manual(values=c("blue", "orange")) +
+    scale_color_manual(values=c("blue", "orange")) +
+    scale_x_discrete(labels=xlabs) +
+    ylab(paste0("Mean ", bandname, " index value (dB)")) +
+    theme_minimal(base_size = 14) +
+    theme(axis.text.x = element_text(angle = 90, vjust=0.5)) +
+    ggtitle(paste0("Plot-wise seasonal comparison of mean annual ", bandname, " backscatter \n (Sentinel-1) for ",  
+                   "30 randomly selected 1 ha",
+    #     length(unique(plotdata$Hectare_ID)), " ", scale, 
+         " plots, ", studyarea, ", Brazil"))
+```
+
+Save plot
+```{r}
+ggsave(paste0(studyarea_base, "_plotseasonal_s1_", bandname, ".png"), units="in", width=10, height=5, dpi=300, device = 'png')
+```
+
+Analysis of variance:season
+```{r}
+#fit the linear model 
+fit <- lm(value ~ season*year*Hectare_ID, plotdata.stats, 
+          contrasts = list(Hectare_ID = "contr.sum", year = "contr.poly"))
+anova(fit) %>% kable(digits = 10) 
+write.csv(anova(fit) , paste0(studyarea_base, "_anova_s1_", bandname, ".csv"))
+
+```
+
+Histogram
+```{r}
+#plot histogram
+hist(indexdata.mean$mean, breaks = 20, ylim = c(0,25), xlab= paste0("Mean ", bandname, " value (dB)"), ylab= "Number of days / year", main= paste0("\n\n Distribution of daily Sentinel-1 averaged ", bandname, " backscatter \n values for ", length(indexdata)-1, " 1-ha plots over ", foresttype, ",\n ", studyarea, ", Brazil (2016-2021)"), border=F, col="dark blue")
+
+abline(h=seq(0,55,5), col="gray", lty="dotted")
+
+ggsave(paste0(studyarea_base, "_histannual_s1.png"), units="in", width=10, height=5, dpi=300, device = 'png')
+```
+
+misc code
+```{r}
+if (study_site == "rio_doce") {studyarea <-  "PE Rio Doce, MG"
+} else if (study_site == "sooretama") {studyarea <- "REBIO Sooretama, ES"
+} else if (study_site == "monte_pascoal") {studyarea <- "PNH Monte Pascoal, BA"
+} else if (study_site == "mata_escura") {studyarea <- "REBIO Mata Escura, MG"
+} else {studyarea <- "NA"}
+
+if (study_site == "rio_doce" | study_site == "mata_escura") {foresttype <- "seasonal semi-deciduous forest"
+} else if (study_site == "monte_pascoal" | study_site == "sooretama") {foresttype <- "broadleaf evergreen forest"
+} else {foresttype <- "NA"}
+```
+

@@ -1,0 +1,511 @@
+---
+title: "S1/S2 Plot-wise Seasonality"
+author: "J. Bruce Bell"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "/Users/brbell01/Google Drive/PHD/CUNY/Research/R/Phenology/")
+```
+
+Imports
+
+```{r echo=FALSE}
+library(knitr)
+library(tidyr)
+library(lubridate)
+library(clock)
+library(stringr)
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(hrbrthemes)
+library(purrr)
+library(data.table)
+library(tibble)
+library(sf)
+library(tidyquant)
+library(circular)
+library(readr)
+library(DescTools)
+library(padr)
+library(xts)
+library(zoo)
+library(grid)
+```
+
+Setup
+```{r}
+#set working directory
+setwd("/Users/brbell01/Google Drive/PHD/CUNY/Research/R/Phenology/")
+wd <- getwd()
+
+#Choose indices and sites
+S1_band <- "RVI" ; S2_band <- "EVI2"
+site_1 <- "mata_escura" ; site_2 <- "monte_pascoal" ; site_3 <- "rio_doce" ; site_4 <- "sooretama"
+site.list <- c(site_3, site_4)
+
+#________________________________________________
+
+#other params
+studyarea_bases <- c("mata_escura","monte_pascoal","rio_doce","sooretama")
+S1.band.list <- c("RVI", "VH", "VV")
+S2.band.list <- c("EVI2", "EVI", "NDVI")
+
+```
+
+Compile vegetation index data
+```{r}
+indexdata <- c()
+for (site in site.list) {
+  #sentinel-1
+  S1_indexdata <- vector(mode = "list", length = 0)
+  S1_table <- read.csv(paste0(wd, "/raw/s1/1ha/second_run/", site, "_s1_1ha_", S1_band, "_processed.csv"))
+  S1_table <- S1_table[,!names(S1_table) %in% c("X")] %>% mutate(date = as.Date(date))
+  S1_site_band <- paste0(site, "_", S1_band)
+  S1_indexdata[[S1_site_band]] <- S1_table 
+  #sentinel-2
+  S2_indexdata <- vector(mode = "list", length = 0)
+  S2_table <- read.csv(paste0(wd, "/raw/s2/1ha/second_run/", site, "_s2_1ha_", S2_band, "_processed.csv"))
+  S2_table <- S2_table[,!names(S2_table) %in% c("X")] %>% mutate(date = as.Date(date))
+  S2_site_band <- paste0(site, "_", S2_band)
+  S2_indexdata[[S2_site_band]] <- S2_table
+  
+  #combine
+  indexdata <- c(indexdata, S1_indexdata, S2_indexdata)
+}
+```
+
+Prep raw time series data for plotting
+```{r}
+  plotdata <- list()
+  for (band in names(indexdata)) {
+  plotdata[[band]] <- indexdata[[band]] %>% gather("Hectare_ID", value, -date) %>%     
+                           filter(!grepl('sd', Hectare_ID)) %>% group_by(Hectare_ID) %>% na.omit() %>% 
+                           mutate(mean = mean(value))
+  }
+```
+
+outlier removal function
+```{r}
+#outlier removal function
+remove_outliers <- function(x, na.rm = TRUE, ...) {
+  qnt <- quantile(x, probs=c(.1, .9), na.rm = na.rm, ...)
+  H <- 1.5 * IQR(x, na.rm = na.rm)
+  y <- x
+  y[x < (qnt[1] - H)] <- NA
+  y[x > (qnt[2] + H)] <- NA
+  y
+}
+```
+
+A. Single Harmonic Fit (Amplitude & Peak Phase definition)
+```{r}
+hnum <- "single" #choose harmonic number
+colnames <- c("S1_Ampl", "S1_Phase_Peak", "S2_Ampl", "S2_Phase_Peak")
+colnames_spread <- paste0(colnames, "_IQR") 
+colnames <- c(colnames, colnames_spread) 
+metrics <-data.frame(matrix(NA, nrow=0, ncol=length(colnames))) #empty dataframe to hold phenometrics
+
+for (site in site.list) {
+    # Read in seasonality file - single harmonic
+    study_siteID <- match(site,studyarea_bases)  # study site defined above
+    S1_path <- "/raw/s1/1ha/harmonic" ; S2_path <- "/raw/s2/1ha/harmonic"
+    
+    S1_season <- dir(paste0(wd, S1_path), full.names = T, pattern = paste0(S1_band, "_seasonality_processed.csv")) %>% map(read.csv, header=T)
+    S1_season[[study_siteID]] -> S1_season
+    S2_season <- dir(paste0(wd, S2_path), full.names = T, pattern = paste0(S2_band, "_seasonality_processed.csv")) %>% map(read.csv, header=T)
+    S2_season[[study_siteID]] -> S2_season
+    
+    #Define season interval ("season_def")
+    S1_season <- S1_season %>% mutate(stdoy = yday(paste0("1901-", month(season_start_date), "-", day(season_start_date))))
+    S1_season <- S1_season %>% mutate(enddoy = yday(paste0("1901-", month(season_end_date), "-", day(season_end_date))))
+    S2_season <- S2_season %>% mutate(stdoy = yday(paste0("1901-", month(season_start_date), "-", day(season_start_date))))
+    S2_season <- S2_season %>% mutate(enddoy = yday(paste0("1901-", month(season_end_date), "-", day(season_end_date))))
+    
+    #S1 phenometrics
+    S1_season_start <- S1_season$season_start_date %>% yday %>% median(na.rm=T)
+    S1_season_end <- S1_season$season_end_date %>% yday %>% median(na.rm=T)
+    S1_season_def <- c(0, S1_season_start, S1_season_end, 365)    # define season intervals
+    # swap season start/end when season end wraps to following year
+    if (S1_season_start > S1_season_end) {S1_season_def[c(2,3)] <- S1_season_def[c(3,2)]}
+    S1_Ampl <- S1_season$Ampl. %>% median(na.rm=T) ; S1_Ampl_IQR <- S1_season$Ampl. %>% IQR(na.rm=T)
+    S1_Phase_Peak <- S1_season$phase_peak %>% median(na.rm=T) ; S1_Phase_Peak_IQR <- S1_season$phase_peak %>% median(na.rm=T)
+    
+    #S2 phenometrics
+    S2_season_start <- S2_season$season_start_date %>% yday %>% median(na.rm=T)
+    S2_season_end <- S2_season$season_end_date %>% yday %>% median(na.rm=T)
+    S2_season_def <- c(0, S2_season_start, S2_season_end, 365)    # define season intervals
+    # swap season start/end when season end wraps to following year
+    if (S2_season_start > S2_season_end) {S2_season_def[c(2,3)] <- S2_season_def[c(3,2)]}
+    S2_Ampl <- S2_season$Ampl. %>% median(na.rm=T) ; S2_Ampl_IQR <- S2_season$Ampl. %>% IQR(na.rm=T)
+    S2_Phase_Peak <- S2_season$phase_peak %>% median(na.rm=T) ; S2_Phase_Peak_IQR <- S2_season$phase_peak %>% median(na.rm=T)
+    
+    sitemetrics <- data.frame(t(c(S1_Ampl, S1_Phase_Peak, S2_Ampl, S2_Phase_Peak)))
+    sitemetrics_spread <- data.frame(t(c(S1_Ampl_IQR, S1_Phase_Peak_IQR, S2_Ampl_IQR, S2_Phase_Peak_IQR)))
+    metrics <- rbind(metrics, c(sitemetrics,sitemetrics_spread))
+}
+
+colnames(metrics) <- colnames
+metrics <- cbind(data.frame(site.list), metrics)
+names(metrics)[1] <- "study_site"
+
+metrics_means <- metrics %>% mutate(S1_S2_Phase = abs(S1_Phase-S2_Phase)) %>% mutate(S1_S2_Phase_seas = abs(S1_Phase_seas-S2_Phase_seas)) %>% 
+                       mutate(S1_S2_Phase_ensemble = abs(S1_Phase_ensemble-S2_Phase_ensemble)) %>% 
+                       select(study_site, S2_Ampl, S1_S2_Phase, S1_S2_Phase_seas, S1_S2_Phase_ensemble)
+
+metrics_spread <- metrics %>% mutate(S1_S2_Phase_IQR = abs(S1_Phase_IQR-S2_Phase_IQR)) %>% mutate(S1_S2_Phase_seas_IQR = abs(S1_Phase_seas_IQR-S2_Phase_seas_IQR)) %>% 
+                       mutate(S1_S2_Phase_ensemble_IQR = abs(S1_Phase_ensemble_IQR-S2_Phase_ensemble_IQR)) %>% 
+                       select(study_site, S2_Ampl_IQR, S1_S2_Phase_IQR, S1_S2_Phase_seas_IQR, S1_S2_Phase_ensemble_IQR)
+```
+
+B. Calculate Phenometrics for Multiple Harmonic Fit (Amplitude & Peak, Season-Length, and Ensemble phase definitions)
+```{r}
+hnum <- "multiple"
+# Read season data from Timesat output seasonality file
+colnames <- c("S1_Ampl", "S1_Phase", "S1_Phase_seas", "S1_Phase_ensemble", "S2_Ampl", "S2_Phase", "S2_Phase_seas", "S2_Phase_ensemble")
+colnames_spread <- paste0(colnames, "_IQR") 
+colnames <- c(colnames, colnames_spread)
+metrics <-data.frame(matrix(NA, nrow=0, ncol=length(colnames)))
+
+for (site in site.list) {
+  # Read in seasonality file - multiple harmonic
+  study_siteID <- match(site,studyarea_bases)  # study site defined above
+  S1_path <- "/timesat/output/third_run/S1/" ; S2_path <- "/timesat/output/third_run/S2/"
+
+  S1_season <- dir(paste0(wd, S1_path), full.names = T, pattern = "seasonality_processed.csv") %>% map(read.csv, header=T)
+  S1_season[[study_siteID]] -> S1_season
+  S2_season <- dir(paste0(wd, S2_path), full.names = T, pattern = "seasonality_processed.csv") %>% map(read.csv, header=T)
+  S2_season[[study_siteID]] -> S2_season
+
+  #Define season interval ("season_def")
+  S1_season <- S1_season %>% mutate(stdoy = yday(paste0("1901-", month(season_start_date), "-", day(season_start_date))))
+  S1_season <- S1_season %>% mutate(enddoy = yday(paste0("1901-", month(season_end_date), "-", day(season_end_date))))
+  S2_season <- S2_season %>% mutate(stdoy = yday(paste0("1901-", month(season_start_date), "-", day(season_start_date))))
+  S2_season <- S2_season %>% mutate(enddoy = yday(paste0("1901-", month(season_end_date), "-", day(season_end_date))))
+
+  #S1 phenometrics
+  S1_season_start <- S1_season$season_start_date %>% yday %>% median(na.rm=T)
+  S1_season_end <- S1_season$season_end_date %>% yday %>% median(na.rm=T)
+  S1_season_def <- c(0, S1_season_start, S1_season_end, 365)    # define season intervals
+  # swap season start/end when season end wraps to following year
+  if (S1_season_start > S1_season_end) {S1_season_def[c(2,3)] <- S1_season_def[c(3,2)]} 
+  S1_Ampl <- S1_season$Ampl. %>% median(na.rm=T) ; S1_Ampl_IQR <- S1_season$Ampl. %>% IQR(na.rm=T)
+  S1_Phase <- S1_season$phase_peak %>% median(na.rm=T) ; S1_Phase_IQR <- S1_season$phase_peak %>% median(na.rm=T)
+  S1_Phase_seas <- S1_season$phase_seas %>% median(na.rm=T) ; S1_Phase_seas_IQR <- S1_season$phase_seas %>% IQR(na.rm=T)
+  S1_Phase_ensemble <- S1_season$phase_ensemble %>% median(na.rm=T) ; S1_Phase_ensemble_IQR <- S1_season$phase_ensemble %>% IQR(na.rm=T)
+  
+  #S2 phenometrics
+  S2_season_start <- S2_season$season_start_date %>% yday %>% median(na.rm=T)
+  S2_season_end <- S2_season$season_end_date %>% yday %>% median(na.rm=T)
+  S2_season_def <- c(0, S2_season_start, S2_season_end, 365)    # define season intervals
+  # swap season start/end when season end wraps to following year
+  if (S2_season_start > S2_season_end) {S2_season_def[c(2,3)] <- S2_season_def[c(3,2)]}
+  S2_Ampl <- S2_season$Ampl. %>% median(na.rm=T) ; S2_Ampl_IQR <- S2_season$Ampl. %>% IQR(na.rm=T)
+  S2_Phase <- S2_season$phase_peak %>% median(na.rm=T) ; S2_Phase_IQR <- S2_season$phase_peak %>% median(na.rm=T)
+  S2_Phase_seas <- S2_season$phase_seas %>% median(na.rm=T) ; S2_Phase_seas_IQR <- S2_season$phase_seas %>% IQR(na.rm=T)
+  S2_Phase_ensemble <- S2_season$phase_ensemble %>% median(na.rm=T) ; S2_Phase_ensemble_IQR <- S2_season$phase_ensemble %>% IQR(na.rm=T)
+  
+  sitemetrics <- data.frame(t(c(S1_Ampl, S1_Phase, S1_Phase_seas, S1_Phase_ensemble, S2_Ampl, S2_Phase, S2_Phase_seas, S2_Phase_ensemble)))
+  sitemetrics_spread <- data.frame(t(c(S1_Ampl_IQR, S1_Phase_IQR, S1_Phase_seas_IQR, S1_Phase_ensemble_IQR, S2_Ampl_IQR, S2_Phase_IQR, S2_Phase_seas_IQR, S2_Phase_ensemble_IQR)))
+  metrics <- rbind(metrics, c(sitemetrics,sitemetrics_spread))
+}
+
+colnames(metrics) <- colnames
+metrics <- cbind(data.frame(site.list), metrics)
+names(metrics)[1] <- "study_site"
+
+metrics_means <- metrics %>% mutate(S1_S2_Phase = abs(S1_Phase-S2_Phase)) %>% mutate(S1_S2_Phase_seas = abs(S1_Phase_seas-S2_Phase_seas)) %>% 
+                       mutate(S1_S2_Phase_ensemble = abs(S1_Phase_ensemble-S2_Phase_ensemble)) %>% 
+                       select(study_site, S2_Ampl, S1_S2_Phase, S1_S2_Phase_seas, S1_S2_Phase_ensemble)
+
+metrics_spread <- metrics %>% mutate(S1_S2_Phase_IQR = abs(S1_Phase_IQR-S2_Phase_IQR)) %>% mutate(S1_S2_Phase_seas_IQR = abs(S1_Phase_seas_IQR-S2_Phase_seas_IQR)) %>% 
+                       mutate(S1_S2_Phase_ensemble_IQR = abs(S1_Phase_ensemble_IQR-S2_Phase_ensemble_IQR)) %>% 
+                       select(study_site, S2_Ampl_IQR, S1_S2_Phase_IQR, S1_S2_Phase_seas_IQR, S1_S2_Phase_ensemble_IQR)
+```
+
+Plot Summary Seasonality
+```{r}
+metric_type_names <- names(metrics_means)[-1]
+metrics_means <- metrics_means %>% pivot_longer(cols = all_of(metric_type_names),  names_to = "metric_type", values_to = "value") %>% mutate(mID=rep(seq(1,length(metric_type_names)), length(site.list)))
+metrics_scaled <- tapply(metrics_means$value, metrics_means$mID, scale) 
+
+metrics_scaled_df <- metrics_scaled %>% data.frame() ; names(metrics_scaled_df) <- "metric_type" ; 
+metrics_scaled <- metrics_scaled_df$metric_type %>% bind_cols() ; names(metrics_scaled) <- metric_type_names
+metrics_scaled <- metrics_scaled %>% pivot_longer(cols = all_of(metric_type_names),  names_to = "metric_type", values_to = "value")
+seq <- seq(1,(length(studyarea_bases))*length(metric_type_names), by=length(metric_type_names))
+IDs <- c() ; for (i in 1:length(site.list)) {IDs <- c(IDs, i+seq-1)}
+metrics_scaled <- metrics_scaled %>% mutate(orderID = IDs) %>% relocate(orderID)
+
+m_s_vals <- c() ; m_c_vals <- c() 
+for (metric in 1:length(metric_type_names)) {
+  m_scale <- metrics_scaled_df$metric_type[[metric]] %>% attr(., "scaled:scale")
+  m_center <- metrics_scaled_df$metric_type[[metric]] %>% attr(., "scaled:center")
+  m_s_vals <- c(m_s_vals, m_scale) ; m_c_vals <- c(m_c_vals, m_center) 
+}
+
+metrics_scaled <- metrics_scaled %>% mutate(study_site = rep(metrics$study_site, each=length(metric_type_names)))
+metrics_scaled <- metrics_scaled %>% mutate(scale = rep(m_s_vals, length(metric_type_names))) %>%
+                            mutate(center = m_c_vals) %>% arrange(orderID)
+metric_spread_names <- names(metrics_spread)[2:5]
+metrics_spread <- metrics_spread %>% pivot_longer(cols = all_of(metric_spread_names),  names_to = "metric_type", values_to = "value") %>% mutate(mID=rep(seq(1,length(metric_spread_names)), length(studyarea_bases)))
+metrics_scaled_spread <- tapply(metrics_spread$value, metrics_spread$mID, scale) 
+
+metrics_scaled_spread_df <- metrics_scaled_spread %>% data.frame() ; names(metrics_scaled_spread_df) <- "metric_type"
+metrics_scaled_spread <- metrics_scaled_spread_df$metric_type %>% bind_cols() ; names(metrics_scaled_spread) <- metric_spread_names
+metrics_scaled_spread <- metrics_scaled_spread %>% pivot_longer(cols = all_of(metric_spread_names),  names_to = "metric_type", values_to = "value")
+metrics_scaled_spread <- metrics_scaled_spread %>% mutate(orderID = IDs) %>% relocate(orderID)
+
+m_s_s_vals <- c() ; m_c_s_vals <- c() 
+for (metric in 1:length(metric_type_names)) {
+  m_scale <- metrics_scaled_spread_df$metric_type[[metric]] %>% attr(., "scaled:scale")
+  m_center <- metrics_scaled_spread_df$metric_type[[metric]] %>% attr(., "scaled:center")
+  m_s_s_vals <- c(m_s_s_vals, m_scale) ; m_c_s_vals <- c(m_c_s_vals, m_center) 
+}
+
+metrics_scaled_spread <- metrics_scaled_spread %>% arrange(orderID) 
+metrics_scaled <- metrics_scaled %>% mutate(value_spread = rep(metrics_scaled_spread$value)) %>% mutate(scale_spread = rep(m_s_s_vals, each=length(metric_type_names))) %>% mutate(center_spread = rep(m_c_s_vals, each=length(metric_type_names)))
+
+levels = c("PE Rio Doce, MG", "REBIO Mata Escura, MG", "REBIO Sooretama, ES", "PNH Monte Pascoal, BA")
+metrics_scaled$study_site <- as.factor(metrics_scaled$study_site)
+
+foresttype <- c("seasonal semi-deciduous forest", "broadleaf evergreen forest")
+metrics_scaled <- metrics_scaled %>% mutate(ftype=rep(foresttype,8)) 
+metrics_scaled$metric_type_1 <- factor(metrics_scaled$metric_type, levels=metric_type_names, labels = c(
+                                         "Model 1: Optical Amplitude only", "Model 2:  Phase Diff. (Peak)", "Model 3: Phase Diff. (Season Mid-Point)", "Model 4: Phase Diff. (Ensemble)"))
+
+plot <- ggplot(data = metrics_scaled) +
+  geom_col(aes(y=value+2, x=study_site, fill=ftype), position="dodge", size=2) +
+  geom_errorbar(aes(ymin=value+2-value_spread, ymax=value+2+value_spread, x=study_site), width=0.3) +
+  scale_color_manual("Forest Type", values= c(rep(c("dark green", "green")))) +
+  facet_wrap(~ metric_type_1, nrow=2, labeller = label_wrap_gen()) +
+  scale_fill_manual("Forest Type", values = c(rep(c("dark green", "green")))) +
+  #scale_y_continuous(~.*S1scale+S1center, breaks = pretty_breaks()
+  #            , name = "Sentinel-1 RVI Index (detrended)" 
+  #            , sec.axis = sec_axis(~.*S2scale+S2center, name="Sentinel-2 EVI2 Index (detrended)"
+  #            , breaks = pretty_breaks())) +
+  theme_bw() +
+       xlab("Study Site (Park)") +
+       ylab("Seasonality metric (rescaled)") +
+       theme(legend.position = "top", axis.text.x = element_text(size = 10, angle = 90),
+             axis.line.x.bottom=element_line(size=0.8),
+             strip.text.x = element_text(size = 11, face = "italic"),
+             strip.text.y = element_text(size = 11, face = "italic"),
+             strip.background = element_rect(fill = "white"), 
+             panel.border = element_blank(), panel.spacing.x = unit(0.3,"line")) 
+
+grid.newpage()
+
+q <- ggplotGrob(plot)
+lg <- linesGrob(x=unit(c(0,1),"npc"), y=unit(c(0,0),"npc"),gp=gpar(lwd=0.8))
+
+for (k in grep("strip-t",q$layout$name)) {
+  q$grobs[[k]]$grobs[[1]]$children[[1]] <- lg
+}
+
+grid.draw(q)
+```
+
+Save plot
+```{r}
+ggsave(paste0("Summary_Seasonality_Comparison_", hnum, "_harmonic1.png"), units="in", width=12, height=12, dpi=300, device = 'png')
+```
+
+misc code
+```{r}
+if (study_site == "rio_doce") {studyarea <-  "PE Rio Doce, MG"
+} else if (study_site == "sooretama") {studyarea <- "REBIO Sooretama, ES"
+} else if (study_site == "monte_pascoal") {studyarea <- "PNH Monte Pascoal, BA"
+} else if (study_site == "mata_escura") {studyarea <- "REBIO Mata Escura, MG"
+} else {studyarea <- "NA"}
+
+if (study_site == "rio_doce" | study_site == "mata_escura") {foresttype <- "seasonal semi-deciduous forest"
+} else if (study_site == "monte_pascoal" | study_site == "sooretama") {foresttype <- "broadleaf evergreen forest"
+} else {foresttype <- "NA"}
+```
+
+Split data using season definition defined above (A or B)
+```{r}
+plotdata.stats <- plotdata %>% 
+              mutate(day = yday(date)) %>%  #create a month factor
+              mutate(season=cut(day, #create season factor
+              breaks=season_def,  #define seasons by day of year 
+              labels=c("wet","dry","wet"))) %>%  
+              mutate(year = year(date)) %>%  #create a year factor
+              mutate(Hectare_ID = substring(Hectare_ID, 14)) %>%
+              group_by(Hectare_ID) %>%    #group and reorder ascending
+              mutate(mean = mean(value, na.rm = TRUE)) %>% arrange(mean) %>%
+             # mutate(sortorder = rep(seq(1:length(IDs)), length.out = length(Hectare_ID))) %>%
+              ungroup()
+
+plotdata.stats <- data.frame(value = plotdata.stats$value,      #rearrange
+                             Hectare_ID = factor(plotdata.stats$Hectare_ID),
+                             season = factor(plotdata.stats$season), 
+                             year = factor(plotdata.stats$year)
+#                             ,sortorder = factor(indexdata.stats$sortorder)
+)
+```
+
+Plot seasonality by 1-ha plot
+```{r}
+#take a random sample 
+selectedrows <- sample.int(plotdata.stats$Hectare_ID %>% unique() %>% length(), 30, replace = F)
+plotdata.stats <- plotdata.stats[is.element(plotdata.stats$Hectare_ID, selectedrows),]
+
+#plot seasonal comparison
+xlabs <- plotdata.stats$Hectare_ID %>% unique() %>% as.character()
+ylims <- c(-16,-10)
+#check boxplots
+colors = c("wet" = "blue", "dry" = "orange")
+plotdata.stats %>% na.omit() %>% 
+  ggplot(aes(y=value, x=Hectare_ID, color = season, fill = season)) + 
+    geom_boxplot(outlier.size=0.5, outlier.colour = NULL, show.legend = FALSE) + 
+    scale_fill_manual(values=c("blue", "orange")) +
+    scale_color_manual(values=c("blue", "orange")) +
+    scale_x_discrete(labels=xlabs) +
+    ylab(paste0("Mean ", bandname, " index value (dB)")) +
+    theme_minimal(base_size = 14) +
+    theme(axis.text.x = element_text(angle = 90, vjust=0.5)) +
+    ggtitle(paste0("Plot-wise seasonal comparison of mean annual ", bandname, " backscatter \n (Sentinel-1) for ",  
+                   "30 randomly selected 1 ha",
+    #     length(unique(plotdata$Hectare_ID)), " ", scale, 
+         " plots, ", studyarea, ", Brazil"))
+```
+
+Save plot
+```{r}
+ggsave(paste0(studyarea_base, "_plotseasonal_s1_", bandname, ".png"), units="in", width=10, height=5, dpi=300, device = 'png')
+```
+
+Analysis of variance:season
+```{r}
+#fit the linear model 
+fit <- lm(value ~ season*year*Hectare_ID, plotdata.stats, 
+          contrasts = list(Hectare_ID = "contr.sum", year = "contr.poly"))
+anova(fit) %>% kable(digits = 10) 
+write.csv(anova(fit) , paste0(studyarea_base, "_anova_s1_", bandname, ".csv"))
+
+```
+
+Histogram
+```{r}
+#plot histogram
+hist(indexdata.mean$mean, breaks = 20, ylim = c(0,25), xlab= paste0("Mean ", bandname, " value (dB)"), ylab= "Number of days / year", main= paste0("\n\n Distribution of daily Sentinel-1 averaged ", bandname, " backscatter \n values for ", length(indexdata)-1, " 1-ha plots over ", foresttype, ",\n ", studyarea, ", Brazil (2016-2021)"), border=F, col="dark blue")
+
+abline(h=seq(0,55,5), col="gray", lty="dotted")
+
+ggsave(paste0(studyarea_base, "_histannual_s1.png"), units="in", width=10, height=5, dpi=300, device = 'png')
+```
+
+Prep data for statistical analysis by circular statistics
+```{r}
+#summarize by daily mean across years and samples 
+indexdata.mean <- indexdata$VH %>% 
+                  reshape::melt(id = "date") %>%
+                  mutate(doy = ymd(paste0("1901-", month(date), "-", day(date))))  %>%
+                  distinct() %>%
+                  group_by(doy) %>%
+                  summarize(mean = mean(value, na.rm = TRUE)) 
+
+#append converted days % summarize by month
+indexdata.mean <- indexdata.mean %>% 
+                  mutate("VH_13" = ifelse(mean>=-13.011, 1, 0)) %>%
+                  group_by(month(doy)) %>%
+                  count(VH_13) %>% mutate("month" = `month(doy)`, "VH_count" = n) %>%
+                  filter(VH_13==1) 
+#                  select(month, VH_count)
+
+vec.labels <- seq(ymd('2000-01-01'),ymd('2000-12-01'),by='months') %>% format('%b')
+  
+ggplot(data=indexdata.mean, aes(x=month, y=VH_count)) +
+  coord_polar(theta='x', start = 0, direction=1) +
+  geom_col(fill="light grey") +
+  theme_minimal() +
+  geom_text(aes(label = VH_count), color="blue") +
+  scale_y_continuous("Number of days/month VH greater than -13.270") +
+  scale_x_continuous(limits = c(0,12), breaks=seq(0,12), labels=c(vec.labels,".")) +
+  theme(axis.text.y = element_blank(),
+         axis.ticks.y = element_blank() )
+#        axis.title.x = element_blank(),
+#        axis.text.x = element_blank()) +
+ # annotate(geom = "text",
+#           x = 1:nrow(indexdata.mean),
+#           y = min(indexdata.mean$VH_count),
+#           label = indexdata.mean$month)
+
+ggsave(paste0(studyarea_base,"_polar1.png"), units="in", width=10, height=5, dpi=300, device = 'png')
+```
+
+```{r}
+#circular stats
+#circular mean 
+
+#circular median
+
+#circular Kappa (measure of spread) - based on Von Mises Distribution
+
+```
+
+```{r}
+#Rayleigh Test of Uniformity
+rayleigh.test((x, mu = NULL)
+## S3 method for class 'rayleigh.test'
+print(x, digits=4, ...)
+
+```
+
+```{r}
+#daily circular plot, using plot.circular
+
+#format days as integer day of year
+degree_days <- plotmeans$doy %>% format(format = "%j") %>% as.numeric()
+
+#convert day (degrees) to radians and threshold EVI values
+radian_days <- 2*pi*degree_days/365
+
+#circular plot
+
+#vec.breaks <- seq(from = pi/2, to = 2*pi, by = pi/2)
+#pi.halfs <- c(paste(expression(pi), "/2"),
+#  paste(seq(from = 3, to = 4, by = 2), "*" , expression(pi), "/2"))
+#pi.fulls <- c(paste(expression(pi)),
+#  paste(seq(from = 2, to = 2, by = 1), "*" , expression(pi)))
+#vec.expr <- parse(text = c(rbind(pi.halfs, pi.fulls)))[1:4]
+vec.expr <- c(0, pi/6, pi/3, pi/2, 2*pi/3, 5*pi/6, pi, 7*pi/6, 4*pi/3, 3*pi/2, 5*pi/3, 11*pi/6)
+
+#plot, but can't seem to place gridlines at above intervals.. 
+plot.circular(circular(plotmeans$radian_days, units="radians", template = NULL))
+```
+
+```{r}
+#circular stats
+#circular mean 
+
+#circular median
+
+#circular Kappa (measure of spread) - based on Von Mises Distribution
+
+
+
+```
+
+```{r}
+#Rayleigh Test of Uniformity
+rayleigh.test(x, mu = NULL)
+## S3 method for class 'rayleigh.test'
+print(x, digits=4, ...)
+
+```
+
+```{r}
+#circular linear regression modeling from S1 & S2 data
+lm.circular(..., type=c("c-c", "c-l"))
+lm.circular.cc(y, x, order = 1, level = 0.05, control.circular = list())
+lm.circular.cl(y, x, init = NULL, verbose = FALSE, tol = 1e-10, 
+  control.circular = list())
+# S3 method for lm.circular.cl
+print(x, digits = max(3, getOption("digits") - 3), 
+  signif.stars= getOption("show.signif.stars"), ...)
+```

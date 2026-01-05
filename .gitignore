@@ -53,5 +53,6 @@ rsconnect/
 
 #Dont commit data
 data/*
+output/*
 
 

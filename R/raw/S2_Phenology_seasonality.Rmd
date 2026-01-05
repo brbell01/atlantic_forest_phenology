@@ -1,0 +1,175 @@
+---
+title: "S2 Seasonality"
+author: "J. Bruce Bell"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Imports
+```{r echo=FALSE}
+library(knitr)
+library(tidyr)
+library(lubridate)
+library(scales)
+library(ggthemes)
+library(ggtext)
+library(stringr)
+library(dplyr)
+library(ggplot2)
+library(purrr)
+library(data.table)
+library(tibble)
+library(sf)
+library(tidyquant)
+library(circular)
+library(data.table)
+library(readr)
+```
+
+Import processed Sentinel-2 model data from Earth Engine output
+
+```{r}
+#working directory
+setwd("/Users/brbell01/Google Drive/PHD/CUNY/Research/R/Phenology/raw/s2/1ha/harmonic")
+wd <- getwd()
+
+#Parameters to be altered
+foresttype <- "Seasonal Semi-deciduous Forest"  # "Seasonal Semi-deciduous Forest"; "Broadleaf Evergreen"
+studyarea <- "REBIO Mata Escura, MG"  #  "REBIO Mata Escura, MG" ; "PNH Monte Pascoal" 
+studyarea_base <- "monte_pascoal" # "mata_escura" ; "monte_pascoal" 
+band <- "EVI"  # "NDVI"
+
+#raw data
+table <- read.csv(paste0(wd, "/", studyarea_base, "_s2_1ha_", band, "_harmonic.csv"))
+#table <- table[,!names(table) %in% c("X")] %>% mutate(date = ymd(date))
+      
+#fitted 
+
+#residuals
+
+
+```
+
+
+Prep data for statistical analysis by circular statistics
+```{r}
+#seasonal threshold
+threshold <- table$fitted %>% range() %>% sum()
+threshold <- threshold/2
+
+#summarize by daily mean across years and samples 
+plotmeans <- table %>% mutate(doy = table$system.time_start %>% parse_datetime("%b %d, %Y", locale = locale("en")) %>% ymd())
+
+plotlabels <- plotmeans %>% 
+                  mutate("band_threshold" = ifelse(fitted>=threshold, 1, -1)) %>%
+                  group_by(month(doy)) %>% 
+                  count(band_threshold) %>%
+                  mutate("month" = `month(doy)`, "band_count" = n, 
+                         "thresh_count" = band_count*band_threshold) %>%
+                  mutate("month_lab" = ymd(paste0('2000-',`month(doy)`,'-01')) %>%     
+                          format('%b')) %>%
+                  select(month, month_lab, thresh_count) %>% ungroup()
+names <- names(plotlabels) 
+month_abbrev<- seq(ymd('2000-01-01'),ymd('2000-12-01'),by='months') %>% format('%b')          
+zeros <- data.frame(cbind(seq(1:12), seq(1:12), month_abbrev, numeric(12)))
+names(zeros) <- names
+plotlabels <- rbind(plotlabels,zeros)
+plotlabels <- plotlabels %>% group_by(month_lab) %>% slice(c(1,2))
+plotlabels$month <- as.numeric(plotlabels$month)
+plotlabels$thresh_count <- as.numeric(plotlabels$thresh_count)
+plotlabels <- plotlabels %>% arrange(month) 
+plotlabels <- plotlabels[(names[2:4])]
+
+#append converted days & summarize by month
+#plotmeans <- plotmeans %>% 
+ #                 mutate("band_threshold" = ifelse(fitted>=threshold, 1, 0)) %>%
+ #                 group_by(month(doy)) %>%
+ #                 mutate("month" = `month(doy)`) %>%
+ #                 arrange(month) %>% 
+ #                 na.omit()
+
+#vec.breaks <- seq(from=0, to=12, by=12)[1:12]
+
+colour <- c("blue", "red")
+plotlabels <- plotlabels %>% mutate("gt" = thresh_count > 0)
+
+
+ggplot(data=plotlabels, aes(x=factor(month_lab, levels = month.abb), y = thresh_count, fill = gt)) +
+  geom_bar(stat = 'identity') +
+  coord_polar(theta = 'x', start = 0, direction = 1, clip = "off") +
+  theme_minimal() +
+  geom_text(aes(y=thresh_count + 5, label = thresh_count, color=gt)) +
+  scale_y_continuous(paste0("Number of days/month, ", band, " greater than ", threshold) 
+                     ,limits = c(0,50)
+                      ) 
++ scale_x_continuous(labels=c(vec.labels,".")) +
+#                   limits = c(0,12), breaks=seq(0,12), 
+#                   ) +
+  theme(legend.position = "none",
+  axis.text.y = element_blank(),
+         axis.ticks.y = element_blank()) +
+  ggtitle(paste0("Sentinel-2 EVI time series ", max(year(plotmeans$doy))-min(year(plotmeans$doy))))
+
+ggsave("polar2.png", units="in", width=10, height=5, dpi=300, device = 'png')
+```
+
+
+```{r}
+#daily circular plot, using plot.circular
+
+#format days as integer day of year
+degree_days <- plotmeans$doy %>% format(format = "%j") %>% as.numeric()
+
+#convert day (degrees) to radians and threshold EVI values
+radian_days <- 2*pi*degree_days/365
+
+#circular plot
+
+#vec.breaks <- seq(from = pi/2, to = 2*pi, by = pi/2)
+#pi.halfs <- c(paste(expression(pi), "/2"),
+#  paste(seq(from = 3, to = 4, by = 2), "*" , expression(pi), "/2"))
+#pi.fulls <- c(paste(expression(pi)),
+#  paste(seq(from = 2, to = 2, by = 1), "*" , expression(pi)))
+#vec.expr <- parse(text = c(rbind(pi.halfs, pi.fulls)))[1:4]
+vec.expr <- c(0, pi/6, pi/3, pi/2, 2*pi/3, 5*pi/6, pi, 7*pi/6, 4*pi/3, 3*pi/2, 5*pi/3, 11*pi/6)
+
+#plot, but can't seem to place gridlines at above intervals.. 
+plot.circular(circular(plotmeans$radian_days, units="radians", template = NULL))
+```
+
+```{r}
+#circular stats
+#circular mean 
+
+#circular median
+
+#circular Kappa (measure of spread) - based on Von Mises Distribution
+
+
+
+```
+
+```{r}
+#Rayleigh Test of Uniformity
+rayleigh.test(x, mu = NULL)
+## S3 method for class 'rayleigh.test'
+print(x, digits=4, ...)
+
+```
+
+```{r}
+#circular linear regression modeling from S1 & S2 data
+lm.circular(..., type=c("c-c", "c-l"))
+lm.circular.cc(y, x, order = 1, level = 0.05, control.circular = list())
+lm.circular.cl(y, x, init = NULL, verbose = FALSE, tol = 1e-10, 
+  control.circular = list())
+# S3 method for lm.circular.cl
+print(x, digits = max(3, getOption("digits") - 3), 
+  signif.stars= getOption("show.signif.stars"), ...)
+```
+
+

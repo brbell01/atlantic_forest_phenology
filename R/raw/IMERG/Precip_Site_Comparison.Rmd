@@ -1,0 +1,681 @@
+---
+title: "Precip. Site Comparison"
+author: "J. Bruce Bell"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+#knitr::opts_knit$set(root.dir = "/Users/brbell01/Google Drive/PHD/CUNY/Research/R/Phenology/")
+```
+
+Import Libraries
+```{r include=F}
+libs <- c("reshape2", "xts","tidyr","knitr","lubridate","scales","ggthemes","ggtext","stringr","dplyr","ggplot2","purrr","data.table","tibble","scales","grid","clock", "lmtest", "padr", "remotes")
+
+# Loop through the vector and install and load each library if needed
+for (lib in libs) {
+  if (!require(lib, character.only = TRUE)) {
+    install.packages(lib)
+    library(lib, character.only = TRUE)
+  }
+}
+```
+
+Define parameters
+```{r}
+#setwd("/Users/brbell01/Google Drive/PHD/CUNY/Research/R/Phenology/raw/")
+wd <- "/Users/brbell01/Documents/git/atlantic_forest_phenology/R/raw"
+suffix <- "_monthly_rainfall.csv"
+suffix_sd <- "_monthly_rainfall_sd.csv"
+IMERG_end_date <- "2021-09-15"
+hours_per_month <- c(31,28,31,30,31,30,31,31,30,31,30,31)*24
+
+# Function to check if a year is a leap year
+is_leap_year <- function(year) {
+  return(year %% 4 == 0 & (year %% 100 != 0 | year %% 400 == 0))
+}
+
+# Inputs
+site_1 <- "rio_doce" ; site_2 <- "sooretama" # site_1 <- "mata_escura" ; site_2 <- "monte_pascoal" # 
+site.list <- c(site_1, site_2)
+
+foresttypes <- c("seasonal semi-deciduous forest", "evergreen broadleaf forest")
+foresttypes_abbr <- c("SS", "EB")
+studyareas <- c("REBIO Mata Escura, MG", "PNH Monte Pascoal, BA",  "PE Rio Doce, MG", "REBIO Sooretama, ES")
+
+for (site in site.list) {if (site == "rio_doce" | site == "mata_escura") {foresttype <- foresttypes[1]
+} else if (site == "monte_pascoal" | site == "sooretama") {foresttype <- foresttypes[2]
+} else {foresttype <- "NA"}
+}
+
+studyarea.list <- c()
+for (site in site.list) {if (site == "rio_doce") {studyarea <- studyareas[3]
+} else if (site == "sooretama") {studyarea <- studyareas[4]
+} else if (site == "mata_escura") {studyarea <- studyareas[1]
+} else if (site == "monte_pascoal") {studyarea <- studyareas[2]
+} else {studyarea <- "NA"}
+studyarea.list <- c(studyarea.list,studyarea)
+}
+
+rainfall_filename1 <- paste0(gsub("(?<=^|_)([a-z])", "\\U\\1", site_1, perl=TRUE), suffix)
+rainfall_sd_filename1 <- paste0(gsub("(?<=^|_)([a-z])", "\\U\\1", site_1, perl=TRUE), suffix_sd)
+rainfall_filename2 <- paste0(gsub("(?<=^|_)([a-z])", "\\U\\1", site_2, perl=TRUE), suffix)
+rainfall_sd_filename2 <- paste0(gsub("(?<=^|_)([a-z])", "\\U\\1", site_2, perl=TRUE), suffix_sd)
+  
+```
+
+Data import
+```{r include=FALSE}
+#Import max. hourly rate (reported daily) rainfall data ; rainfall is raw and filtered for values 
+raintable1 <- read.csv(paste0(wd, "/IMERG/", rainfall_filename1), header=T) ; names(raintable1) <- c("Date","null","monthly_precip")
+raintable1 <- raintable1 %>% select(Date,monthly_precip)
+raintable_sd_1 <- read.csv(paste0(wd, "/IMERG/", rainfall_sd_filename1), header=T) ; names(raintable_sd_1) <- c("Date","monthly_precip_sd")
+raintable_sd_1 <- raintable_sd_1 %>% select(Date,monthly_precip_sd)
+
+raintable2 <- read.csv(paste0(wd, "/IMERG/", rainfall_filename2), header=T) ; names(raintable2) <- c("Date","null","monthly_precip")
+raintable2 <- raintable2 %>% select(Date,monthly_precip)
+raintable_sd_2 <- read.csv(paste0(wd, "/IMERG/", rainfall_sd_filename2), header=T) ; names(raintable_sd_2) <- c("Date","monthly_precip_sd")
+raintable_sd_2 <- raintable_sd_2 %>% select(Date,monthly_precip_sd)
+
+raintable <- raintable1 %>% full_join(raintable_sd_1, by = "Date", keep=F) %>% arrange(Date)
+raintable <- raintable %>% full_join(raintable2, by = "Date", keep=F) %>% arrange(Date)
+raintable <- raintable %>% full_join(raintable_sd_2, by = "Date", keep=F) %>% arrange(Date)
+names(raintable)[c(2,4)] <- paste0(site.list, "_precip")
+names(raintable)[c(3,5)] <- paste0(site.list, "_precip_sd")
+
+# add a sample size column for st. dev. calculations
+names(hours_per_month) <- month.abb 
+
+raintable$Month <- format(as.Date(paste0(raintable$Date,"-01")), "%b")
+raintable$Year <- format(as.Date(paste0(raintable$Date,"-01")), "%Y")
+
+#raintable$n <- sapply(raintable$Month, function(month) {return(hours_per_month[[month]])})
+
+# Adjust the number of hours per month based on whether it's a leap year or not
+raintable$n <- mapply(function(month, year) {
+  year <- as.numeric(year)
+  if (month == "Feb" && is_leap_year(year)) {
+    return(29 * 24)
+  } else {
+    return(hours_per_month[[month]])
+  }
+}, raintable$Month, raintable$Year)
+```
+
+Prep data
+```{r include=F}
+# Extracting month and year from the date
+reshape_table <- function(data, variable, prefix) {
+  reshaped_table <- data %>% 
+    select(Year, Month, all_of(variable)) %>% 
+    pivot_wider(names_from = Month, values_from = all_of(variable), names_prefix = prefix)
+  return(reshaped_table)
+}
+
+# Define function to reshape data and join
+reshape_and_join <- function(site_name, raintable) {
+  # Prepare column names
+  precip_column <- paste0(site_name, "_precip")
+  precip_sd_column <- paste0(site_name, "_precip_sd")
+  
+  # Apply reshape_table function
+  precip_table <- reshape_table(raintable, precip_column, paste0(precip_column, "_"))
+  precip_sd_table <- reshape_table(raintable, precip_sd_column, paste0(precip_sd_column, "_"))
+  
+  # Join tables
+  join_table <- full_join(precip_table, precip_sd_table, by = "Year")
+  
+  return(join_table)
+}
+
+# Initialize final_table
+final_table <- NULL
+
+# Loop over site.list and apply reshape_and_join function
+for(site in site.list) {
+  site_table <- reshape_and_join(site, raintable)
+  
+  if(is.null(final_table)) {
+    final_table <- site_table
+  } else {
+    final_table <- full_join(final_table, site_table, by = "Year")
+  }
+}
+
+# Reshape and join 'n' column once
+n_column <- "n"
+n_table <- reshape_table(raintable, n_column, "n_")
+
+# Join final_table and n_table
+final_table <- full_join(final_table, n_table, by = "Year")
+```
+
+Plotting for data visualization
+```{r}
+# Long-form conversion
+final_table_avg <- final_table %>%
+  pivot_longer(
+    cols = matches(paste0(c(site.list[1], site.list[2]), "_precip_")),
+    names_to = c("site", "month"),
+    names_pattern = "(.*)_precip_(.*)",
+    values_drop_na = TRUE
+  ) %>%
+  mutate(month = match(month, month.abb)) %>%
+  group_by(site, month) %>%
+  summarise(avg_value = mean(value, na.rm = TRUE))
+
+# Function to calculate the global standard deviation
+get_global_sd <- function(value, sample_size) {
+  sqrt(sum(value^2 * (sample_size - 1), na.rm = TRUE) / sum(sample_size - 1, na.rm = TRUE))
+}
+
+# Long-form conversion for standard deviation values
+final_table_n <- final_table %>%
+  select(tail(names(.), 12)) %>% 
+  pivot_longer(
+    cols = everything(),
+    names_to = "month",
+    names_pattern = "n_(.*)",
+    values_drop_na = TRUE
+  ) %>% 
+  mutate(month = match(month, month.abb))
+
+final_table_sd <- final_table %>% 
+  pivot_longer(
+    cols = matches(paste0(c(site.list[1], site.list[2]), "_precip_sd_")),
+    names_to = c("site", "month"),
+    names_pattern = "(.*)_precip_sd_(.*)",
+    values_to = "sd_value",  
+    values_drop_na = TRUE
+  ) %>%
+  mutate(month = match(month, month.abb)) %>%
+  left_join(final_table_n, by = c("month" = "month")) %>%
+  group_by(site, month) %>%
+  summarise(sd_value = get_global_sd(sd_value, value), n = sum(value), .groups = 'drop')
+
+
+# Join average and standard deviation data frames
+final_table_agg <- inner_join(final_table_avg, final_table_sd, by = c("site", "month")) %>%
+                    mutate(type = ifelse(site == site.list[1], foresttypes[1], foresttypes[2]))
+
+# grab the global monthly average for each site
+global_average1 <- mean(final_table_agg$avg_value[final_table_agg$site == site.list[1]])
+global_average2 <- mean(final_table_agg$avg_value[final_table_agg$site == site.list[2]])
+
+
+# Create the bar chart
+title <- paste("Comparison of Monthly Rainfall Between\n", studyarea.list[1], " and ", studyarea.list[2])
+ggplot(data = final_table_agg, aes(x = factor(month.abb[month], levels = month.abb), y = avg_value, fill = type)) +
+  geom_bar(position = position_dodge(), stat = "identity", color = "black") +
+  geom_errorbar(aes(ymin = avg_value - sd_value, ymax = avg_value + sd_value), width = 0.2, position = position_dodge(0.9)) +
+  geom_hline(aes(yintercept = global_average1), linetype = "dashed", color = "#808080") +
+  geom_hline(aes(yintercept = global_average2), linetype = "dashed", color = "#d1d1d1") +
+  scale_fill_manual(values = setNames(c("#808080", "#d1d1d1"), foresttypes)) +
+  theme_minimal() +
+  labs(
+    x = "Month",
+    y = "Average Rainfall (mm)",
+    title = title,
+    subtitle = "Error bars represent standard deviation"
+  ) +
+  theme(legend.position = "top"
+ #       , legend.justification = c("right", "top")
+        , legend.title = element_blank()
+ #       , plot.margin = margin(1,1,1,3, "cm")
+ ) +
+  scale_x_discrete(labels = month.abb) +
+  annotate("text", x = 4, y = global_average1+17, label = "mean monthly rainfall: ", color = "#808080", hjust = 0, size = 3.5) +
+  annotate("text", x = 4, y = global_average1+10, label = paste(foresttypes[1], " = ", round(global_average1, 1), " mm"), color = "#808080", hjust = 0, size = 3.5) +
+  annotate("text", x = 4, y = global_average2-10, label = paste(foresttypes[2], " = ", round(global_average2, 1), " mm"), color = "#B3B3B3", hjust = 0, size = 3.5) +
+  annotate("text", x = 6.5, y = max(final_table_agg$avg_value) - 10, label = "dry season", color = "black", size = 4) +
+  geom_segment(aes(x = 4, y = max(final_table_agg$avg_value) - 5, xend = 4, yend = max(final_table_agg$avg_value) - 10), color = "black") +
+  geom_segment(aes(x = 9, y = max(final_table_agg$avg_value) - 5, xend = 9, yend = max(final_table_agg$avg_value) - 10), color = "black") +
+  geom_segment(aes(x = 4, y = max(final_table_agg$avg_value) - 5, xend = 9, yend = max(final_table_agg$avg_value) - 5), color = "black")
+```
+
+Reshape table for seasonality comparison 
+```{r include=F}
+# Calculate total annual rainfall list for each site
+annual_rainfall <- final_table_avg %>% na.omit() %>% 
+  group_by(site) %>%
+  summarise(total_rainfall = sum(avg_value)) %>%
+  pull(total_rainfall)
+avg_annual_rainfall_list <- setNames(as.list(annual_rainfall), site.list)
+
+# Calculate total annual st. dev. list for each site
+annual_sd <- final_table_sd %>%
+  group_by(site) %>%
+  summarise(total_sd = get_global_sd(sd_value,n)) %>%
+  pull(total_sd)
+sd_annual_rainfall_list <- setNames(as.list(annual_sd), site.list)
+
+#reshape the original raintable for plotting
+measures <- c("precip", "precip_sd")
+cols <- paste(rep(site.list, each=length(measures)), measures, sep="_")
+raintable_long <- raintable %>% pivot_longer(cols = cols,names_to = c("site", ".value"), names_pattern = "(.*)_(.*)", values_drop_na = TRUE) %>% mutate(site = str_replace(site, "_precip", ""))
+raintable_long$sd <- c(raintable_long$sd[2:nrow(raintable_long)],NA)
+raintable_long <- raintable_long %>% na.omit()
+```
+
+Test for significant difference
+```{r}
+site1 <- raintable_long %>% filter(site=="rio_doce") %>% select(precip) %>% rename(rio_doce = precip)
+site2 <- raintable_long %>% filter(site=="sooretama") %>% select(precip) %>% rename(sooretama = precip)
+
+wilcox <- wilcox.test(site1$rio_doce, site2$sooretama)
+
+#other stats
+#annual average 
+raintable_long %>% group_by(site, Year) %>% summarise(mean=mean(precip), n=sum(n), sd=get_global_sd(sd,n)) %>% ungroup() %>% group_by(site) %>% summarise(sum=sum(mean), n=sum(n), sd=get_global_sd(sd,n)) %>% kable(digits = 4)
+```
+
+Add dry season stats to our table
+```{r}
+# Get months for which mean monthly rainfall falls below the global average average (i.e. dry season months)
+dry_months <- list()
+global_averages <- setNames(annual_rainfall/12, site.list)
+for (site in site.list) {
+  site_table <- final_table_avg[final_table_avg$site==site,]
+  dry_months[[site]] <- site_table$month[site_table$avg_value<=global_averages[[site]]]
+  dry_months[[site]] <- dry_months[[site]][!is.na(dry_months[[site]])]
+}
+
+# Reshape raintable by adding dry season stats 
+raintable_long$month_num <- match(raintable_long$Month, month.abb)
+df <- data.frame()
+for (site in site.list) {
+  site_long <- raintable_long %>% filter(site == site)
+  site_long$season <- ifelse(site_long$month_num %in% dry_months[[site]], "dry", "wet")
+  df <- df %>% rbind(site_long)
+}
+df <- df %>% select(Date, season, site)
+raintable_long <- raintable_long %>% left_join(df, by=c("Date","site"), multiple="first")
+raintable_long$month_num <- NULL
+
+# Function to get dry season means and SDs for a specific site ## This function doesn't seem to work. 
+get_dry_season_stats <- function(data, site) {
+
+  dry_data <- data %>%
+    filter(site == site) %>%
+    arrange(Date) %>%
+    mutate(dry_mean = ifelse(season=="dry", precip, NA),
+           dry_n = ifelse(season=="dry",  n, NA),
+           dry_sd = ifelse(season=="dry", sd, NA))
+
+dry_season_values <- dry_data$dry_mean
+dry_season_global_mean <- mean(dry_data$dry_mean, na.rm = TRUE)  
+dry_season_sd_values <-dry_data$dry_sd
+dry_season_global_sd <- get_global_sd(dry_data$dry_sd, sum(dry_data$dry_n, na.rm = TRUE))  
+
+return(list(dry_season_values = dry_season_values,
+              dry_season_global_mean = dry_season_global_mean,
+            dry_season_sd_values = dry_season_sd_values,
+              dry_season_global_sd = dry_season_global_sd, 
+              dry_season_flag = dry_data$season)) 
+}
+
+# Apply the function to each site.
+dry_season_stats_list <- map(site.list, ~get_dry_season_stats(raintable_long, .x))
+names(dry_season_stats_list) <- site.list
+
+# # Function to get total precipitation for each dry season
+# get_dry_season_mean_precip_sum <- function(site_data, data) {
+#   # Get list of dry seasons
+#   dry_seasons <- site_data$dry_season_starts
+# 
+#   # Calculate total precipitation for each dry season
+#   dry_season_mean_precip_sum <- lapply(dry_seasons, function(season) {
+#     # Filter data for the months in this season
+#     season_data <- data[data$month %in% season, ]
+#     # Sum up the mean precipitation for these months
+#     mean_precip_sum <- sum(season_data$rolling_mean, na.rm = TRUE)
+#     return(mean_precip_sum)
+#   })
+#   
+#   return(dry_season_mean_precip_sum)
+# }
+# 
+# # Apply function to each site's data
+# dry_season_mean_precip_sum_list <- lapply(seq_along(dry_season_stats_list), function(i) {
+#   site_data <- dry_season_stats_list[[i]]
+#   site <- names(dry_season_stats_list)[i]
+#   # Filter data for this site
+#   site_data_full <- final_table_agg[final_table_agg$site == site, ]
+#   get_dry_season_mean_precip_sum(site_data, site_data_full)
+# })
+# 
+# # Name list elements
+# names(dry_season_mean_precip_sum_list) <- names(dry_season_stats_list)
+```
+
+violin plot comparing the two sites in the dry season
+```{r}
+site1 <- raintable_long %>% filter(site=="rio_doce") %>% filter(season=="dry") %>% select(precip) %>% rename(rio_doce = precip)
+site2 <- raintable_long %>% filter(site=="sooretama") %>% filter(season=="dry") %>% select(precip) %>% rename(sooretama = precip)
+
+df <- data.frame(rio_doce = site1, sooretama = site2) %>% pivot_longer(everything(.), names_to = "site", values_to = "dry_precip") %>% mutate(foresttypes_abbr = rep(foresttypes_abbr, length.out=length(site)))
+
+df %>% mutate(foresttypes = as.factor(foresttypes_abbr)) %>% 
+  ggplot(aes(x=site, y=dry_precip, fill=foresttypes_abbr)) +
+  geom_violin(trim=FALSE) +
+  geom_boxplot(width=0.1) +
+#  geom_hline(aes(yintercept = global_average1), linetype = "dashed", color = "#808080") +
+#  geom_hline(aes(yintercept = global_average2), linetype = "dashed", color = "#d1d1d1") +
+  scale_x_discrete(labels=foresttypes_abbr) +
+  scale_fill_manual(values = setNames(c("#808080", "#d1d1d1"), foresttypes_abbr)) +
+  ylim(0, 100) +
+  theme_minimal() +
+  theme(legend.position = "none", plot.title = element_text(hjust = 0.5),text = element_text(size = 18)) +
+  labs(x = "Forest Type", y = "Average Monthly Rainfall (mm)", title = "dry season")
+  
+```
+
+Test for significant difference in the dry season
+```{r}
+wilcox.test(site1$rio_doce, site2$sooretama)
+
+#other stats
+#annual average 
+raintable_long %>% group_by(site, Year) %>% summarise(mean=mean(precip), n=sum(n), sd=get_global_sd(sd,n)) %>% ungroup() %>% group_by(site) %>% summarise(sum=sum(mean), n=sum(n), sd=get_global_sd(sd,n)) %>% kable(digits = 4)
+
+
+#dry season 
+raintable_long %>% filter(season=="dry") %>% group_by(site) %>% summarise(mean=mean(precip), n=sum(n), sd=get_global_sd(sd,n)) %>% kable(digits = 4) 
+```
+
+Are wet forests getting wetter?? (and dry forest getting drier?). Data Prep.
+```{r include=FALSE}
+# Import historical precip data
+raintable1 <- read.csv(paste0(wd, "/IMERG/2002-2022/", rainfall_filename1), header=T) ; names(raintable1) <- c("Date","monthly_precip")
+raintable1 <- raintable1 %>% select(Date,monthly_precip)
+raintable_sd_1 <- read.csv(paste0(wd, "/IMERG/2002-2022/", rainfall_sd_filename1), header=T) ; names(raintable_sd_1) <- c("Date","monthly_precip_sd")
+raintable_sd_1 <- raintable_sd_1 %>% select(Date,monthly_precip_sd)
+
+raintable2 <- read.csv(paste0(wd, "/IMERG/2002-2022/", rainfall_filename2), header=T) ; names(raintable2) <- c("Date","monthly_precip")
+raintable2 <- raintable2 %>% select(Date,monthly_precip)
+raintable_sd_2 <- read.csv(paste0(wd, "/IMERG/2002-2022/", rainfall_sd_filename2), header=T) ; names(raintable_sd_2) <- c("Date","monthly_precip_sd")
+raintable_sd_2 <- raintable_sd_2 %>% select(Date,monthly_precip_sd)
+
+raintable <- raintable1 %>% full_join(raintable_sd_1, by = "Date", keep=F) %>% arrange(Date)
+raintable <- raintable %>% full_join(raintable2, by = "Date", keep=F) %>% arrange(Date)
+raintable <- raintable %>% full_join(raintable_sd_2, by = "Date", keep=F) %>% arrange(Date)
+names(raintable)[c(2,4)] <- paste0(site.list, "_precip")
+names(raintable)[c(3,5)] <- paste0(site.list, "_precip_sd")
+
+raintable$Month <- format(as.Date(paste0(raintable$Date,"-01")), "%b")
+raintable$Year <- format(as.Date(paste0(raintable$Date,"-01")), "%Y")
+
+names(hours_per_month) <- month.abb
+
+# Adjust the number of hours per month based on whether it's a leap year or not
+raintable$n <- mapply(function(month, year) {
+  year <- as.numeric(year)
+  if (month == "Feb" && is_leap_year(year)) {
+    return(29 * 24)
+  } else {
+    return(hours_per_month[[month]])
+  }
+}, raintable$Month, raintable$Year)
+
+#reshape the original raintable for dry season stats
+measures <- c("precip", "precip_sd")
+cols <- paste(rep(site.list, each=length(measures)), measures, sep="_")
+raintable_long <- raintable %>% pivot_longer(cols = cols,names_to = c("site", ".value"), names_pattern = "(.*)_(.*)", values_drop_na = TRUE) %>% mutate(site = str_replace(site, "_precip", ""))
+raintable_long$sd <- c(raintable_long$sd[2:nrow(raintable_long)],NA)
+raintable_long <- raintable_long %>% na.omit() 
+raintable_long$month_num <- match(raintable_long$Month, month.abb)
+df <- data.frame()
+for (site in site.list) {
+  site_long <- raintable_long %>% filter(site == site)
+  site_long$season <- ifelse(site_long$month_num %in% dry_months[[site]], "dry", "wet")
+  df <- df %>% rbind(site_long)
+}
+df <- df %>% select(Date, season, site)
+raintable_long <- raintable_long %>% left_join(df, by=c("Date","site"), multiple="first")
+raintable_long$month_num <- NULL
+```
+
+Annual mean change? (first 6 years vs last 6 years)
+```{r}
+beginning <- raintable_long[raintable_long$Year <= 2007, ]
+ending <- raintable_long[raintable_long$Year >= 2016, ]
+beginning_mo <- beginning %>% group_by(site,Month) %>% summarise(mean=mean(precip), n=sum(n), sd=get_global_sd(sd,n))
+ending_mo <- ending %>% group_by(site,Month) %>% summarise(mean=mean(precip), n=sum(n), sd=get_global_sd(sd,n))
+beginning_an <- beginning %>% group_by(site) %>% summarise(mean_annual=sum(precip/6), n=sum(n), sd=get_global_sd(sd,n))
+ending_an <- ending %>% group_by(site) %>% summarise(mean_annual=sum(precip)/6, n=sum(n), sd=get_global_sd(sd,n))
+
+monthly_compared <- left_join(beginning_mo, ending_mo, by=c("site", "Month"))
+names(monthly_compared) <- c("site","Month",unlist(lapply(c("beginning", "ending"), function(site) {paste0(c("mean_", "n_", "sd_"), site)})))
+annual_compared <- left_join(beginning_an, ending_an, by=c("site"))
+names(annual_compared) <- c("site",unlist(lapply(c("beginning", "ending"), function(site) {paste0(c("mean_", "n_", "sd_"), site)})))
+
+site1 <- "rio_doce"
+#global mean monthly
+site1_precip <- monthly_compared[monthly_compared$site==site1,]
+global_mean_monthly1 <- data.frame(beginning_precip_monthly = site1_precip$mean_beginning, ending_precip_monthly = site1_precip$mean_ending) %>% pivot_longer(everything(.), names_to = "period", values_to = "precip") %>% group_by("period") %>% summarize(global_mean=mean(precip))
+#mean total annual
+site1_precip_ann <- annual_compared[annual_compared$site==site1,]
+global_total_annual1 <- data.frame(beginning_precip_annual = site1_precip_ann$mean_beginning, ending_precip_annual = site1_precip_ann$mean_ending) %>% pivot_longer(everything(.), names_to = "period", values_to = "precip") %>% group_by(period) %>% summarize(global_total=sum(precip))
+
+#global n
+global_n_monthly1 <- data.frame(beginning_n_monthly = site1_precip$n_beginning, ending_n_monthly = site1_precip$n_ending) %>% pivot_longer(everything(.), names_to = "period", values_to = "n") %>% group_by(period) %>% summarize(global_n=sum(n))
+
+#mean sd monthly
+global_sd_monthly1 <- data.frame(beginning_sd_monthly = site1_precip$sd_beginning, ending_sd_monthly = site1_precip$sd_ending) %>% pivot_longer(everything(.), names_to = "period", values_to = "sd") %>% mutate(Month = rep(month.abb,each=2), period1 = substr(period,0,3))
+    ndf <- data.frame(beginning_n_monthly = site1_precip$n_beginning, ending_n_monthly = site1_precip$n_ending) %>% pivot_longer(everything(.), names_to = "period", values_to = "n") %>% mutate(Month = rep(month.abb,each=2), period1 = substr(period,0,3))
+global_sd_monthly1 <- global_sd_monthly1 %>% left_join(ndf, by=c("period1","Month")) %>% select(-Month,-period1,-period.y)    %>% group_by(period.x) %>% summarize(global_total_sd=get_global_sd(sd,n))
+
+#mean sd annual
+global_sd_annual1 <- data.frame(beginning_sd_annual = site1_precip_ann$sd_beginning, ending_sd_annual = site1_precip_ann$sd_ending) %>% pivot_longer(everything(.), names_to = "period", values_to = "sd")
+    ndf <- data.frame(beginning_n_annual = site1_precip_ann$n_beginning, ending_n_annual = site1_precip_ann$n_ending) %>% pivot_longer(everything(.), names_to = "period", values_to = "n")
+global_sd_annual1$n <- ndf$n
+
+
+site2 <- "sooretama"
+#global mean monthly
+site2_precip <- monthly_compared[monthly_compared$site==site2,]
+global_mean_monthly2 <- data.frame(beginning_precip_monthly = site2_precip$mean_beginning, ending_precip_monthly = site2_precip$mean_ending) %>% pivot_longer(everything(.), names_to = "period", values_to = "precip") %>% group_by("period") %>% summarize(global_mean=mean(precip))
+#mean total annual
+site2_precip_ann <- annual_compared[annual_compared$site==site2,]
+global_total_annual2 <- data.frame(beginning_precip_annual = site2_precip_ann$mean_beginning, ending_precip_annual = site2_precip_ann$mean_ending) %>% pivot_longer(everything(.), names_to = "period", values_to = "precip") %>% group_by(period) %>% summarize(global_total=sum(precip))
+
+#global n
+global_n_monthly2 <- data.frame(beginning_n_monthly = site2_precip$n_beginning, ending_n_monthly = site2_precip$n_ending) %>% pivot_longer(everything(.), names_to = "period", values_to = "n") %>% group_by(period) %>% summarize(global_n=sum(n))
+
+#mean sd monthly
+global_sd_monthly2 <- data.frame(beginning_sd_monthly = site2_precip$sd_beginning, ending_sd_monthly = site2_precip$sd_ending) %>% pivot_longer(everything(.), names_to = "period", values_to = "sd") %>% mutate(Month = rep(month.abb,each=2), period1 = substr(period,0,3))
+    ndf <- data.frame(beginning_n_monthly = site2_precip$n_beginning, ending_n_monthly = site2_precip$n_ending) %>% pivot_longer(everything(.), names_to = "period", values_to = "n") %>% mutate(Month = rep(month.abb,each=2), period1 = substr(period,0,3))
+global_sd_monthly2 <- global_sd_monthly2 %>% left_join(ndf, by=c("period1","Month")) %>% select(-Month,-period1,-period.y)    %>% group_by(period.x) %>% summarize(global_total_sd=get_global_sd(sd,n))
+
+#mean sd annual
+global_sd_annual2 <- data.frame(beginning_sd_annual = site2_precip_ann$sd_beginning, ending_sd_annual = site2_precip_ann$sd_ending) %>% pivot_longer(everything(.), names_to = "period", values_to = "sd")
+    ndf <- data.frame(beginning_n_annual = site2_precip_ann$n_beginning, ending_n_annual = site2_precip_ann$n_ending) %>% pivot_longer(everything(.), names_to = "period", values_to = "n")
+global_sd_annual2$n <- ndf$n
+
+# gather stats into a table
+table <- data.frame("site" = rep(site.list, each=2),
+                    "period" = c("early (2002-2007)", "late (2016-2021)"), 
+                    "Mean Monthly Precip" = c(global_mean_monthly1$global_mean, global_mean_monthly2$global_mean), 
+                    "Mean Monthly St. Dev." = c(global_sd_monthly1$global_total_sd, global_sd_monthly2$global_total_sd), 
+                    "Mean Annual Precip" = c(global_total_annual1$global_total, global_total_annual2$global_total), 
+                    "Mean Annual St. Dev." = c(global_sd_annual1$sd, global_sd_annual2$sd), 
+                    "Sample Size n" = c(global_n_monthly1$global_n, global_n_monthly2$global_n))
+```
+
+Plot period comparison
+```{r}
+remotes::install_github("coolbutuseless/ggpattern", force = TRUE) ; library(ggpattern)
+table$site <- factor(table$site, levels = c("rio_doce", "sooretama"), labels = foresttypes_abbr)
+
+table %>%
+ggplot(aes(x = site, y = Mean.Annual.Precip, fill = site, pattern = period)) +
+  geom_bar_pattern(stat = 'identity', position = 'dodge', 
+                   pattern_fill = "black", pattern_density = 0.1, pattern_spacing = 0.02, pattern_key_scale_factor = 1) +
+  geom_errorbar(aes(ymin = Mean.Annual.Precip - Mean.Annual.St..Dev., ymax = Mean.Annual.Precip + Mean.Annual.St..Dev.), 
+                width = 0.2, position = position_dodge(0.9)) +
+  scale_pattern_manual(values = c("early (2002-2007)" = "stripe", "late (2016-2021)" = "none")) +
+  labs(x = "Site", y = "Mean Annual Rainfall (mm)") +
+  theme_minimal() +
+  scale_fill_manual(values = c(SS = "#808080", EB = "#d1d1d1")) +
+  theme(legend.title = element_blank(), legend.position = "top", text = element_text(size = 18)) +
+  guides(fill = FALSE)  # Remove the legend for fill
+```
+Looks like our sites have gotten drier over the last 20 years!!
+
+What about the dry season? Is it because dry seasons are getting drier, or just just drier more generally (first 6 years - historical vs last 6 years - present)?
+```{r}
+#Compare mean montly precip during dry season to mean monthly annual precip
+
+beginning_dry <- raintable_long[raintable_long$Year <= 2007, ] %>% filter(season=="dry")
+ending_dry <- raintable_long[raintable_long$Year >= 2016, ] %>% filter(season=="dry")
+beginning_dry_mo <- beginning_dry %>% group_by(site,Month) %>% summarise(mean=mean(precip), n=sum(n), sd=get_global_sd(sd,n))
+ending_dry_mo <- ending_dry %>% group_by(site,Month) %>% summarise(mean=mean(precip), n=sum(n), sd=get_global_sd(sd,n))
+
+monthly_compared_dry <- left_join(beginning_dry_mo, ending_dry_mo, by=c("site", "Month"))
+names(monthly_compared_dry) <- c("site","Month",unlist(lapply(c("beginning", "ending"), function(site) {paste0(c("mean_", "n_", "sd_"), site)})))
+
+site1 <- "rio_doce"
+#global mean monthly
+site1_dry_precip <- monthly_compared_dry[monthly_compared_dry$site==site1,] ; dry_mo_1 <- factor(site1_dry_precip$Month, levels = month.abb)
+global_mean_dry_monthly1 <- data.frame(beginning_precip_monthly = site1_dry_precip$mean_beginning, ending_precip_monthly = site1_dry_precip$mean_ending) %>% pivot_longer(everything(.), names_to = "period", values_to = "precip") %>% group_by("period") %>% summarize(global_mean=mean(precip))
+
+#global n
+global_n_dry_monthly1 <- data.frame(beginning_n_monthly = site1_dry_precip$n_beginning, ending_n_monthly = site1_dry_precip$n_ending) %>% pivot_longer(everything(.), names_to = "period", values_to = "n") %>% group_by(period) %>% summarize(global_n=sum(n))
+
+#mean sd monthly
+global_sd_dry_monthly1 <- data.frame(beginning_sd_monthly = site1_dry_precip$sd_beginning, ending_sd_monthly = site1_dry_precip$sd_ending) %>% pivot_longer(everything(.), names_to = "period", values_to = "sd") %>% mutate(Month = rep(as.character(dry_mo_1[order(dry_mo_1)]), each=2), period1 = substr(period,0,3))
+    ndf <- data.frame(beginning_n_monthly = site1_dry_precip$n_beginning, ending_n_monthly = site1_dry_precip$n_ending) %>% pivot_longer(everything(.), names_to = "period", values_to = "n") %>% mutate(Month = rep(as.character(dry_mo_1[order(dry_mo_1)]), each=2), period1 = substr(period,0,3))
+global_sd_dry_monthly1 <- global_sd_dry_monthly1 %>% left_join(ndf, by=c("period1","Month")) %>% select(-Month,-period1,-period.y)    %>% group_by(period.x) %>% summarize(global_total_sd=get_global_sd(sd,n))
+
+site2 <- "sooretama"
+#global mean monthly
+site2_dry_precip <- monthly_compared_dry[monthly_compared_dry$site==site2,] ; dry_mo_2 <- factor(site2_dry_precip$Month, levels = month.abb)
+global_mean_dry_monthly2 <- data.frame(beginning_precip_monthly = site2_dry_precip$mean_beginning, ending_precip_monthly = site2_dry_precip$mean_ending) %>% pivot_longer(everything(.), names_to = "period", values_to = "precip") %>% group_by("period") %>% summarize(global_mean=mean(precip))
+
+#global n
+global_n_dry_monthly2 <- data.frame(beginning_n_monthly = site2_dry_precip$n_beginning, ending_n_monthly = site2_dry_precip$n_ending) %>% pivot_longer(everything(.), names_to = "period", values_to = "n") %>% group_by(period) %>% summarize(global_n=sum(n))
+
+#mean sd monthly
+global_sd_dry_monthly2 <- data.frame(beginning_sd_monthly = site2_dry_precip$sd_beginning, ending_sd_monthly = site2_dry_precip$sd_ending) %>% pivot_longer(everything(.), names_to = "period", values_to = "sd") %>% mutate(Month = rep(as.character(dry_mo_2[order(dry_mo_2)]), each=2), period1 = substr(period,0,3))
+    ndf <- data.frame(beginning_n_monthly = site2_dry_precip$n_beginning, ending_n_monthly = site2_dry_precip$n_ending) %>% pivot_longer(everything(.), names_to = "period", values_to = "n") %>% mutate(Month = rep(as.character(dry_mo_2[order(dry_mo_2)]), each=2), period1 = substr(period,0,3))
+global_sd_dry_monthly2 <- global_sd_dry_monthly2 %>% left_join(ndf, by=c("period1","Month")) %>% select(-Month,-period1,-period.y)    %>% group_by(period.x) %>% summarize(global_total_sd=get_global_sd(sd,n))
+
+# gather stats into a table
+dry_table <- data.frame("site" = rep(site.list, each=2),
+                    "period" = c("early (2002-2007)", "late (2016-2021)"), 
+                    "Mean Monthly Precip" = c(global_mean_dry_monthly1$global_mean, global_mean_dry_monthly2$global_mean), 
+                    "Mean Monthly St. Dev." = c(global_sd_dry_monthly1$global_total_sd, global_sd_dry_monthly2$global_total_sd), 
+                    "Sample Size n" = c(global_n_dry_monthly1$global_n, global_n_dry_monthly2$global_n))
+```
+
+Plot dry period (mean monthly) and historical comparison with all months 
+```{r}
+remotes::install_github("coolbutuseless/ggpattern") ; library(ggpattern)
+table$site <- factor(table$site, levels = c("rio_doce", "sooretama"), labels = foresttypes_abbr)
+dry_table$site <- factor(dry_table$site, levels = c("rio_doce", "sooretama"), labels = foresttypes_abbr)
+
+# # merge both for comparing mean monthly directly to mean monthly (dry period)
+# names(dry_table)[-c(1,2)] <- paste0(names(dry_table)[-c(1,2)], "_dry")
+# table <- merge(table, dry_table, by = c("site", "period"))
+
+dry_table %>%
+ggplot(aes(x = site, y = Mean.Monthly.Precip, fill = site, pattern = period)) +
+  geom_bar_pattern(stat = 'identity', position = 'dodge', 
+                   pattern_fill = "black", pattern_density = 0.1, pattern_spacing = 0.02, pattern_key_scale_factor = 1) +
+  geom_errorbar(aes(ymin = Mean.Monthly.Precip - Mean.Monthly.St..Dev., ymax = Mean.Monthly.Precip + Mean.Monthly.St..Dev.), 
+                width = 0.2, position = position_dodge(0.9)) +
+  scale_pattern_manual(values = c("early (2002-2007)" = "stripe", "late (2016-2021)" = "none")) +
+  labs(x = "Site", y = "Mean Monthly Rainfall - Dry Season (mm)") +
+  ylim(0, 100) +
+  theme_minimal() +
+  scale_fill_manual(values = c(SS = "#808080", EB = "#d1d1d1")) +
+  theme(legend.title = element_blank(), legend.position = "top", text = element_text(size = 18)) +
+  guides(fill = FALSE)  # Remove the legend for fill
+```
+
+Test for significant difference in the dry season (historical vs present)
+```{r}
+beginning_dry_site1 <- beginning_dry %>% filter(site=="rio_doce") %>% select(Date,precip)
+beginning_dry_site2 <- beginning_dry %>% filter(site=="sooretama") %>% select(Date,precip)
+ending_dry_site1 <- ending_dry %>% filter(site=="rio_doce") %>% select(Date,precip)
+ending_dry_site2 <- ending_dry %>% filter(site=="sooretama") %>% select(Date,precip)
+
+beginning_dry_site1$Date <- ymd(paste0(beginning_dry_site1$Date, "-01"))
+beginning_dry_site2$Date <- ymd(paste0(beginning_dry_site2$Date, "-01"))
+      ending_dry_site1$Date <- ymd(paste0(ending_dry_site1$Date, "-01"))
+      ending_dry_site2$Date <- ymd(paste0(ending_dry_site2$Date, "-01"))
+
+#correct for IMERG end date issue before data merge
+ending_dry_site1 <- ending_dry_site1 %>% rbind(c(ymd(IMERG_end_date) %>% ceiling_date(unit="months"), NA))
+
+#to compare time series on a plot, shift first time series by X number of days      
+plotCorrect <- ending_dry_site1$Date-beginning_dry_site1$Date
+
+
+# Use the correction factor to predict significant differences between the two times series
+beginning_dry_site1$Date <- beginning_dry_site1$Date + plotCorrect
+beginning_dry_site2$Date <- beginning_dry_site2$Date + plotCorrect
+
+begin_end_site1 <- merge.zoo(read.zoo(beginning_dry_site1), read.zoo(ending_dry_site1), all=F)
+names(begin_end_site1) <- c("beginning_dry", "ending_dry")
+begin_end_site2 <- merge.zoo(read.zoo(beginning_dry_site2), read.zoo(ending_dry_site2), all=F)
+names(begin_end_site2) <- c("beginning_dry", "ending_dry")
+
+#Granger Test site 1
+grangertest(beginning_dry ~ ending_dry, order = 3, data = begin_end_site1) %>% kable(digits = 5)
+#Granger Test site 2
+grangertest(beginning_dry ~ ending_dry, order = 3, data = begin_end_site2) %>% kable(digits = 5)
+
+# Other stats
+# #dry season 
+# raintable_long %>% filter(season=="dry") %>% group_by(site) %>% summarise(mean=mean(precip), n=sum(n), sd=get_global_sd(sd,n)) %>% kable(digits = 4) 
+```
+
+Plot early-late dry season time series
+```{r}
+raintable_long$precip_dry <- ifelse(raintable_long$season == "wet", NA, raintable_long$precip)
+late_table_dry <- raintable_long[raintable_long$Year >= 2016, ] %>% select(Date,site,precip_dry)
+raintable_long$precip_wet <- ifelse(raintable_long$season == "dry", NA, raintable_long$precip)
+late_table_wet <- raintable_long[raintable_long$Year >= 2016, ] %>% select(Date,site,precip_wet)
+
+#pad late period table with extra NAs
+late_table_dry <- late_table_dry %>% mutate(Date=as.Date(paste0(late_table_dry$Date,"-01"))) %>% group_by(site) %>% pad(end_val=ymd("2021-12-01")) %>% ungroup() %>% arrange(Date)
+late_table_wet <- late_table_wet %>% mutate(Date=as.Date(paste0(late_table_wet$Date,"-01"))) %>% group_by(site) %>% pad(end_val=ymd("2021-12-01")) %>% ungroup() %>% arrange(Date)
+
+plot_raintable_long <- raintable_long[raintable_long$Year <= 2007, ] %>% mutate(precip_late_dry = late_table_dry$precip_dry, precip_late_wet = late_table_wet$precip_wet) 
+
+site1 <- plot_raintable_long %>% filter(site == "rio_doce") %>% select(Date,precip_dry, precip_wet, precip_late_dry, precip_late_wet)
+site1$Date <- ymd(paste0(site1$Date,"-01")) + plotCorrect[1]; site1 <- read.zoo(site1)
+site2 <- plot_raintable_long %>% filter(site == "sooretama") %>% select(Date,precip_dry, precip_wet, precip_late_dry, precip_late_wet)
+site2$Date <- ymd(paste0(site2$Date,"-01")) + plotCorrect[1]; site2 <- read.zoo(site2)
+
+# function to "connect" separate lines in the plot by creating overlapping values between wet/dry precip values.
+replace_first_na <- function(x, y) {
+  na_idx <- which(is.na(x))
+  na_first_idx <- c(TRUE, diff(na_idx) > 1)
+  x[na_idx[na_first_idx]] <- y[na_idx[na_first_idx]]
+  x
+}
+
+site1$precip_wet <- replace_first_na(site1$precip_wet, site1$precip_dry)
+site1$precip_dry <- replace_first_na(site1$precip_dry, site1$precip_wet)
+site1$precip_late_wet <- replace_first_na(site1$precip_late_wet, site1$precip_late_dry)
+site1$precip_late_dry <- replace_first_na(site1$precip_late_dry, site1$precip_late_wet)
+
+site2$precip_wet <- replace_first_na(site2$precip_wet, site2$precip_dry)
+site2$precip_dry <- replace_first_na(site2$precip_dry, site2$precip_wet)
+site2$precip_late_wet <- replace_first_na(site2$precip_late_wet, site2$precip_late_dry)
+site2$precip_late_dry <- replace_first_na(site2$precip_late_dry, site2$precip_late_wet)
+
+site2 %>% plot(type = c("h", "h"), screens = 1, col = rep(c("darkgray", "black"), each=2), lty = rep(c("dashed","solid"),2), cex = 0.6, pch=20, ylab="Mean monthly rainfall (mm)", xlab="", cex.axis = 1.5, ylim = c(0, 500), main = paste(str_to_title(foresttypes[2])))
+mtext("Years", side = 1, line = 2.5, cex = 1.6)
+legend("topleft", 
+       legend = c("2002-2007 (early)", "2016-2021 (late)"), 
+       col = c("darkgray", "black"), 
+       pch = c(NA, NA), 
+       lty = c("solid"),
+       cex = 0.6)
+```
+

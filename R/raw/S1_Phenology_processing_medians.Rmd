@@ -1,0 +1,68 @@
+---
+title: "S1 Phenology Processing from Earth Engine"
+author: "J. Bruce Bell"
+date: "`r Sys.Date()`"
+---
+
+Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Imports
+```{r echo=FALSE}
+library(knitr)
+library(tidyr)
+library(lubridate)
+library(clock)
+library(stringr)
+library(dplyr)
+library(purrr)
+library(data.table)
+library(tibble)
+```
+
+Parameters
+```{r}
+#working directory
+wd <- "/Users/brbell01/Google Drive/PHD/CUNY/Research/R/Phenology/raw"
+
+#data descriptors
+studyarea_base <- "monte_pascoal" # "mata_escura" ; "monte_pascoal" ; "rio_doce" ; "sooretama"
+scale <- "1ha" # "1ha" ; "25ha" ; "625ha" ; "Park"
+```
+
+Import Sentinel-1 data
+```{r}
+#gather files for each year
+tables_yrslist <- dir(paste0(wd, "/s1/", scale, "/means_export/"), full.names = T, pattern = "csv") %>%
+  str_subset(studyarea_base) 
+
+#process files in a loop
+indexdata <- data.frame()
+colnames <- as.vector(names(read.csv(tables_yrslist[1])))
+
+for (year in 1:length(tables_yrslist)) {
+      table <- read.csv(tables_yrslist[year])
+      table <- table %>% mutate(Date = date_parse(system.time_start, format = "%b %d, %Y"))# format date
+     
+       #merge duplicate dates
+      table <- table %>% group_by(Date, system.time_start)
+      table <- table %>% summarise_all(mean) 
+
+      #update the master table with processed data for each year by row bind
+      indexdata <- rbind(indexdata,table)
+}
+
+names(indexdata) <- c("Date", colnames) # reset columns
+indexdata <- indexdata %>% select(-tail(names(.), 1))  %>% # drop last column 
+             relocate(Date, .after = last_col())  #put Date column at the end
+
+```
+
+```{r}
+#write out processed file
+filename_base <- paste0(studyarea_base, "_s1_", scale)
+write.csv(indexdata, paste0(wd, "/s1/", scale, "/means_export/", filename_base, "_processed.csv"))
+```
+

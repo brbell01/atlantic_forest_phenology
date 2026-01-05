@@ -1,0 +1,401 @@
+---
+title: "S1 Phenology Plotting"
+author: "J. Bruce Bell"
+date: "`r Sys.Date()`"
+---
+
+Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Imports
+```{r include=FALSE}
+packages <- c("knitr", "tidyr", "lubridate", "scales", "ggthemes", "ggtext", "stringr", "dplyr", "ggplot2", "data.table", "tibble", "sf", "tidyquant", "purrr", "ggpubr", "circular")
+
+installed_packages <- rownames(installed.packages())
+for (package in packages) {
+  if (!(package %in% installed_packages)) {
+    install.packages(package)
+  }
+  library(package, character.only = TRUE)
+}
+```
+
+```{r}
+#working directory
+setwd("/Users/brbell01/Documents/git/atlantic_forest_phenology/R/raw/")
+wd <- getwd()
+```
+
+Import processed Sentinel-1 data tables
+```{r}
+#Parameters to be altered
+foresttype <-  "Evergreen Broadleaf"  # "Seasonal Semi-deciduous Forest"  ; "Broadleaf Evergreen"
+studyarea <- "REBIO Sooretama, ES" #  "PE Rio Doce, MG"  # "REBIO Mata Escura, MG"  # ; "PNH Monte Pascoal, BA" ; "REBIO Sooretama, ES"
+studyarea_base <- "sooretama" # "rio_doce" # "mata_escura" ; "monte_pascoal" 
+scale <- "1ha" # "1ha" ; "25ha" ; "625ha" ; "Park"
+
+#import
+band.list <- c("VH", "VV", "RVI")
+indexdata <- vector(mode = "list", length = 0)
+for (band in band.list) {
+      table <- read.csv(paste0(wd, "/s1/1ha/second_run/", studyarea_base, "_s1_1ha_", band, "_processed.csv"))
+      table <- table[,!names(table) %in% c("X")] %>% mutate(date = ymd(date))
+      indexdata[[band]] <- table
+}
+
+#indexdata <- read.csv(paste0(wd, "/s1/", scale, "/", studyarea_base, "_s1_", scale,"_processed.csv"))
+#indexdata <- table[,!names(table) %in% c("X")] %>% mutate(date = ymd(date))
+```
+
+Process plot means
+```{r}
+indexmeans <- vector(mode = "list", length = 0)
+for (band in band.list) {
+      means <- indexdata[[band]] %>% gather("Hectare_ID", value, -date) %>% group_by(date) %>%     
+                         filter(!grepl('sd', Hectare_ID)) %>%
+                         summarize(mean(value, na.rm=TRUE)) %>% mutate(date = ymd(date))
+      names(means)[2] <- paste0(band,"_hectare_means")
+      indexmeans[[band]] <- means
+}
+```
+
+Median and means calculated across plots seem to be identical. Why? Because distributions are all approx. normal.
+```{r}
+bandname <- "RVI"
+plotdata <- indexdata[[bandname]] %>% gather("Hectare_ID", value, -date) %>%     
+                         filter(!grepl('sd', Hectare_ID)) %>% group_by(Hectare_ID) %>% na.omit() %>% 
+                         mutate(mean = mean(value), median = median(value)) %>%
+                         mutate(Hectare_ID, meanlab = paste('Mean =', mean), medianlab = paste('Median =', median)) %>%
+                         mutate(meanlab = substring(meanlab, 1, 13), medianlab = substring(medianlab, 1, 15))
+
+#take a random sample 
+selectedrows <- paste0(bandname, "_hectareID_", sample.int(150, 20))
+plotdata <- plotdata[is.element(plotdata$Hectare_ID, selectedrows),]
+
+#bars <- plotdata %>% select(-date) %>% summarise(mean = mean(value), median = mean(value)) 
+#labels <- bars %>% mutate(Hectare_ID, meanlab = paste('Mean =', mean), medianlab = paste('Median =', median)) %>%
+#          mutate(mean = str_trunc(mean, 16, side="right"), median = str_trunc(median, 16, side="left"))
+color <- (c("mean" = "red", "median" = "maroon"))
+
+ggplot(data = plotdata, aes(plotdata$value)) +
+  geom_histogram(bins = 50) +
+  scale_x_continuous(limits = c(-16,-11)) +
+ # ggtitle(substring(plotdata$Hectare_ID, 17)) +
+  theme(legend.position="none", strip.background=element_blank(), strip.text.x = element_text(size = 0),panel.background=element_blank(), axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14), 
+        axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12)) +    
+  facet_wrap(~Hectare_ID) +
+  geom_text(aes(y = 16, x=-15.5, label = substring(plotdata$Hectare_ID, 11, 15), group = Hectare_ID, size = 5, color = "black")) +
+  geom_text(aes(y = 14, x=-11, label = plotdata$meanlab, group = Hectare_ID, size = 5, color = "mean", hjust = 1)) +
+  geom_text(aes(y = 10, x=-11, label = plotdata$medianlab, group = Hectare_ID, size = 5, color = "median", hjust = 1)) +
+  scale_color_manual(values = c("black", "red", "maroon")) +
+#  geom_text(aes(label = plotdata$medianlab), data = plotdata, vjust = "middle", hjust = "right", size = 5, color = "maroon") +
+  geom_vline(aes(xintercept=mean, group = Hectare_ID),        # Add line for mean
+             col = "red",
+             lwd = 1) +
+  geom_vline(aes(xintercept=median, group = Hectare_ID),        # Add line for mean
+             col = "maroon",
+             lwd = 1) +
+  xlab(paste0('Sentinel-1 ', bandname, ' backscatter (dB), (2016-2021)')) + 
+  ylab('Pixel Count')
+ 
+#Because distributions are all approx. normal
+```
+
+Save Plot
+```{r}
+png(paste0(studyarea_base, "_histograms_mean_med_s1_", bandname, ".png"), units="in", width=20, height=10, res=300)
+print(plot)
+dev.off()
+```
+
+
+```{r}
+#define outlier function
+remove_outliers <- function(x, na.rm = TRUE, ...) {
+  qnt <- quantile(x, probs=c(0.10, 0.90), na.rm = na.rm, ...)
+  H <- 1.5 * IQR(x, na.rm = na.rm)
+  y <- x
+  y[x < (qnt[1] - H)] <- NA
+  y[x > (qnt[2] + H)] <- NA
+  y
+}
+```
+
+```{r}
+#park mean band values time series for overplot
+park.mean <- read.csv(paste0(wd, "/", satellite, "/Park/", studyarea_base, "_", satellite, "_", bandname, "_Park_processed.csv"))
+park.mean <- park.mean %>% select(date, VH_hectareID_NA, VH_sd_hectareID_NA) %>% mutate(date = ymd(date), VH_Park=VH_hectareID_NA,VH_sd_Park=VH_sd_hectareID_NA) %>% na.omit()
+```
+
+Plotting: Raw time series
+```{r}
+#choose which band to plot
+bandname <- "RVI"
+plotdata <- gather(indexdata[[bandname]], "Hectare_ID", value, -date)  %>% 
+  filter(!grepl('sd', Hectare_ID)) %>%
+  na.omit()
+plotsds <- gather(indexdata[[bandname]], "Hectare_ID", value, -date)  %>% filter(grepl('sd', Hectare_ID)) %>%
+  na.omit()
+plotmeans <- indexmeans[[bandname]]
+
+#plot time series 
+# ylims <- c(-10,-6)
+ggplot(data=plotdata, aes(x = date, y = value)) +  
+  geom_point(aes(colour = Hectare_ID), size=0.8, alpha = 0.3) +
+  geom_line(data=plotmeans, aes(x=date, y=unlist(plotmeans[,2]) %>% remove_outliers()),
+       color = "grey25", size=0.8) +
+       theme_minimal(base_size = 14) +
+       scale_x_date(date_labels = "%b, %Y"
+               , date_breaks = "3 month"
+               , expand = expansion(add = .05) 
+                ) +
+#      scale_y_continuous(limits = ylims) +
+       xlab("Month, Year") +
+       ylab(paste0(bandname," index value (dB)")) +
+       theme(legend.position = "none"
+             ,axis.text.x = element_text(angle = 45)) +
+       ggtitle(paste0("Sentinel-1 average backscatter (", bandname, ") values \n for ", length(unique(plotdata$Hectare_ID)), " ", scale, " plots over ", foresttype, ",\n", studyarea, ", Brazil"))
+```
+
+Save Plot
+```{r}
+ggsave(paste0("plotraw_s1_", bandname, ".png"), units="in", width=10, height=5, dpi=300, device = 'png')
+#dev.off()
+```
+
+Plotting: looking at within-plot variance
+```{r}
+#take a random sample 
+selectedrows <- paste0(bandname, "_sd_hectareID_", sample.int(plotsds$Hectare_ID %>% unique() %>% length(), 20, replace = F))
+plotsds <- plotsds[is.element(plotdata$Hectare_ID, selectedrows),]
+
+plotsds.stats <- plotsds %>% group_by(Hectare_ID) %>%    #group and reorder ascending
+              mutate(mean = mean(value, na.rm = TRUE)) %>%
+              mutate(Hectare_ID = substring(Hectare_ID, 17)) %>%
+              ungroup()
+ylims <- c(0,30)
+ggplot(data=plotsds.stats, aes(x = Hectare_ID, y = value^2)) +  
+  geom_boxplot(aes(colour = mean)) +
+ # geom_line(data=plotmeans, aes(x=date, y=unlist(plotmeans[,2]) %>% remove_outliers()),
+ #      color = "grey25", size=0.8) +
+       theme_minimal(base_size = 14) +
+       scale_y_continuous(breaks = pretty_breaks() )+
+ #                         ,limits = ylims) +
+       ylab(paste0("variance in \n", bandname, " index value (dB)")) +
+       theme(legend.position = "none"
+             ,axis.text.x = element_text(angle = 90, vjust=0.5), 
+             panel.grid.major.x = element_blank()) +
+       ggtitle(paste0("Plot-wise variance in Sentinel-1 ", bandname," backscatter values \n for ", length(unique(plotdata$Hectare_ID)), " ", scale, " plots over ", foresttype, ",\n", studyarea, ", Brazil"))
+```
+
+Save Plot
+```{r}
+ggsave(paste0("boxplots_variance_s1_", bandname, ".png"), units="in", width=10, height=5, dpi=300, device = 'png')
+#dev.off()
+```
+
+Variance:  alternate plotting
+```{r}
+bandname <- "VH" # for plot labels
+plotsds.stats <- plotsds %>% group_by(Hectare_ID) %>%    #group and reorder ascending
+              mutate(median = median(value, na.rm = TRUE)) %>%
+              mutate(Hectare_ID = substring(Hectare_ID, 17)) %>%
+              ungroup() %>% arrange(median)
+
+plotsds.stats$Hectare_ID <- factor(plotsds.stats$Hectare_ID, levels = unique(plotsds.stats$Hectare_ID))
+
+labels <- tibble(
+   median = unique(plotsds.stats$median),
+   Hectare_ID = unique(plotsds.stats$Hectare_ID)
+)
+  
+# ylims <- c(0,1)
+ggplot(data=plotsds.stats, aes(x = median^2, y = Hectare_ID, fill = stat(x))) +  
+      geom_density_ridges_gradient(aes(scale = 2, rel_min_height = 0.01)) +
+      theme_ridges() +
+      geom_label(data = labels, aes(y = Hectare_ID, x = median^2, alpha = 1/100), label = labels$Hectare_ID, label.size = NA) +
+      #scale_x_continuous(limits = ylims, breaks = seq(0,0.005, 0.0005)) +
+      scale_fill_viridis_c(name = "Variance \n(median within-plot)", option = "C") +
+      xlab(paste0(bandname, " variance")) +
+      theme(legend.position = "none", axis.text.y = element_blank(), axis.ticks.y = element_blank()) +
+      ggtitle(paste0("Plot-wise variance in Sentinel-1 backscatter \n for ",  
+                     length(unique(plotdata$Hectare_ID)), " ", scale, " plots over ", foresttype, ",\n", studyarea, ", Brazil"))
+```
+
+Save Plot
+```{r}
+ggsave(paste0(studyarea_base, "_ridges_variance_s1_", bandname, ".png"), units="in", width=15, height=7.5, dpi=300, device = 'png')
+#dev.off()
+```
+
+Variance:  alternate plotting 2
+```{r}
+bandname <- "VH" # for plot labels
+plotsds.stats <- plotsds %>% group_by(Hectare_ID) %>%    #group and reorder ascending
+              mutate(mean = mean(value, na.rm = TRUE)) %>%
+              mutate(Hectare_ID = substring(Hectare_ID, 17)) %>%
+              ungroup() %>% arrange(mean)
+
+plotsds.stats$Hectare_ID <- factor(plotsds.stats$Hectare_ID, levels = unique(plotsds.stats$Hectare_ID))
+
+labels <- tibble(
+   median = unique(plotsds.stats$mean),
+   Hectare_ID = unique(plotsds.stats$Hectare_ID)
+)
+  
+ylims <- c(0,1)
+plot1 <- ggplot(data=plotsds.stats, aes(x = mean^2, y = Hectare_ID, fill = stat(x))) +  
+      geom_density_ridges_gradient(aes(scale = 1, rel_min_height = 0.01)) +
+      theme_ridges() +
+      geom_label(data = labels, aes(y = Hectare_ID, x = mean^2, alpha = 1/100), label = labels$Hectare_ID, label.size = NA) +
+      scale_x_continuous(limits = ylims, breaks = seq(0,1, 0.1)) +
+      scale_fill_viridis_c(name = "Variance \n(median within-plot)", option = "C") +
+      xlab(paste0("variance in ", bandname, " backscatter (dB)")) +
+      ylab("Hectare ID") +
+      theme(legend.position = "none", axis.text.y = element_blank(), axis.ticks.y = element_blank()) +
+      ggtitle(paste0("Plot-wise variance in Sentinel-1 backscatter \n for ",  
+                     length(unique(plotdata$Hectare_ID)), " ", scale, " plots over ", foresttype, ",\n", studyarea, ", Brazil"))
+
+ylims <- c(5,7)
+plot2 <- ggplot(data=plotsds.stats, aes(x = median^2, y = Hectare_ID, fill = stat(x))) +  
+      geom_density_ridges_gradient(aes(scale = 1, rel_min_height = 0.01)) +
+      theme_ridges() +
+      geom_label(data = labels, aes(y = Hectare_ID, x = median^2, alpha = 1/100), label = labels$Hectare_ID, label.size = NA) +
+      scale_x_continuous(limits = ylims, breaks = seq(1,15, 1)) +
+      scale_fill_viridis_c(name = "Variance \n(median within-plot)", option = "C") +
+   #   xlab(paste0("variance in ", bandname, " backscatter (dB)")) +
+      theme(legend.position = "none", axis.text.y = element_blank(), axis.ticks.y = element_blank())
+
+grid.draw(cbind(ggplotGrob(plot1), ggplotGrob(plot2)))
+```
+
+Save Plot
+```{r}
+ggsave(paste0(studyarea_base, "_ridges_variance_s1_", bandname, ".png"), units="in", width=15, height=7.5, dpi=300, device = 'png')
+#dev.off()
+```
+
+Plotting: Median VH/VV time series
+```{r}
+indexmeans <- indexmeans %>% reduce(left_join, by = "date")   
+colors <- c("all plots median VH"="black", "all plots median VV" = "maroon")
+#colors <- c("all plots median VHVVV ratio"="blue", "all plots median RVI composite" = "purple")
+ylims <- c(-16,3)
+
+#plot time series 
+ggplot(data = indexmeans, aes(x = date)) +
+  geom_line(aes(y = VH_hectare_means, colour = "all plots mean VH"), linetype = "solid") +
+  geom_line(aes(y = VV_hectare_means-6, colour = "all plots mean VV"), linetype = "dashed") +
+  scale_color_manual(name = "Legend", values = colors, labels = c("VH Line", "VV Line")) +
+  scale_linetype_manual(name = "Lines", values = c("solid", "dashed"), labels = c("VH Line", "VV Line")) +
+  theme_minimal(base_size = 14) +
+  scale_x_date(date_labels = "%b,%Y", date_breaks = "3 month", expand = expansion(add = .05)) +
+  scale_y_continuous(breaks = pretty_breaks(), name = "VH index values (dB)",
+                     sec.axis = sec_axis(~.+6, name = "VV index values (dB)", breaks = pretty_breaks())) +
+  xlab("Month, Year") +
+  theme(legend.position = "top", axis.text.x = element_text(angle = 45)) +
+  ggtitle(paste0("Sentinel-1 backscatter (VH & VV, mean of 129 1-ha plots) \nover ", foresttype, ",\n", studyarea, ", Brazil"))
+
+```
+
+```{r}
+ggsave(paste0(studyarea_base, "_plotmedians_allbands_s1.png"), units="in", width=10, height=5, dpi=300, device = 'png')
+#dev.off()
+```
+
+Plotting: Mean VH + AMSRE VOD for comparison
+```{r}
+VOD <- read.csv("/Users/brbell01/Google Drive/PHD/CUNY/Research/Data/AMSRE/data/AMSRU/VOD/2016-2018/VOD_processed.csv")
+
+#prep Mata Escura park means which are the first two VOD columns
+VOD <- VOD %>% select(date, VOD_1, VOD_2) %>%
+                mutate('VOD_means'= rowMeans(select(.,VOD_1,VOD_2))) %>%
+                mutate(date = as.Date(date))
+
+colors <- c("all plots mean RVI"="black", "AMSRE VOD returns" = "orchid")
+# ylims <- c(-16,3)
+ylims <- c(0,2)
+#axis_shift_VH <- 15.5
+axis_scalar_RVI <- 2
+axis_shift_RVI <- 2.5
+axis_shift2_RVI <- 0.5
+
+#plot time series
+ggplot() +  
+  geom_line(data=indexmeans, aes(x= date, y= RVI_hectare_means
+                                 , colour = "all plots mean RVI")) +
+  geom_line(data=VOD, aes(x= date, y= (axis_shift_RVI - VOD_means/axis_scalar_RVI)/axis_scalar_RVI, colour = "AMSRE VOD returns")) +
+  scale_color_manual(name = "Legend", values= colors) +
+       theme_minimal(base_size = 14) +
+       scale_x_date(date_labels = "%Y-%m"
+#               , limits = ymd(c("1901-11-01", "1901-12-31"))
+               , date_breaks = "6 month"
+#               , minor_breaks = "1 day"
+               , expand = expansion(add = .05) 
+                ) +
+       scale_y_continuous(breaks = pretty_breaks()
+              , name = "RVI index values" 
+              , limits = c(0.4, 1.2)
+              , sec.axis = sec_axis(~ (axis_shift_RVI - .*axis_scalar_RVI)*axis_scalar_RVI, name="AMSRE VOD value", breaks = pretty_breaks())) +
+       xlab("Year-Month") +
+       theme(legend.position = "right"
+             , axis.text.y.right = element_text(color = "orchid")  # Set right axis label color to purple
+             , axis.title.y.right = element_text(color = "orchid")  # Set right axis title color to purple
+             , axis.text.x = element_text(angle = 90)) +
+       ggtitle(paste0("Comparison of Sentinel-1 (RVI) (average of ", length(unique(plotdata$Hectare_ID)), 
+       " 1-ha plots) & \nAMSRE VOD returns (average of 2 scenes) \nover ", foresttype, ",", studyarea, ", Brazil"))
+```
+
+
+```{r}
+ggsave(paste0(studyarea_base,"_VH_VOD_compare_s1.png"), units="in", width=10, height=5, dpi=300, device = 'png')
+#dev.off()
+```
+
+
+```{r}
+#prep and plot annual average time series
+annual.means <- plotdata %>% mutate(doy = ymd(paste0("1901-", month(date), "-", day(date)))) %>%
+distinct() %>% group_by(doy) %>%
+summarize(mean = mean(value, na.rm = TRUE), stdev = sd(value, na.rm = TRUE))
+
+ylims <- annual.means$mean %>% range()
+ylims[1] <- ylims[1] %>% floor()
+ylims[2] <- ylims[2] %>% ceiling()
+
+color <- c(paste0(bandname, ", 15-day \n moving average" = "dark green"))
+
+ylims <- c(0.6,0.8)
+annual.means %>%
+ggplot(aes(x = doy, y = mean)) + 
+       geom_ribbon(aes(x=doy, ymin = mean-stdev, ymax = mean+stdev)
+                   , fill = "grey90", alpha = 0.75, color = NA) +
+       geom_point(alpha=0.5, size = 0.5, color = "dark green") +
+       geom_ma(ma_fun = SMA, inherit.aes = TRUE, n=15, show.legend = FALSE, color = "dark green", lwd=1.1) +
+       theme_minimal(base_size = 14) +
+       theme(panel.grid.major.x = element_line(color = "grey45", size = (0.3)),
+             panel.grid.major.y =  element_line(size = (0.1), color = "grey"),
+             panel.grid.minor = element_line(size = (0.1), color = "grey")) +
+       scale_color_manual(name = "Legend", values = color) +
+       scale_y_continuous(limits = ylims, breaks = pretty_breaks()) +
+       scale_x_date(date_labels = "%b %d"
+#               , limits = ymd(c("1901-11-01", "1901-12-31"))
+               , date_breaks = "1 month"
+#               , minor_breaks = "1 day"
+               , expand = expansion(add = .05) 
+                ) +
+       xlab(paste0("Month-Day (", year(max(plotdata$date))-year(min(plotdata$date)), "-yr average)")) +
+       ylab(paste0("mean ", bandname," index value (dB)")) +
+       theme(legend.position = "right"
+             ,axis.text.x = element_text(angle = 45)) +
+       ggtitle(paste0("Sentinel-1 ", bandname, " annual average backscatter \n for ",length(unique(plotdata$Hectare_ID)),         
+       " ", scale, " plots over ", foresttype, ",\n", studyarea, ", Brazil"))
+```
+
+save plot
+```{r}
+ggsave(paste0(studyarea_base, "_plotannual_s1_", bandname, ".png"), units="in", width=10, height=5, dpi=300, device = 'png')
+```
+

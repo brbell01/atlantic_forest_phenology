@@ -1,0 +1,115 @@
+---
+title: "S1_S2_trend_analysis"
+author: "J. Bruce Bell"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "/Users/brbell01/Google Drive/PHD/CUNY/Research/R/Phenology/")
+```
+
+Imports
+
+```{r echo=FALSE}
+library(knitr)
+library(tidyr)
+library(lubridate)
+library(clock)
+library(stringr)
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(hrbrthemes)
+library(purrr)
+library(data.table)
+library(tibble)
+library(sf)
+library(tidyquant)
+library(circular)
+library(readr)
+library(DescTools)
+library(padr)
+library(xts)
+library(zoo)
+library(grid)
+```
+
+Setup
+```{r}
+#set working directory
+setwd("/Users/brbell01/Google Drive/PHD/CUNY/Research/R/Phenology/")
+wd <- getwd()
+
+#Choose indices and sites
+S1_band <- "VV" # "RVI" ; "VH" ; "VV" 
+S2_band <- "EVI2" # "NDVI" ; "EVI" ; "EVI2"
+site_1 <- "mata_escura" ; site_2 <- "monte_pascoal" ; site_3 <- "rio_doce" ; site_4 <- "sooretama"
+site.list <- c(site_3, site_4)
+
+#________________________________________________
+
+#other params
+studyarea_bases <- c("mata_escura","monte_pascoal","rio_doce","sooretama")
+S1.band.list <- c("RVI", "VH", "VV")
+S2.band.list <- c("EVI2", "EVI", "NDVI")
+
+```
+
+Compile vegetation index data
+```{r}
+indexdata <- c()
+for (site in site.list) {
+  #sentinel-1
+  S1_indexdata <- vector(mode = "list", length = 0)
+  S1_table <- read.csv(paste0(wd, "/raw/s1/1ha/second_run/", site, "_s1_1ha_", S1_band, "_processed.csv"))
+  S1_table <- S1_table[,!names(S1_table) %in% c("X")] %>% mutate(date = as.Date(date))
+  S1_site_band <- paste0(site, "_", S1_band)
+  S1_indexdata[[S1_site_band]] <- S1_table 
+  #sentinel-2
+  S2_indexdata <- vector(mode = "list", length = 0)
+  S2_table <- read.csv(paste0(wd, "/raw/s2/1ha/second_run/", site, "_s2_1ha_", S2_band, "_processed.csv"))
+  S2_table <- S2_table[,!names(S2_table) %in% c("X")] %>% mutate(date = as.Date(date))
+  S2_site_band <- paste0(site, "_", S2_band)
+  S2_indexdata[[S2_site_band]] <- S2_table
+  
+  #combine
+  indexdata <- c(indexdata, S1_indexdata, S2_indexdata)
+}
+```
+
+Prep raw time series data for plotting
+```{r}
+  plotdata <- list()
+  for (site_band in names(indexdata)) {
+  plotdata[[site_band]] <- indexdata[[site_band]] %>% gather("Hectare_ID", value, -date) %>% group_by(date) %>% 
+                           filter(!grepl('sd', Hectare_ID)) %>%     
+                           dplyr::summarize(mean(value, na.rm=TRUE)) %>% mutate(date = ymd(date))
+  names(plotdata[[site_band]]) <- c("date", paste0(site_band,"_hectare_means"))
+  }
+
+#plotdata <- reduce(plotdata, left_join, by = "date")  %>% arrange(date)
+#names(plotdata) <- c("date", names(indexdata))
+
+```
+
+Mann Kendall trend test for the Sentinel-1 time series
+```{r}
+site <- "rio_doce" ; bandname <- S1_band #or  S2_band
+site_data <- plotdata[grepl(paste0(site, "_", bandname),names(plotdata))] %>% data.frame()
+x <- site_data[2]
+
+series <- xts(x = site_data[2], order.by = site_data$date)
+
+require(Kendall)
+SeasonalMannKendall(series)
+
+#res <- SeasonalMannKendall(x,y)
+```
+
+run all
+```{r}
+
+```
+

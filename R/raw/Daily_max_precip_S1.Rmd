@@ -1,0 +1,219 @@
+---
+title: "Daily_max_precip_S1"
+author: "J. Bruce Bell"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyr)
+library(knitr)
+library(lubridate)
+library(scales)
+library(ggthemes)
+library(ggtext)
+library(stringr)
+library(dplyr)
+library(ggplot2)
+library(purrr)
+library(data.table)
+library(tibble)
+library(scales)
+library(grid)
+library(padr)
+library(clock)
+```
+
+```{r}
+setwd("/Users/brbell01/Google Drive/PHD/CUNY/Research/R/Phenology/raw/")
+wd <- getwd()
+
+#parameters
+foresttype <- "Seasonal Semi-deciduous Forest" # "Evergreen Broadlead Forest"
+studyarea <-  "REBIO Sooretama, ES" # "PE Rio Doce, MG" # "REBIO Sooretama, ES" #"PNH Monte Pascoal, BA" #  "REBIO Mata Escura, MG" 
+studyarea_base <- "sooretama" # "monte_pascoal" rio_doce ; monte_pascoal ; sooretama
+satellite <- "S1"
+rainfall_name <- "IMERG"
+rainfall_filename <- "Sooretama_IMERG_2016-2022.csv"  ;
+scale <- "1ha" # "25ha", "625ha", "Park"
+
+#Import max. hourly rate (reported daily) rainfall data ; rainfall is raw and filtered for values 
+raintable <- read.csv(paste0(wd, "/", rainfall_name,"/", rainfall_filename), header=T)
+raintable <- raintable %>% mutate(date = date_parse(raintable$system.time_start, format = "%b %d, %Y")) %>%                          select(-system.time_start) %>% relocate(date) %>% pad
+
+#import s1 data
+#tables <- dir(paste0(wd, "/", satellite, "/", scale, "/"), full.names = T, pattern = paste0("mata_escura_s1_", scale)) %>% map(read.csv, header=F)
+#tables <- read.csv(paste0(wd, "/", satellite, "/", scale, "/", "mata_escura_s1_", scale, ".csv"))
+
+band.list <- c("VH", "VV", "RVI")
+tables <- vector(mode = "list", length = 0)
+for (band in band.list) {
+  table <- read.csv(paste0(wd, "/s1/1ha/second_run/", studyarea_base, "_s1_1ha_", band, "_processed.csv"))
+  table <- table[,!names(table) %in% c("X")] %>% mutate(date = ymd(date))
+  tables[[band]] <- table
+}
+```
+
+Function to make a dataframe from each of the data elements in the imported list
+```{r}
+make_index_df <- function(df) {
+df1 <- df %>% lapply("[[",1)
+mat <- gsub("^\\[|\\]$", "", df1[2])
+mat <- gsub("^\\[|\\]$", "", mat)
+mat <- strsplit(mat, "\\], \\[")[[1]]
+mat <- data.frame(date=sub(",.*$", "", mat), VH=sub("^.*, ", "", mat), stringsAsFactors=FALSE) 
+mat$date <- ymd(mat$date)
+}
+# tables[2] %>% make_index_df()
+# names(tables) <- c("Hectare_ID", "VH", "VV", "VHVV_ratio")
+# s1_raw <- tables # %>% select(date)
+```
+
+Process summary backscatter data for all plots
+```{r}
+#get summary data for all plots
+tablemeans <- vector(mode = "list", length = 0)
+for (band in band.list) {
+  means <- tables[[band]] %>% gather("Hectare_ID", value, -date) %>% group_by(date) %>%     
+    filter(!grepl('sd', Hectare_ID)) %>%
+    dplyr::summarize(mean(value, na.rm=TRUE)) %>% mutate(date = ymd(date))
+  names(means) <- c("date", paste0(band,"_hectare_means"))
+  tablemeans[[band]] <- means
+}
+
+tablemeans <- reduce(tablemeans, full_join, by = "date")  %>% arrange(date)
+```
+
+```{r}
+#define outlier function
+remove_outliers <- function(x, na.rm = TRUE, ...) {
+  qnt <- quantile(x, probs=c(.25, .75), na.rm = na.rm, ...)
+  H <- 1.5 * IQR(x, na.rm = na.rm)
+  y <- x
+  y[x < (qnt[1] - H)] <- NA
+  y[x > (qnt[2] + H)] <- NA
+  y
+}
+```
+
+Scale for plotting
+```{r}
+#choose S1 band to plot against rainfall
+band <- "RVI" # "RVI" #  "VV"
+
+bandvals <- tablemeans[, grep(band, names(tablemeans))] %>% unlist()
+#bandvals <- bandvals %>% remove_outliers
+s1 <- cbind(data.frame(tablemeans$date, bandvals)) 
+names(s1) <- c("date",band)
+s1max  <- max(s1[[2]] , na.rm = T)   # Specify max of first y axis
+pmax <- max(raintable$precipitationCal, na.rm = T)  # Specify max of second y axis
+s1min  <- min(s1[[2]], na.rm = T)   # Specify min of first y axis
+pmin <- min(raintable$precipitationCal, na.rm = T) # Specify min of second y axis
+scale <- (pmax - pmin)/(s1max - s1min)
+
+pscaled <- raintable$precipitationCal/scale + s1min
+# scale and shift variables calculated based on desired mins and maxes
+rainfall <- cbind(raintable$date, pscaled) %>% as.data.frame()
+rainfall$date <- ymd(as.Date(rainfall$V1, origin = "1970-01-01"))
+rainfall <- rainfall %>% relocate(date) %>% select(-c(V1))
+
+#breaks <- round(seq(from = min(p_scaled, na.rm = T), to = max(p_scaled, na.rm = T), length.out=10), digits=2)
+#obreaks <- round(seq(from = min(p, na.rm = T), to = max(p, na.rm = T), length.out=10), digits=1) %>% rev()
+
+```
+
+Filter rainfall to days for S1 data exists
+```{r}
+plotdata <- s1 %>% left_join(rainfall, by = "date")
+```
+
+
+Plotting: combined
+```{r}
+ggplot(data = plotdata) +
+  geom_line(aes(x=date, y = s1[[2]] %>% remove_outliers), linewidth=0.45, color = "grey40") +
+  geom_point(aes(x=date, y = s1[[2]] %>% remove_outliers), size=0.6) +
+  geom_point(aes(x=date, y = pscaled), color="blue", alpha = 0.6, size=0.9) +
+  #geom_ribbon(aes(x=date, y = p_rescaled, ymin = 0.6, ymax = 1), fill = 'blue', alpha=0.3) +
+  #geom_ribbon(aes(ymin= ylims[1], ymax = ylims[2]), fill= "blue", alpha = 0.5, position = "identity") +
+  #scale_fill_manual(breaks = c("p_rescaled", "other"), values = c("blue", "white")) +
+  #xlab("Month, Year")  +
+  theme_bw(base_size = 16) +
+  scale_x_date(date_labels = "%b %Y"
+               , limits = c(as.Date("2016-01-01"),as.Date("2022-01-01"))
+               , date_breaks = "6 months"
+               , minor_breaks = "2 months"
+              , expand = expansion(add = .05)) +
+  theme(axis.text.x=element_text(angle=90)
+        , plot.title = element_text(size = 14)
+        , axis.title.x = element_blank()
+        , axis.title.y.right = element_text(color = "blue")
+        , axis.text.y.right = element_text(color = "blue")
+        ,
+  #      , panel.grid.minor.y = element_line(color = "gray90", size = 0.5)
+  #      , panel.grid.major.y = element_line(color = "gray90", size = 0.5)
+  )+
+  scale_y_continuous(name = paste0(band, " index values (dB)")
+             #        , breaks = breaks
+                     , sec.axis = sec_axis(~(.-s1min)*scale
+                                           , name="Daily Max. Precip. (mm/hr)")) +
+  ggtitle(paste0("Sentinel-1 ", band, " and \n Maximum Daily Precipitation over \n", studyarea))
+```
+
+```{r}
+ggsave(paste0("IMERG_daily_max_precip_vs_S1_", band, "_", studyarea_base, ".png"), units="in", width=10, height=5, dpi=300, device = 'png')
+#dev.off()
+```
+
+
+Plotting: separate panels
+```{r}
+colors <- c("all plots mean RVI"="black", "all plots mean VV" = "maroon")
+
+plot1 <- tablemeans %>%
+  ggplot() +
+  geom_line(aes(x = date, y = VH_hectare_means), size=0.25, color = "black") +
+  ylab("RVI index values (dB)") +
+  theme_minimal(base_size = 16) +
+  scale_x_date(date_labels = "%b, %Y"
+               , date_breaks = "3 months"
+               , minor_breaks = "1 month"
+               , expand = expansion(add = .05)) +
+  theme(axis.title.x = element_blank(), axis.text.x=element_text(angle=90)
+        , panel.grid.minor.y = element_line(color = "gray90", size = 0.5)
+        , panel.grid.major.y = element_line(color = "gray90", size = 0.5))
+
+plot2 <- tablemeans %>%
+  ggplot() +
+  geom_line(aes(x = date, y = VV_hectare_means), size=0.25, color = "maroon") +
+  ylab("VV index values (dB)") +
+  theme_minimal(base_size = 16) +
+  scale_x_date(date_labels = "%b, %Y"
+               , date_breaks = "3 months"
+               , minor_breaks = "1 month"
+               , expand = expansion(add = .05)) +
+  theme(axis.title.x = element_blank(), axis.text.x=element_text(angle=90)
+        , panel.grid.minor.y = element_line(color = "gray90", size = 0.5)
+        , panel.grid.major.y = element_line(color = "gray90", size = 0.5))
+
+plot3 <- rainfall_nonzero %>%
+  ggplot() +
+  geom_col(aes(x = date, y = precipitationCal), color = 'blue', alpha = 0.5) +
+  ylab("Max. Daily Precip. (mm/Hr)") +
+  theme_minimal(base_size = 16) +
+  scale_x_date(date_labels = "%b, %Y"
+               , date_breaks = "3 months"
+               , minor_breaks = "1 month"
+               , expand = expansion(add = .05)) +
+ # scale_y_continuous(position = "right") +
+  theme(axis.title.x = element_blank(), axis.text.x=element_text(angle=90)
+        , panel.grid.minor.y = element_line(color = "gray90", size = 0.5)
+        , panel.grid.major.y = element_line(color = "gray90", size = 0.5))
+
+grid.draw(rbind(ggplotGrob(plot1), ggplotGrob(plot2), ggplotGrob(plot3)))
+```
+
+

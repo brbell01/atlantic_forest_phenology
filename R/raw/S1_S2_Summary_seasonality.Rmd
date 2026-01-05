@@ -1,0 +1,2275 @@
+---
+title: "Sentinel-1/Sentinel-2 Summary Seasonality"
+author: "J. Bruce Bell"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r knitr setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "/Users/brbell01/Documents/git/atlantic_forest_phenology/R/")
+```
+
+Library imports
+```{r imports, include=FALSE}
+# Create a vector of library names
+libs <- c("knitr", "tidyr", "lubridate", "clock", "stringr", "dplyr", "ggplot2", "scales", "purrr", "data.table", "tibble", "tidyquant", "circular", "readr", "DescTools", "padr", "xts", "zoo", "grid", "hydrostats")
+
+# Loop through the vector and install and load each library if needed
+for (lib in libs) {
+  if (!require(lib, character.only = TRUE)) {
+    install.packages(lib)
+    library(lib, character.only = TRUE)
+  }
+}
+```
+
+Define initial parameters and functions
+```{r params and functions, include=FALSE}
+#set working directory
+wd <- ("/Users/brbell01/Documents/git/atlantic_forest_phenology/R/")
+
+#Choose indices and sites
+S1_band <- "RVI" ; S2_band <- "EVI2"
+
+site_1 <- "mata_escura" ; site_2 <- "monte_pascoal" ; site_3 <- "rio_doce" ; site_4 <- "sooretama"
+site.list <- c(site_3, site_4)
+
+Park_1 <- "REBIO Mata Escura" ; Park_2 <- "PNH Monte Pascoal"  ; Park_3 <- "PE Rio Doce" ; Park_4 <- "REBIO Sooretama"
+park.list <- c(Park_3, Park_4)
+
+foresttypes <- c("seasonal semi-deciduous forest", "evergreen broadleaf forest")
+
+#________________________________________________
+
+#other params
+studyarea_bases <- c(site_1, site_2, site_3, site_4)
+all_parks <- c(Park_1,Park_2, Park_3, Park_4)
+S1.band.list <- c("RVI", "VH", "VV")
+S2.band.list <- c("EVI2", "EVI", "NDVI")
+
+#________________________________________________
+
+#FUNCTION DEFINITIONS
+
+#read season data function
+read_season_data <- function(path, band, pattern){
+  dir(path, full.names = TRUE, pattern = paste0(band,"_",pattern)) %>% 
+    map(read.csv, header = TRUE)
+}
+
+#calculate seasonality metrics function
+calculate_season_vars <- function(df){
+  df %>% 
+    mutate(
+      stdoy = yday(paste0("1901-", month(season_start_date), "-", day(season_start_date))), 
+      enddoy = yday(paste0("1901-", month(season_end_date), "-", day(season_end_date))),
+      straddoy = 2*pi*stdoy/365, 
+      endraddoy = 2*pi*enddoy/365, 
+      phase_peak_rad = 2*pi*phase_peak/365, 
+      phase_season_rad = 2*pi*phase_seas/365, 
+      phase_ensemble_rad = 2*pi*phase_ensemble/365)
+}
+
+#convert date columns to radians
+to_radians <- function(date_col) {
+  2 * pi * yday(date_col) / 365
+}
+
+#convert specific columns in a dataframe to radians
+convert_to_radians <- function(site_df) {
+  for (i in 1:length(orig_cols)) {
+    if (orig_cols[i] %in% colnames(site_df)) {
+      site_df[[paste0(new_cols[i] , "raddoy")]] <- to_radians(site_df[[orig_cols[i]]])
+    }
+  }
+  site_df
+}
+
+#convert radians to day of year (doy)
+doy_convert <- function(rad) {doy <- rad*365/(2*pi)
+      doy
+}
+
+#fix negative circular values
+circular_negative_fixed <- function(circ_val){
+  if (circ_val < 0) {
+    return(circ_val + 2*pi)
+  } else {
+    return(circ_val)
+  }
+}
+
+#calculate a corrected circular mean from a list of angles in radians
+circ_mean <- function(data) {
+  circular_data <- data %>% circular()
+  mean_value <- mean(circular_data, na.rm = TRUE)
+  fixed_value <- circular_negative_fixed(mean_value)
+  fixed_value
+}
+
+#calculate a circular rho value from a list of angles in radians
+circ_rho <- function(data) {
+  circular_data <- data %>% circular()
+  rho_value <- rho.circular(circular_data, na.rm = TRUE)
+  rho_value
+}
+
+#subtract circular values and fix negative results
+circular_diff_fixed <- function(circ_1,circ_2){
+  if (circ_2 < circ_1) {
+    return(circ_1 - circ_2)
+  } else {
+    return(circ_2 - circ_1)
+  }
+}
+
+#subtract day of year (doy) values and fix negative doy values
+doy_diff_fixed <- function(doy_1,doy_2){
+  if (doy_2 < doy_1) {
+    return(doy_1 - doy_2)
+  } else {
+    return(doy_2 - doy_1)
+  }
+}
+
+#create a sequence of dates representing season length.  if S1start < S1end, use 2000 origin, else 2001 origin
+date_seq <- function(start, end) {
+  if (start < end) {
+    seq(as.Date(doy_convert(start), origin="2000-01-01"),
+        as.Date(doy_convert(end), origin="2000-01-01"), by=1)
+  } else {
+    seq(as.Date(doy_convert(start), origin="2000-01-01"), 
+        as.Date(doy_convert(end), origin="2001-01-01"), by=1)
+  }
+}
+
+#outlier removal function
+remove_outliers <- function(x, na.rm = TRUE, ...) {
+  qnt <- quantile(x, probs=c(.1, .9), na.rm = na.rm, ...)
+  H <- 1.5 * IQR(x, na.rm = na.rm)
+  y <- x
+  y[x < (qnt[1] - H)] <- NA
+  y[x > (qnt[2] + H)] <- NA
+  y
+}
+```
+
+Import raw S1/S2 data
+```{r import raw data}
+#loop through both each of the sites and grab the veg. index data
+indexdata <- c() ; indexmeans <- c() ; annualmeans <- c()
+for (site in site.list) {
+  #sentinel-1
+  S1_indexdata <- vector(mode = "list", length = 0)
+  S1_table <- read.csv(paste0(wd, "/raw/s1/1ha/second_run/", site, "_s1_1ha_", S1_band, "_processed.csv"))
+  S1_table <- S1_table[,!names(S1_table) %in% c("X")] %>% mutate(date = as.Date(date))
+  S1_site_band <- paste0(site, "_", S1_band)
+  S1_indexdata[[S1_site_band]] <- S1_table
+  
+  S1_indexmeans <- vector(mode = "list", length = 0)
+  means <- S1_indexdata[[S1_site_band]] %>% gather("Hectare_ID", value, -date) %>% group_by(date) %>% 
+                         filter(!grepl('sd', Hectare_ID)) %>%
+                         summarize(mean(value, na.rm=TRUE)) %>% mutate(date = ymd(date))
+  S1_indexmeans[[S1_site_band]] <- means
+ 
+  S1_annualmeans <- vector(mode = "list", length = 0)
+  names(S1_indexmeans[[S1_site_band]])[2] <- "value"
+  annualmeans <- S1_indexmeans[[S1_site_band]] %>%
+                  mutate(doy = ymd(paste0("1901-", month(date), "-", day(date))))  %>%
+                  distinct() %>%
+                  group_by(doy) %>%
+                  summarize(mean = mean(value, na.rm = TRUE)) 
+  S1_annualmeans[[S1_site_band]] <- annualmeans
+  
+  names(S1_annualmeans[[S1_site_band]])[2] <- paste0(S1_band,"_annual_means")
+  names(S1_indexmeans[[S1_site_band]])[2] <- paste0(S2_band,"_hectare_means")
+                         
+   #sentinel-2
+  S2_indexdata <- vector(mode = "list", length = 0)
+  S2_table <- read.csv(paste0(wd, "/raw/s2/1ha/second_run/", site, "_s2_1ha_", S2_band, "_processed.csv"))
+  S2_table <- S2_table[,!names(S2_table) %in% c("X")] %>% mutate(date = as.Date(date))
+  S2_site_band <- paste0(site, "_", S2_band)
+  S2_indexdata[[S2_site_band]] <- S2_table
+  
+  S2_indexmeans <- vector(mode = "list", length = 0)
+  means <- S2_indexdata[[S2_site_band]] %>% gather("Hectare_ID", value, -date) %>% group_by(date) %>% 
+                         filter(!grepl('sd', Hectare_ID)) %>%
+                         summarize(mean(value, na.rm=TRUE)) %>% mutate(date = ymd(date))
+  S2_indexmeans[[S2_site_band]] <- means
+ 
+  S2_annualmeans <- vector(mode = "list", length = 0)
+  names(S2_indexmeans[[S2_site_band]])[2] <- "value"
+  annualmeans <- S2_indexmeans[[S2_site_band]] %>%
+                  mutate(doy = ymd(paste0("1901-", month(date), "-", day(date))))  %>%
+                  distinct() %>%
+                  group_by(doy) %>%
+                  summarize(mean = mean(value, na.rm = TRUE)) 
+  S2_annualmeans[[S2_site_band]] <- annualmeans
+  
+  names(S2_indexmeans[[S2_site_band]])[2] <- paste0(S1_band,"_hectare_means")
+  names(S2_annualmeans[[S2_site_band]])[2] <- paste0(S2_band,"_annual_means")
+  
+  #combine
+  indexdata <- c(indexdata, S1_indexdata, S2_indexdata)
+  indexmeans <- c(indexmeans, S1_indexmeans, S2_indexmeans)
+  annualmeans <- c(annualmeans, S1_annualmeans, S2_annualmeans)
+}
+
+```
+
+A. Calculate seasonality metrics for Single Harmonic Fit (Amplitude & Peak Phase definition)
+```{r calculate seasonality metrics single}
+# read in seasonality tables 
+hnum <- "single"
+colnames <- c("S1_Ampl", "S1_season_start", "S1_season_start_rad", "S1_Phase_Peak", "S1_Phase_Peak_rad", "S2_Ampl",  "S2_season_start", "S2_season_start_rad", "S2_Phase_Peak", "S2_Phase_Peak_rad", "S1_S2_season_start", "S1_S2_season_start_rad", "S1_S2_Phase_Peak", "S1_S2_Phase_Peak_rad")
+colnames_spread <- c("S1_Ampl_IQR", "S1_season_start_IQR", "S1_season_start_rad_rho", "S1_Phase_Peak_IQR", "S1_Phase_Peak_rad_rho", "S2_Ampl_IQR", "S2_season_start_IQR", "S2_season_start_rad_rho", "S2_Phase_Peak_IQR", "S2_Phase_Peak_rad_rho", "S1_S2_season_start_IQR", "S1_S2_season_start_rad_rho", "S1_S2_Phase_Peak_IQR", "S1_S2_Phase_Peak_rad_rho")
+colnames <- c(colnames, colnames_spread)
+
+#Create a list of empty dataframes to hold phenometrics
+metrics <-data.frame(matrix(NA, nrow=0, ncol=length(colnames)))
+list <- list() ; for (site in site.list) {list[[site]] <- metrics}
+list -> metrics
+                
+#calculate seasonality metrics function
+calculate_season_vars <- function(df){
+  df %>% 
+    mutate(
+      stdoy = yday(paste0("1901-", month(season_start_date), "-", day(season_start_date))), 
+      enddoy = yday(paste0("1901-", month(season_end_date), "-", day(season_end_date))),
+      straddoy = 2*pi*stdoy/365, 
+      endraddoy = 2*pi*enddoy/365, 
+      phase_peak_rad = 2*pi*phase_peak/365
+    )
+}
+
+for (site in site.list) {
+  # Read in seasonality file - single harmonic
+  study_siteID <- match(site,studyarea_bases)  # study site defined above
+  S1_path <- "raw/s1/1ha/harmonic" ; S2_path <- "raw/s2/1ha/harmonic"
+    
+  S1_season <- read_season_data(paste0(wd, S1_path),S1_band, "seasonality_processed.csv")[[study_siteID]]
+  S2_season <- read_season_data(paste0(wd, S2_path),S2_band, "seasonality_processed.csv")[[study_siteID]]
+  
+  #Define season start and end for season length definition
+
+  # Call the function on S1_season dataframe
+  S1_season <- calculate_season_vars(S1_season)
+  S2_season <- calculate_season_vars(S2_season)
+
+  #Seasonality metrics 
+  
+  #S1 seasonality metrics (standard statistics)
+  S1_season_start <- S1_season$stdoy %>% median(na.rm=T) ; S1_season_start_IQR <- S1_season$stdoy %>% IQR(na.rm=T)
+  S1_season_end <- S1_season$enddoy %>% median(na.rm=T)
+  S1_season_def <- c(0, S1_season_start, S1_season_end, 365)    # define season intervals
+  # swap season start/end when season end wraps to following year
+  if (S1_season_start > S1_season_end) {S1_season_def[c(2,3)] <- S1_season_def[c(3,2)]}
+  S1_Ampl <- S1_season$Ampl. %>% median(na.rm=T) ; S1_Ampl_IQR <- S1_season$Ampl. %>% IQR(na.rm=T)
+  S1_Phase_Peak <- S1_season$phase_peak %>% median(na.rm=T) ; S1_Phase_Peak_IQR <- S1_season$phase_peak %>% IQR(na.rm=T)
+  
+  #S1 seasonality metrics (circular statistics)
+  S1_season_start_rad <- S1_season$straddoy %>% circ_mean() ; S1_season_start_rad_rho <- S1_season$straddoy %>% circ_rho()
+  S1_season_end_rad <- S1_season$endraddoy %>% circ_mean() ; S1_season_end_rad_rho <- S1_season$endraddoy %>% circ_rho()
+  S1_season_rad_def <- c(0, S1_season_start_rad[1], S1_season_end_rad[1], 2*pi)
+  S1_Phase_Peak_rad <- S1_season$phase_peak_rad %>% circ_mean() ; S1_Phase_Peak_rad_rho <- S1_season$phase_peak %>% circ_rho()
+  
+  #S2 seasonality metrics (standard statistics)
+  S2_season_start <- S2_season$stdoy %>% median(na.rm=T) ; S2_season_start_IQR <- S2_season$stdoy %>% IQR(na.rm=T)
+  S2_season_end <- S2_season$enddoy %>% median(na.rm=T)
+  S2_season_def <- c(0, S2_season_start, S2_season_end, 365)    # define season intervals
+  # swap season start/end when season end wraps to following year
+  if (S2_season_start > S2_season_end) {S2_season_def[c(2,3)] <- S2_season_def[c(3,2)]}
+  S2_Ampl <- S2_season$Ampl. %>% median(na.rm=T) ; S2_Ampl_IQR <- S2_season$Ampl. %>% IQR(na.rm=T)
+  S2_Phase_Peak <- S2_season$phase_peak %>% median(na.rm=T) ; S2_Phase_Peak_IQR <- S2_season$phase_peak %>% IQR(na.rm=T)
+  
+  #S2 seasonality metrics (circular statistics)
+  S2_season_start_rad <- S2_season$straddoy %>% circ_mean() ; S2_season_start_rad_rho <- S2_season$straddoy %>% circ_rho()
+  S2_season_end_rad <- S2_season$endraddoy %>% circ_mean() ; S2_season_end_rad_rho <- S2_season$endraddoy %>% circ_rho()
+  S2_season_rad_def <- c(0, S2_season_start_rad[1], S2_season_end_rad[1], 2*pi)
+  S2_Phase_Peak_rad <- S2_season$phase_peak_rad %>% circ_mean() ; S2_Phase_Peak_rad_rho <- S2_season$phase_peak %>% circ_rho()
+  
+  #Calculate Phase Differences (S1/S2)
+  S1_S2_season_start <- ifelse(S1_season_start > S2_season_start, S2_season_start - S1_season_start + 365, S2_season_start - S1_season_start)
+  S1_S2_season_start_rad <- ifelse(S1_season_start_rad > S2_season_start_rad, S2_season_start_rad - S1_season_start_rad + 2*pi, S2_season_start_rad - S1_season_start_rad)
+  S1_S2_season_start_IQR <- S2_season$stdoy - S1_season$stdoy[4:dim(S1_season)[1]]
+  S1_S2_season_start_IQR <- S1_S2_season_start_IQR %>% IQR(na.rm=T)
+  S1_S2_season_start_rad_rho <- circular(S2_season$straddoy) - circular(S1_season$straddoy[4:dim(S1_season)[1]]) %>% rho.circular(na.rm=T)
+  S1_S2_season_start_rad_rho <- S1_S2_season_start_rad_rho %>% rho.circular(na.rm=T)
+  S1_S2_Phase_Peak <- ifelse(S1_Phase_Peak > S2_Phase_Peak, S2_Phase_Peak - S1_Phase_Peak + 365, S2_Phase_Peak - S1_Phase_Peak)
+  S1_S2_Phase_Peak_rad <- ifelse(S1_Phase_Peak_rad > S2_Phase_Peak_rad, S2_Phase_Peak_rad - S1_Phase_Peak_rad + 2*pi, S2_Phase_Peak_rad - S1_Phase_Peak_rad)
+  S1_S2_Phase_Peak_IQR <- S2_season$phase_peak - S1_season$phase_peak[4:dim(S1_season)[1]]
+  S1_S2_Phase_Peak_IQR <- S1_S2_Phase_Peak_IQR %>% IQR(na.rm=T)
+  S1_S2_Phase_Peak_rad_rho <- circular(S2_season$phase_peak_rad) - circular(S1_season$phase_peak_rad[4:dim(S1_season)[1]]) %>% rho.circular(na.rm=T)
+  S1_S2_Phase_Peak_rad_rho <- S1_S2_Phase_Peak_rad_rho %>% rho.circular(na.rm=T)
+  
+  #combine S1/S2 stats
+  sitemetrics <- data.frame(t(c(S1_Ampl, S1_season_start, S1_season_start_rad, S1_Phase_Peak, S1_Phase_Peak_rad, S2_Ampl, S2_season_start, S2_season_start_rad, S2_Phase_Peak, S2_Phase_Peak_rad, S1_S2_season_start, S1_S2_season_start_rad, S1_S2_Phase_Peak, S1_S2_Phase_Peak_rad)))
+  sitemetrics_spread <- data.frame(t(c(S1_Ampl_IQR, S1_season_start_IQR, S1_season_start_rad_rho, S1_Phase_Peak_IQR, S1_Phase_Peak_rad_rho, S2_Ampl_IQR, S2_season_start_IQR, S2_season_start_rad_rho,  S2_Phase_Peak_IQR, S2_Phase_Peak_rad_rho, S1_S2_season_start_IQR, S1_S2_season_start_rad_rho, S1_S2_Phase_Peak_IQR, S1_S2_Phase_Peak_rad_rho)))
+  metrics[[site]] <- c(sitemetrics,sitemetrics_spread)
+}
+
+metrics <- bind_rows(metrics)  #collapse the list of sites
+colnames(metrics) <- colnames 
+metrics <- cbind(data.frame(site.list), metrics) #add site labels to rows
+names(metrics)[1] <- "study_site"
+
+#get seasonality metrics means and annual variation (IQR and rho measures of spread)
+metrics_means_single <- metrics %>% select(study_site, S1_Ampl, S2_Ampl, S1_season_start, S2_season_start, S1_season_start_rad, S2_season_start_rad, S1_Phase_Peak, S2_Phase_Peak, S1_Phase_Peak_rad, S2_Phase_Peak_rad, S1_S2_season_start, S1_S2_season_start_rad, S1_S2_Phase_Peak, S1_S2_Phase_Peak_rad)
+metrics_spread_single <- metrics %>% select(study_site, S1_Ampl_IQR, S2_Ampl_IQR, S1_season_start_IQR, S2_season_start_IQR, S1_season_start_rad_rho, S2_season_start_rad_rho, S1_Phase_Peak_IQR, S2_Phase_Peak_IQR, S1_Phase_Peak_rad_rho, S2_Phase_Peak_rad_rho, S1_S2_season_start_IQR, S1_S2_season_start_rad_rho, S1_S2_Phase_Peak_IQR, S1_S2_Phase_Peak_rad_rho)
+```
+
+B. Calculate seasonality metrics for Multiple Harmonic Fit (Amplitude & Peak, Season Length, and Ensemble phase definitions)
+```{r calculate seasonality metrics multiple}
+hnum <- "multiple"
+# Read season data from Timesat output seasonality file
+colnames <- c("S1_Ampl", "S1_season_start", "S2_season_start_rad", "S1_Phase_Peak", "S1_Phase_Peak_rad", "S1_Phase_Season", "S1_Phase_Season_rad","S1_Phase_Ensemble", "S1_Phase_Ensemble_rad", "S2_Ampl", "S2_season_start", "S1_season_start_rad","S2_Phase_Peak", "S2_Phase_Peak_rad", "S2_Phase_Season", "S2_Phase_Season_rad","S2_Phase_Ensemble", "S2_Phase_Ensemble_rad", "S1_S2_season_start", "S1_S2_season_start_rad", "S1_S2_Phase_Peak", "S1_S2_Phase_Peak_rad", "S1_S2_Phase_Season", "S1_S2_Phase_Season_rad", "S1_S2_Phase_Ensemble", "S1_S2_Phase_Ensemble_rad")
+
+colnames_spread <- c("S1_Ampl_IQR", "S1_season_start_IQR", "S1_season_start_rad_rho", "S1_Phase_Peak_IQR", "S1_Phase_Peak_rad_rho", "S1_Phase_Season_IQR", "S1_Phase_Season_rad_rho", "S1_Phase_Ensemble_IQR", "S1_Phase_Ensemble_rad_rho", "S2_Ampl_IQR", "S2_season_start_IQR", "S2_season_start_rad_rho", "S2_Phase_Peak_IQR", "S2_Phase_Peak_rad_rho", "S2_Phase_Season_IQR", "S2_Phase_Season_rad_rho", "S2_Phase_Ensemble_IQR", "S2_Phase_Ensemble_rad_rho", "S1_S2_season_start_IQR", "S1_S2_season_start_rad_rho", "S1_S2_Phase_Peak_IQR", "S1_S2_Phase_Peak_rad_rho", "S1_S2_Phase_Season_IQR", "S1_S2_Phase_Season_rad_rho", "S1_S2_Phase_Ensemble_IQR", "S1_S2_Phase_Ensemble_rad_rho")
+colnames <- c(colnames, colnames_spread)
+#Create a list of empty dataframes to hold phenometrics
+metrics <-data.frame(matrix(NA, nrow=0, ncol=length(colnames)))
+list <- list() ; for (site in site.list) {list[[site]] <- metrics}
+list -> metrics
+
+wd <- ("/Users/brbell01/Google Drive/PHD/CUNY/Research/R/Phenology/")
+
+for (site in site.list) {
+  # Read in seasonality file - multiple harmonic
+  study_siteID <- match(site,studyarea_bases)  # study site defined above
+  S1_path <- "timesat/output/third_run/S1/" ; S2_path <- "timesat/output/third_run/S2/"
+
+  read_season_data <- function(path, band, pattern){
+  dir(path, full.names = TRUE, pattern = paste0(band,"_",pattern)) %>% 
+    map(read.csv, header = TRUE)
+  }
+  
+  S1_season <- read_season_data(paste0(wd, S1_path),S1_band, "seasonality_processed.csv")[[study_siteID]]
+  S2_season <- read_season_data(paste0(wd, S2_path),S2_band, "seasonality_processed.csv")[[study_siteID]]
+
+  #Define season start and end for season length definition
+
+  S1_season <- calculate_season_vars(S1_season)
+  S2_season <- calculate_season_vars(S2_season)
+
+  #S1 seasonality metrics (standard statistics)
+  S1_season_start <- S1_season$stdoy %>% median(na.rm=T) ; S1_season_start_IQR <- S1_season$stdoy %>% IQR(na.rm=T)
+  S1_season_end <- S1_season$enddoy %>% median(na.rm=T) ; S1_season_end_IQR <- S1_season$enddoy %>% IQR(na.rm=T)
+  S1_season_def <- c(0, S1_season_start, S1_season_end, 365)    # define season intervals
+  # swap season start/end when season end wraps to following year
+  if (S1_season_start > S1_season_end) {S1_season_def[c(2,3)] <- S1_season_def[c(3,2)]}
+  S1_Ampl <- S1_season$Ampl. %>% median(na.rm=T) ; S1_Ampl_IQR <- S1_season$Ampl. %>% IQR(na.rm=T)
+  S1_Phase_Peak <- S1_season$phase_peak %>% median(na.rm=T) ; S1_Phase_Peak_IQR <- S1_season$phase_peak %>% IQR(na.rm=T)
+  S1_Phase_Season <- S1_season$phase_seas %>% median(na.rm=T) ; S1_Phase_Season_IQR <- S1_season$phase_seas%>% IQR(na.rm=T)
+  S1_Phase_Ensemble <- S1_season$phase_ensemble %>% median(na.rm=T) ; S1_Phase_Ensemble_IQR <- S1_season$phase_ensemble %>% IQR(na.rm=T)
+  
+  #S1 seasonality metrics (circular statistics)
+  S1_season_start_rad <- S1_season$straddoy %>% circ_mean() ; S1_season_start_rad_rho <- S1_season$straddoy %>% circ_rho()
+  S1_season_end_rad <- S1_season$endraddoy %>% circ_mean() ; S1_season_end_rad_rho <- S1_season$endraddoy %>% circ_rho()
+  S1_season_rad_def <- c(0, S1_season_start_rad[1], S1_season_end_rad[1], 2*pi)
+  S1_Phase_Peak_rad <- S1_season$phase_peak_rad %>% circ_mean() ; S1_Phase_Peak_rad_rho <- S1_season$phase_peak_rad %>% circ_rho()
+  S1_Phase_Season_rad <- S1_season$phase_season_rad %>% circ_mean() ; S1_Phase_Season_rad_rho <- S1_season$phase_season_rad %>% circ_rho()
+  S1_Phase_Ensemble_rad <- S1_season$phase_ensemble_rad %>% circ_mean() ; S1_Phase_Ensemble_rad_rho <- S1_season$phase_ensemble_rad %>% circ_rho()
+  
+  #S2 seasonality metrics (standard statistics)
+  S2_season_start <- S2_season$stdoy %>% median(na.rm=T) ; S2_season_start_IQR <- S2_season$stdoy %>% IQR(na.rm=T)
+  S2_season_end <- S2_season$enddoy %>% median(na.rm=T) ; S2_season_end_IQR <- S2_season$enddoy %>% IQR(na.rm=T)
+  S2_season_def <- c(0, S2_season_start, S2_season_end, 365)    # define season intervals
+  # swap season start/end when season end wraps to following year
+  if (S2_season_start > S2_season_end) {S2_season_def[c(2,3)] <- S2_season_def[c(3,2)]}
+  S2_Ampl <- S2_season$Ampl. %>% median(na.rm=T) ; S2_Ampl_IQR <- S2_season$Ampl. %>% IQR(na.rm=T)
+  S2_Phase_Peak <- S2_season$phase_peak %>% median(na.rm=T) ; S2_Phase_Peak_IQR <- S2_season$phase_peak %>% IQR(na.rm=T)
+  S2_Phase_Season <- S2_season$phase_seas %>% median(na.rm=T) ; S2_Phase_Season_IQR <- S2_season$phase_seas %>% IQR(na.rm=T)
+  S2_Phase_Ensemble <- S2_season$phase_ensemble %>% median(na.rm=T) ; S2_Phase_Ensemble_IQR <- S2_season$phase_ensemble %>% IQR(na.rm=T)
+  
+  #S2 seasonality metrics (circular statistics)
+  S2_season_start_rad <- S2_season$straddoy %>% circ_mean() ; S2_season_start_rad_rho <- S2_season$straddoy %>% circ_rho()
+  S2_season_end_rad <- S2_season$endraddoy %>% circ_mean() ; S2_season_end_rad_rho <- S2_season$endraddoy %>% circ_rho()
+  S2_season_rad_def <- c(0, S2_season_start_rad[1], S2_season_end_rad[1], 2*pi)
+  S2_Phase_Peak_rad <- S2_season$phase_peak_rad %>% circ_mean() ; S2_Phase_Peak_rad_rho <- S2_season$phase_peak_rad %>% circ_rho()
+  S2_Phase_Season_rad <- S2_season$phase_season_rad %>% circ_mean() ; S2_Phase_Season_rad_rho <- S2_season$phase_season_rad %>% circ_rho()
+  S2_Phase_Ensemble_rad <- S2_season$phase_ensemble_rad %>% circ_mean() ; S2_Phase_Ensemble_rad_rho <- S2_season$phase_ensemble_rad %>% circ_rho()
+  
+  #Calculate Phase Differences (S1/S2)
+  S1_S2_season_start <- doy_diff_fixed(S1_season_start, S2_season_start)
+  S1_S2_season_start_rad <- circular_diff_fixed(S1_season_start_rad,S2_season_start_rad)
+  S1_S2_season_start_IQR <- S2_season$stdoy - S1_season$stdoy[4:dim(S1_season)[1]] #need consistent year comparisons
+  S1_S2_season_start_IQR <- S1_S2_season_start_IQR %>% IQR(na.rm=T)
+  S1_S2_season_start_rad_rho <- circular(S2_season$straddoy) - circular(S1_season$straddoy[4:dim(S1_season)[1]])
+  S1_S2_season_start_rad_rho <- S1_S2_season_start_rad_rho %>% rho.circular(na.rm=T)
+
+  S1_S2_Phase_Peak <- doy_diff_fixed(S1_Phase_Peak, S2_Phase_Peak)
+  S1_S2_Phase_Peak_rad <- circular_diff_fixed(S1_Phase_Peak_rad,S2_Phase_Peak_rad)
+  S1_S2_Phase_Peak_IQR <- S2_season$phase_peak - S1_season$phase_peak[4:dim(S1_season)[1]] #need consistent year comparisons
+  S1_S2_Phase_Peak_IQR <- S1_S2_Phase_Peak_IQR %>% IQR(na.rm=T)
+  S1_S2_Phase_Peak_rad_rho <- circular(S2_season$phase_peak_rad) - circular(S1_season$phase_peak_rad[4:dim(S1_season)[1]])
+  S1_S2_Phase_Peak_rad_rho <- S1_S2_Phase_Peak_rad_rho %>% rho.circular(na.rm=T)
+
+  S1_S2_Phase_Season <- doy_diff_fixed(S1_Phase_Season, S2_Phase_Season)
+  S1_S2_Phase_Season_rad <- circular_diff_fixed(S1_Phase_Season_rad,S2_Phase_Season_rad)
+  S1_S2_Phase_Season_IQR <- S2_season$phase_season - S1_season$phase_season[4:dim(S1_season)[1]] #need consistent year comparisons
+  S1_S2_Phase_Season_IQR <- S1_S2_Phase_Season_IQR %>% IQR(na.rm=T)
+  S1_S2_Phase_Season_rad_rho <- circular(S2_season$phase_season_rad) - circular(S1_season$phase_season_rad[4:dim(S1_season)[1]])
+  S1_S2_Phase_Season_rad_rho <- S1_S2_Phase_Season_rad_rho %>% rho.circular(na.rm=T)
+  
+  S1_S2_Phase_Ensemble <- doy_diff_fixed(S1_Phase_Ensemble, S2_Phase_Ensemble)
+  S1_S2_Phase_Ensemble_rad <- circular_diff_fixed(S1_Phase_Ensemble_rad,S2_Phase_Ensemble_rad)
+  S1_S2_Phase_Ensemble_IQR <- S2_season$phase_ensemble - S1_season$phase_ensemble[4:dim(S1_season)[1]] #need consistent year comparisons
+  S1_S2_Phase_Ensemble_IQR <- S1_S2_Phase_Ensemble_IQR %>% IQR(na.rm=T)
+  S1_S2_Phase_Ensemble_rad_rho <- circular(S2_season$phase_ensemble_rad) - circular(S1_season$phase_ensemble_rad[4:dim(S1_season)[1]])
+  S1_S2_Phase_Ensemble_rad_rho <- S1_S2_Phase_Ensemble_rad_rho %>% rho.circular(na.rm=T)
+  
+  #combine S1/S2 stats
+  sitemetrics <- data.frame(t(as.double(c(S1_Ampl, S1_season_start, S1_season_start_rad, S1_Phase_Peak, S1_Phase_Peak_rad, S1_Phase_Season, S1_Phase_Season_rad, S1_Phase_Ensemble, S1_Phase_Ensemble_rad, S2_Ampl, S2_season_start, S2_season_start_rad, S2_Phase_Peak, S2_Phase_Peak_rad, S2_Phase_Season, S2_Phase_Season_rad, S2_Phase_Ensemble, S2_Phase_Ensemble_rad, S1_S2_season_start, S1_S2_season_start_rad, S1_S2_Phase_Peak, S1_S2_Phase_Peak_rad, S1_S2_Phase_Season, S1_S2_Phase_Season_rad, S1_S2_Phase_Ensemble, S1_S2_Phase_Ensemble_rad))))
+  
+  sitemetrics_spread <- data.frame(t(as.double(c(S1_Ampl_IQR, S1_season_start_IQR, S1_season_start_rad_rho, S1_Phase_Peak_IQR, S1_Phase_Peak_rad_rho, S1_Phase_Season_IQR, S1_Phase_Season_rad_rho, S1_Phase_Ensemble_IQR, S1_Phase_Ensemble_rad_rho, S2_Ampl_IQR, S2_season_start_IQR, S2_season_start_rad_rho, S2_Phase_Peak_IQR, S2_Phase_Peak_rad_rho, S2_Phase_Season_IQR, S2_Phase_Season_rad_rho, S2_Phase_Ensemble_IQR, S2_Phase_Ensemble_rad_rho, S1_S2_season_start_IQR, S1_S2_season_start_rad_rho, S1_S2_Phase_Peak_IQR, S1_S2_Phase_Peak_rad_rho, S1_S2_Phase_Season_IQR, S1_S2_Phase_Season_rad_rho, S1_S2_Phase_Ensemble_IQR, S1_S2_Phase_Ensemble_rad_rho))))
+  metrics[[site]] <- c(sitemetrics,sitemetrics_spread)
+}
+
+metrics <- bind_rows(metrics)  #colapse the list of sites
+colnames(metrics) <- colnames 
+metrics <- cbind(data.frame(site.list), metrics) #add site labels to rows
+names(metrics)[1] <- "study_site"
+
+#get seasonality metrics means and annual variation (IQR and rho measures of spread)
+metrics_means_multiple <- metrics %>% select(
+      study_site, S1_Ampl, S2_Ampl, S1_season_start, S2_season_start,  S1_season_start_rad, S2_season_start_rad, S1_Phase_Peak, S2_Phase_Peak, S1_Phase_Peak_rad, S2_Phase_Peak_rad, S1_Phase_Season, S2_Phase_Season, S1_Phase_Season_rad, S2_Phase_Season_rad, S1_Phase_Ensemble, S2_Phase_Ensemble, S1_Phase_Ensemble_rad, S2_Phase_Ensemble_rad, S1_S2_season_start, S1_S2_season_start_rad, S1_S2_Phase_Peak, S1_S2_Phase_Peak_rad, S1_S2_Phase_Season, S1_S2_Phase_Season_rad, S1_S2_Phase_Ensemble, S1_S2_Phase_Ensemble_rad)
+
+metrics_spread_multiple <- metrics %>% select(
+      study_site, S1_Ampl_IQR, S2_Ampl_IQR, S1_season_start_IQR, S2_season_start_IQR, S1_season_start_rad_rho, S2_season_start_rad_rho, S1_Phase_Peak_IQR, S2_Phase_Peak_IQR, S1_Phase_Peak_rad_rho, S2_Phase_Peak_rad_rho, S1_Phase_Season_IQR, S2_Phase_Season_IQR, S1_Phase_Season_rad_rho, S2_Phase_Season_rad_rho, S1_Phase_Ensemble_IQR, S2_Phase_Ensemble_IQR, S1_Phase_Ensemble_rad_rho, S2_Phase_Ensemble_rad_rho, S1_S2_season_start_IQR, S1_S2_season_start_rad_rho, S1_S2_Phase_Peak_IQR, S1_S2_Phase_Peak_rad_rho, S1_S2_Phase_Season_IQR, S1_S2_Phase_Season_rad_rho, S1_S2_Phase_Ensemble_IQR, S1_S2_Phase_Ensemble_rad_rho)
+```
+
+A. Plot Summary Seasonality (Single Harmonic)
+```{r summary plot single}
+#combine means and measures of spread
+metric_type_names <- names(metrics_means_single)[-1] ; metric_spread_names <- names(metrics_spread_single)[-1] 
+metrics_means <- metrics_means_single %>% pivot_longer(cols = all_of(metric_type_names),  names_to = "metric_type", values_to = "value") %>% mutate(mID=rep(seq(1,length(metric_type_names)), length(site.list)))
+metrics_spread <- metrics_spread_single %>% pivot_longer(cols = all_of(metric_spread_names),  names_to = "metric_type", values_to = "value") %>% mutate(mID=rep(seq(1,length(metric_type_names)), length(site.list)))
+
+#labels and reordering for nice plotting
+labels <- rep(c("Amplitude", "Season Start", "Season Start - radians", "Phase Peak", "Phase Peak - radians"), each=2)
+labels <- c(labels, "S1-S2 Lag (Season Start)", "S1-S2 Lag (Season Start - radians)", "S1-S2 Lag (Peak)", "S1-S2 Lag (Peak - radians)")
+seq <- seq(1,(length(site.list))*length(metric_type_names), by=length(site.list))
+IDs <- c() ; for (i in 1:length(site.list)) {IDs <- c(IDs, i+seq-1)}
+
+metrics_means <- metrics_means %>% mutate(orderID = IDs) %>% arrange(orderID)
+metrics_spread <- metrics_spread %>% mutate(orderID = IDs) %>% arrange(orderID)
+metrics_means <- metrics_means %>% mutate(value_spread = metrics_spread$value)
+
+#label factors
+foresttype_abbr <- c("SS", "EB")
+metrics_means <- metrics_means %>% mutate(ftype = rep(foresttypes, length(metric_type_names)), ftype_abbr = rep(foresttype_abbr, length(metric_type_names)))
+metrics_means$metric_type_1 <- factor(metrics_means$metric_type, levels=metrics_means$metric_type, labels = rep(labels,each=length(site.list)))
+metrics_means$metric_type_2 <- metrics_means$metric_type_1 %>% gsub(" - radians","",.)
+metrics_means$metric_type_2 <- factor(metrics_means$metric_type_2, levels=metrics_means$metric_type_2, labels = metrics_means$metric_type_2)
+metrics_means <- metrics_means %>% mutate(rownumber = c(
+  rep(paste0(S1_band, " Index"), length(site.list)),
+  rep(paste0(S2_band, " Index"), length(site.list)),
+  rep(paste0(S1_band, " Phase"), length(site.list)),
+  rep(paste0(S2_band, " Phase"), length(site.list)),
+  rep(paste0(S1_band, " Phase (Radians)"), length(site.list)),
+  rep(paste0(S2_band, " Phase (Radians)"), length(site.list)),
+  rep(paste0(S1_band, " Phase"), length(site.list)),
+  rep(paste0(S2_band, " Phase"), length(site.list)),
+  rep(paste0(S1_band, " Phase (Radians)"), length(site.list)),
+  rep(paste0(S2_band, " Phase (Radians)"), length(site.list)),
+  rep(paste0(S1_band, "-", S2_band, "Lag (Days)"), length(site.list)),
+  rep(paste0(S1_band, "-", S2_band, "Lag (Radians)"), length(site.list)),
+  rep(paste0(S1_band, "-", S2_band, "Lag (Days)"), length(site.list)),
+  rep(paste0(S1_band, "-", S2_band, "Lag (Radians)"), length(site.list))
+))
+                                          
+metrics_means <- metrics_means %>% mutate(value_spread1 = ifelse(grepl("_rad", metric_type), 1 - value_spread, value_spread)) # convert rho to deviation
+metrics_means$ftype_abbr <- factor(metrics_means$ftype_abbr, levels = foresttype_abbr)
+metrics_means <- data.table(metrics_means)
+metrics_means[,y_min := value*0.75, by = metric_type_2]
+metrics_means[,y_max:=value*1.25, by = metric_type_2]
+
+plot_original <- ggplot(data = metrics_means) +
+  geom_col(aes(y=value, x=ftype_abbr, fill=ftype_abbr), position="dodge", size=2) +
+  geom_errorbar(aes(ymin=value-value_spread1, ymax=value+value_spread1, x=ftype_abbr), width=0.3) +
+  scale_color_manual("Forest Type", values= c(rep(c("dark green", "green")))) +
+  facet_grid(rows = vars(rownumber), cols = vars(metric_type_2), scales = "free_y", labeller = label_wrap_gen(width=10)) +
+  geom_blank(aes(y = y_min)) +
+  geom_blank(aes(y = y_max)) +
+  scale_x_discrete(labels = label_wrap(10)) + 
+  # scale_fill_manual("Forest Type", values = c("dark green", "green")) +
+  scale_fill_manual("Forest Type", values = c("dark green", "green"), labels = c("seasonal semi-deciduous forest (PE Rio Doce)", "broadleaf evergreen forest (REBIO Sooretama)")) +
+  theme_bw() +
+       xlab("Forest Type") +
+       ylab("Index ") +
+       ggtitle(paste0(str_to_title(hnum), " Harmonic Model")) +
+       theme(legend.position = "top", axis.text.x = element_text(size = 10, angle = 45, vjust = 0.5),
+             axis.line.x.bottom=element_line(size=0.8),
+             strip.text.x = element_text(size = 8, face = "italic"),
+             strip.text.y = element_text(size = 8, face = "italic", angle = 90),
+             strip.background = element_blank(), 
+             panel.grid.major.x = element_blank(),
+             panel.grid.minor.x = element_blank(), 
+             panel.border = element_blank(), panel.spacing.x = unit(0.3,"line"))
+
+  grid.newpage()
+  q <- ggplotGrob(plot_original)
+  lg <- linesGrob(x=unit(c(0,1),"npc"), y=unit(c(0,0),"npc"),gp=gpar(lwd=0.8))
+  for (k in grep("strip-t",q$layout$name)) {
+    q$grobs[[k]]$grobs[[1]]$children[[1]] <- lg
+  }
+  grid.draw(q)
+```
+
+
+```{r}
+metrics_means %>% kable()
+```
+
+A. Alternate Plot (Amplitude Only - Single Harmonic)
+```{r summary plot alternate single}
+metrics_means <- metrics_means[1:4]
+labels <- rep("Amplitude", 4)
+metrics_means$metric_type_3 <- labels
+metrics_means$metric_type_3 <- factor(labels, levels=metrics_means$metric_type_3, labels = labels)
+metrics_means$ftype_abbr <- factor(metrics_means$ftype_abbr, levels = c("SS", "EB"))
+
+# set y-axis limits
+metrics_means[metric_type == "S1_Ampl",y_max := 0.15]
+metrics_means[metric_type == "S2_Ampl",y_max := 0.3]
+
+plot_alt <- ggplot(data = metrics_means) +
+  geom_col(aes(y=value, x=ftype_abbr, fill=ftype_abbr), position="dodge", size=0.8) +
+  geom_errorbar(aes(ymin=value-value_spread1, ymax=value+value_spread1, x=ftype_abbr), width=0.3) +
+  scale_color_manual("Forest Type", values= c(rep(c("dark green", "green")))) +
+  facet_grid(rows = vars(rownumber), cols = vars(metric_type_3), scales = "free_y", labeller = label_wrap_gen(width=10)) +
+  geom_blank(aes(y = y_max)) +
+  #scale_y_continuous(limits = c(0,0.3)) + # for the upper plot
+  # scale_y_continuous(limits = c(0,0.15)) + # for the bottom plot
+  scale_fill_manual("Forest Type", values = c("green", "dark green"), labels = c("seasonal semi-deciduous forest (PE Rio Doce)", "broadleaf evergreen forest (REBIO Sooretama)")) +
+  theme_minimal() +
+       xlab("") +
+       ylab("") + 
+   theme(legend.position = "top",
+             axis.text.x = element_text(size = 12, angle = 45, vjust = 0.5),
+             axis.text.y = element_text(size = 12),
+             axis.line.x.bottom=element_line(size=0.8),
+             strip.text.x = element_text(size = 8, face = "italic"),
+             strip.text.y = element_text(size = 8, face = "italic", angle = 90),
+             strip.background = element_blank(), 
+             panel.grid.major.x = element_blank(),
+             panel.grid.minor.x = element_blank(), 
+             panel.border = element_blank(), 
+             panel.spacing.x = unit(0.3,"line"))
+
+grid.newpage()
+q <- ggplotGrob(plot_alt)
+lg <- linesGrob(x = unit(c(0, 1), "npc"), y = unit(c(1, 1), "npc"), gp = gpar(lwd = 2, col = "black"))  # Updated line thickness and color
+for (k in grep("strip-t",q$layout$name)) {
+  q$grobs[[k]]$grobs[[1]]$children[[1]] <- lg
+}
+grid.draw(q)
+```
+
+A. Alternate Plot (Season Start Only - Single Harmonic)
+```{r summary plot alternate phase seas only multiple}
+metrics_means <- metrics_means[9:12] # use radians but convert back to DOY
+labels <- rep("Season Start", 4)
+metrics_means$metric_type_3 <- labels
+metrics_means$metric_type_3 <- factor(labels, levels=metrics_means$metric_type_3, labels = labels)
+
+metrics_means <- metrics_means %>% mutate(metric_type = c(rep("S1_Season_Start", 2), rep("S2_Season_Start", 2)), value = value*365/(2*pi), value_spread = value_spread*365/(2*pi), rownumber = c(rep("RVI Phase (Day of Year)", 2), rep("EVI2 Phase (Day of Year)", 2)), value_spread1 = value_spread1*365/(2*pi), y_min = y_min*365/(2*pi), y_max = y_max*365/(2*pi))
+
+plot_alt <- ggplot(data = metrics_means) +
+  geom_col(aes(y=value, x=study_site, fill=ftype), position="dodge", size=1) +
+  geom_errorbar(aes(ymin=value-value_spread1, ymax=value+value_spread1, x=study_site), width=0.3) +
+  scale_color_manual("Forest Type", values= c(rep(c("dark green", "green")))) +
+  facet_grid(rows = vars(rownumber), cols = vars(metric_type_3), scales = "free_y", labeller = label_wrap_gen(width=10)) +
+  geom_blank(aes(y = y_min)) +
+  geom_blank(aes(y = y_max)) +
+  scale_x_discrete(labels = label_wrap(10)) + 
+  scale_fill_manual("Forest Type", values = c(rep(c("dark green", "green")))) +
+  theme_bw() +
+       xlab("") +
+       ylab("") +
+       theme(legend.position = "top", axis.text.x = element_text(size = 10, angle = 45, vjust = 0.5),
+             axis.line.x.bottom=element_line(size=0.8),
+             strip.text.x = element_text(size = 8, face = "italic"),
+             strip.text.y = element_text(size = 8, face = "italic", angle = 90),
+             strip.background = element_blank(), 
+             panel.grid.major.x = element_blank(),
+             panel.grid.minor.x = element_blank(), 
+             panel.border = element_blank(), panel.spacing.x = unit(1,"line"))
+
+grid.newpage()
+q <- ggplotGrob(plot_alt)
+lg <- linesGrob(x=unit(c(0,1),"npc"), y=unit(c(0,0),"npc"),gp=gpar(lwd=0.8))
+for (k in grep("strip-t",q$layout$name)) {
+  q$grobs[[k]]$grobs[[1]]$children[[1]] <- lg
+}
+grid.draw(q)
+```
+
+A. Alternate Plot (Phase Season Midpoint Only - Single Harmonic)
+```{r summary plot alternate phase seas only multiple}
+metrics_means <- metrics_means[9:12] # use radians but convert back to DOY
+labels <- rep("Season Mid-Point Phase", 4)
+metrics_means$metric_type_3 <- labels
+metrics_means$metric_type_3 <- factor(labels, levels=metrics_means$metric_type_3, labels = labels)
+
+metrics_means <- metrics_means %>% mutate(metric_type = c(rep("S1_Phase_Peak", 2), rep("S2_Phase_Peak", 2)), value = value*365/(2*pi), value_spread = value_spread*365/(2*pi), rownumber = c(rep("RVI Phase (Day of Year)", 2), rep("EVI2 Phase (Day of Year)", 2)), value_spread1 = value_spread1*365/(2*pi), y_min = y_min*365/(2*pi), y_max = y_max*365/(2*pi))
+
+plot_alt <- ggplot(data = metrics_means) +
+  geom_col(aes(y=value, x=study_site, fill=ftype), position="dodge", size=1) +
+  geom_errorbar(aes(ymin=value-value_spread1, ymax=value+value_spread1, x=study_site), width=0.3) +
+  scale_color_manual("Forest Type", values= c(rep(c("dark green", "green")))) +
+  facet_grid(rows = vars(rownumber), cols = vars(metric_type_3), scales = "free_y", labeller = label_wrap_gen(width=10)) +
+  geom_blank(aes(y = y_min)) +
+  geom_blank(aes(y = y_max)) +
+  scale_x_discrete(labels = label_wrap(10)) + 
+  scale_fill_manual("Forest Type", values = c(rep(c("dark green", "green")))) +
+  theme_bw() +
+       xlab("") +
+       ylab("") +
+       theme(legend.position = "top", axis.text.x = element_text(size = 10, angle = 45, vjust = 0.5),
+             axis.line.x.bottom=element_line(size=0.8),
+             strip.text.x = element_text(size = 8, face = "italic"),
+             strip.text.y = element_text(size = 8, face = "italic", angle = 90),
+             strip.background = element_blank(), 
+             panel.grid.major.x = element_blank(),
+             panel.grid.minor.x = element_blank(), 
+             panel.border = element_blank(), panel.spacing.x = unit(1,"line"))
+
+grid.newpage()
+q <- ggplotGrob(plot_alt)
+lg <- linesGrob(x=unit(c(0,1),"npc"), y=unit(c(0,0),"npc"),gp=gpar(lwd=0.8))
+for (k in grep("strip-t",q$layout$name)) {
+  q$grobs[[k]]$grobs[[1]]$children[[1]] <- lg
+}
+grid.draw(q)
+```
+
+A. Alternate Plot (Season Midpoint/Peak Lag - Single Harmonic)
+```{r summary plot alternate multiple}
+metrics_means <- metrics_means[5:6]
+labels <- rep("Season Midpoint Lag", 2)
+metrics_means$metric_type_3 <- labels
+metrics_means$metric_type_3 <- factor(labels, levels=metrics_means$metric_type_3, labels = labels)
+
+plot_alt <- ggplot(data = metrics_means) +
+  geom_col(aes(y=value, x=study_site, fill=ftype), position="dodge", size=1) +
+  geom_errorbar(aes(ymin=value-value_spread1, ymax=value+value_spread1, x=study_site), width=0.3) +
+  scale_color_manual("Forest Type", values= c(rep(c("dark green", "green")))) +
+ # facet_grid(rows = vars(rownumber), cols = vars(metric_type_3), scales = "free_y", labeller = label_wrap_gen(width=10)) +
+  geom_blank(aes(y = y_min)) +
+  geom_blank(aes(y = y_max)) +
+  scale_x_discrete(labels = label_wrap(10)) + 
+  scale_fill_manual("Forest Type", values = c(rep(c("dark green", "green")))) +
+  theme_bw() +
+       xlab("") +
+       ylab("Time Lag (Days)") +
+       theme(legend.position = "top", axis.text.x = element_text(size = 10, angle = 45, vjust = 0.5),
+             axis.line.x.bottom=element_line(size=0.8),
+             strip.text.x = element_text(size = 8, face = "italic"),
+             strip.text.y = element_text(size = 8, face = "italic", angle = 90),
+             strip.background = element_blank(), 
+             panel.grid.major.x = element_blank(),
+             panel.grid.minor.x = element_blank(), 
+             panel.border = element_blank(), panel.spacing.x = unit(1,"line"))
+
+grid.newpage()
+q <- ggplotGrob(plot_alt)
+lg <- linesGrob(x=unit(c(0,1),"npc"), y=unit(c(0,0),"npc"),gp=gpar(lwd=0.8))
+for (k in grep("strip-t",q$layout$name)) {
+  q$grobs[[k]]$grobs[[1]]$children[[1]] <- lg
+}
+grid.draw(q)
+```
+
+```{r}
+metrics_means %>% kable()
+```
+
+Save plot
+```{r save summary plot single}
+ggsave(paste0("Summary_Seasonality_Comparison_SouthSites_single_harmonic_v5.png"), units="in", width=6, height=6, dpi=300, device = 'png')
+```
+
+A. Plot Summary Seasonality - rescaled (Single Harmonic)
+```{r summary plot single - rescaled}
+metrics_scaled <- tapply(metrics_means$value, metrics_means$mID, scale) 
+metrics_scaled_df <- metrics_scaled %>% data.frame() ; names(metrics_scaled_df) <- "metric_type" ; 
+metrics_scaled <- metrics_scaled_df$metric_type %>% bind_cols() ; names(metrics_scaled) <- metric_type_names
+metrics_scaled <- metrics_scaled %>% pivot_longer(cols = all_of(metric_type_names),  names_to = "metric_type", values_to = "value")
+seq <- seq(1,(length(site.list))*length(metric_type_names), by=length(site.list))
+IDs <- c() ; for (i in 1:length(site.list)) {IDs <- c(IDs, i+seq-1)}
+metrics_scaled <- metrics_scaled %>% mutate(orderID = IDs) %>% relocate(orderID)
+
+m_s_vals <- c() ; m_c_vals <- c() 
+for (metric in 1:length(metric_type_names)) {
+  m_scale <- metrics_scaled_df$metric_type[[metric]] %>% attr(., "scaled:scale")
+  m_center <- metrics_scaled_df$metric_type[[metric]] %>% attr(., "scaled:center")
+  m_s_vals <- c(m_s_vals, m_scale) ; m_c_vals <- c(m_c_vals, m_center) 
+}
+
+metrics_scaled <- metrics_scaled %>% mutate(study_site = rep(metrics$study_site, each=length(metric_type_names)))
+metrics_scaled <- metrics_scaled %>% mutate(scale = rep(m_s_vals, length(site.list))) %>%
+                            mutate(center = rep(m_c_vals, length(site.list))) %>% arrange(orderID)
+
+#rescale annual variation (for error bars) 
+metric_spread_names <- names(metrics_spread)[-1]
+metrics_spread <- metrics_spread %>% pivot_longer(cols = all_of(metric_spread_names),  names_to = "metric_type", values_to = "value") %>% mutate(mID=rep(seq(1,length(metric_spread_names)), length(site.list)))
+metrics_scaled_spread <- tapply(metrics_spread$value, metrics_spread$mID, scale) 
+
+metrics_scaled_spread_df <- metrics_scaled_spread %>% data.frame() ; names(metrics_scaled_spread_df) <- "metric_type"
+metrics_scaled_spread <- metrics_scaled_spread_df$metric_type %>% bind_cols() ; names(metrics_scaled_spread) <- metric_spread_names
+metrics_scaled_spread <- metrics_scaled_spread %>% pivot_longer(cols = all_of(metric_spread_names),  names_to = "metric_type", values_to = "value")
+metrics_scaled_spread <- metrics_scaled_spread %>% mutate(orderID = IDs) %>% relocate(orderID)
+
+m_s_s_vals <- c() ; m_c_s_vals <- c() 
+for (metric in 1:length(metric_type_names)) {
+  m_scale <- metrics_scaled_spread_df$metric_type[[metric]] %>% attr(., "scaled:scale")
+  m_center <- metrics_scaled_spread_df$metric_type[[metric]] %>% attr(., "scaled:center")
+  m_s_s_vals <- c(m_s_s_vals, m_scale) ; m_c_s_vals <- c(m_c_s_vals, m_center) 
+}
+
+metrics_scaled_spread <- metrics_scaled_spread %>% arrange(orderID) 
+metrics_scaled <- metrics_scaled %>% mutate(value_spread = rep(metrics_scaled_spread$value)) %>% mutate(scale_spread = rep(m_s_s_vals, each=length(site.list))) %>% mutate(center_spread = rep(m_c_s_vals, each=length(site.list)))
+
+metrics_scaled$study_site <- as.factor(metrics_scaled$study_site)
+
+foresttype <- c("seasonal semi-deciduous forest", "broadleaf evergreen forest")
+metrics_scaled <- metrics_scaled %>% mutate(ftype=rep(foresttype,each=length(metric_type_names))) 
+metrics_scaled$metric_type_1 <- factor(metrics_scaled$metric_type, levels=metric_type_names, labels = c("Model 1: \nOptical Amplitude only", "Model 2:  \nPhase Diff. (Peak)", "Model 2:  \nCircular Phase Diff. (Peak)"))
+
+#unscaled values for text annotation
+metrics_scaled$orig <- arrange(metrics_means,mID)$value %>% round(digits = 3)
+
+#filter metrics
+metrics_scaled <- metrics_scaled %>% filter(metric_type=="S2_Ampl" | metric_type=="S1_S2_Phase_Peak_rad" )
+
+plot <- ggplot(data = metrics_scaled) +
+  geom_col(aes(y=value+2, x=study_site, fill=ftype), position="dodge", size=2) +
+  geom_label(aes(y=value+2, x=study_site, label=orig, hjust=-0.5)) +
+  geom_errorbar(aes(ymin=value+2-value_spread, ymax=value+2+value_spread, x=study_site), width=0.3) +
+  scale_color_manual("Forest Type", values= c("dark green", "green")) +
+  facet_wrap(~ metric_type_1, nrow=1, labeller = label_wrap_gen()) +
+  scale_fill_manual("Forest Type", values = c("dark green", "green")) +
+  theme_bw() +
+       xlab("Study Site (Park)") +
+       ylab("Seasonality metric (rescaled)") +
+       theme(legend.position = "top", axis.text.x = element_text(size = 10, angle = 90),
+             axis.line.x.bottom=element_line(size=0.8),
+             strip.text.x = element_text(size = 11, face = "italic"),
+             strip.text.y = element_text(size = 11, face = "italic"),
+             strip.background = element_rect(fill = "white"), 
+             panel.border = element_blank(), panel.spacing.x = unit(0.3,"line")) 
+
+grid.newpage()
+
+q <- ggplotGrob(plot_rescaled)
+lg <- linesGrob(x=unit(c(0,1),"npc"), y=unit(c(0,0),"npc"),gp=gpar(lwd=0.8))
+
+for (k in grep("strip-t",q$layout$name)) {
+  q$grobs[[k]]$grobs[[1]]$children[[1]] <- lg
+}
+
+grid.draw(q)
+```
+
+Save plot
+```{r save summary plot single}
+ggsave(paste0("Summary_Seasonality_Comparison_SouthSites_single_harmonic_rescaled.png"), units="in", width=12, height=6, dpi=300, device = 'png')
+```
+
+B. Plot Summary Seasonality (Multiple Harmonic)
+```{r summary plot multiple}
+#combine means and measures of spread
+metric_type_names <- names(metrics_means_multiple)[-1] ; metric_spread_names <- names(metrics_spread_multiple)[-1] 
+metrics_means <- metrics_means_multiple %>% pivot_longer(cols = all_of(metric_type_names),  names_to = "metric_type", values_to = "value") %>% mutate(mID=rep(seq(1,length(metric_type_names)), length(site.list)))
+metrics_spread <- metrics_spread_multiple %>% pivot_longer(cols = all_of(metric_spread_names),  names_to = "metric_type", values_to = "value") %>% mutate(mID=rep(seq(1,length(metric_type_names)), length(site.list)))
+
+#labels and reordering for nice plotting
+labels <- rep(c("Amplitude", "Season Start", "Season Start - radians", "Phase Peak", "Phase Peak - radians", "Phase Season", "Phase Season - radians", "Phase Ensemble", "Phase Ensemble - radians"), each=2)
+labels <- c(labels, "S1-S2 Lag (Season Start)", "S1-S2 Lag (Season Start - radians)", "S1-S2 Lag (Peak)", "S1-S2 Lag (Peak - radians)", "S1-S2 Lag (Season Mid-Point)", "S1-S2 Lag (Season Mid-Point - radians)", "S1-S2 Lag (Ensemble)", "S1-S2 Lag (Ensemble - radians)")
+seq <- seq(1,(length(site.list))*length(metric_type_names), by=length(site.list))
+IDs <- c() ; for (i in 1:length(site.list)) {IDs <- c(IDs, i+seq-1)}
+
+metrics_means <- metrics_means %>% mutate(orderID = IDs) %>% arrange(orderID)
+metrics_spread <- metrics_spread %>% mutate(orderID = IDs) %>% arrange(orderID)
+metrics_means <- metrics_means %>% mutate(value_spread = metrics_spread$value)
+
+#label factors
+foresttype_abbr <- c("SS", "EB")
+metrics_means <- metrics_means %>% mutate(ftype = rep(foresttypes, length(metric_type_names)), ftype_abbr = rep(foresttype_abbr, length(metric_type_names)))
+metrics_means$metric_type_1 <- factor(metrics_means$metric_type, levels=metrics_means$metric_type, labels = rep(labels,each=length(site.list)))
+metrics_means$metric_type_2 <- metrics_means$metric_type_1 %>% gsub(" - radians","",.)
+metrics_means$metric_type_2 <- factor(metrics_means$metric_type_2, levels=metrics_means$metric_type_2, labels = metrics_means$metric_type_2)
+metrics_means <- metrics_means %>% mutate(rownumber = c(
+  rep(paste0(S1_band, " Index"), length(site.list)),
+  rep(paste0(S2_band, " Index"), length(site.list)),
+  rep(paste0(S1_band, " Phase"), length(site.list)),
+  rep(paste0(S2_band, " Phase"), length(site.list)),
+  rep(paste0(S1_band, " Phase (Radians)"), length(site.list)),
+  rep(paste0(S2_band, " Phase (Radians)"), length(site.list)),
+  rep(paste0(S1_band, " Phase"), length(site.list)),
+  rep(paste0(S2_band, " Phase"), length(site.list)),
+  rep(paste0(S1_band, " Phase (Radians)"), length(site.list)),
+  rep(paste0(S2_band, " Phase (Radians)"), length(site.list)),
+  rep(paste0(S1_band, " Phase"), length(site.list)),
+  rep(paste0(S2_band, " Phase"), length(site.list)),
+  rep(paste0(S1_band, " Phase (Radians)"), length(site.list)),
+  rep(paste0(S2_band, " Phase (Radians)"), length(site.list)),
+  rep(paste0(S1_band, " Phase"), length(site.list)),
+  rep(paste0(S2_band, " Phase"), length(site.list)),
+  rep(paste0(S1_band, " Phase (Radians)"), length(site.list)),
+  rep(paste0(S2_band, " Phase (Radians)"), length(site.list)),
+  rep(paste0(S1_band, "-", S2_band, "Lag (Days)"), length(site.list)),
+  rep(paste0(S1_band, "-", S2_band, "Lag (Radians)"), length(site.list)),
+  rep(paste0(S1_band, "-", S2_band, "Lag (Days)"), length(site.list)),
+  rep(paste0(S1_band, "-", S2_band, "Lag (Radians)"), length(site.list)),
+  rep(paste0(S1_band, "-", S2_band, "Lag (Days)"), length(site.list)),
+  rep(paste0(S1_band, "-", S2_band, "Lag (Radians)"), length(site.list)),
+  rep(paste0(S1_band, "-", S2_band, "Lag (Days)"), length(site.list)),
+  rep(paste0(S1_band, "-", S2_band, "Lag (Radians)"), length(site.list))
+))
+                                          
+metrics_means <- metrics_means %>% mutate(value_spread1 = ifelse(grepl("_rad", metric_type), 1 - value_spread, value_spread)) # convert rho to deviation
+metrics_means$ftype_abbr <- as.factor(metrics_means$ftype_abbr)
+metrics_means <- data.table(metrics_means)
+metrics_means[,y_min := value*0.75, by = metric_type_2]
+metrics_means[,y_max:=value*1.25, by = metric_type_2]
+
+plot_original <- ggplot(data = metrics_means) +
+  geom_col(aes(y=value, x=ftype_abbr, fill=ftype_abbr), position="dodge", size=2) +
+  geom_errorbar(aes(ymin=value-value_spread1, ymax=value+value_spread1, x=ftype_abbr), width=0.3) +
+  scale_color_manual("Forest Type", values= c(rep(c("dark green", "green")))) +
+  facet_grid(rows = vars(rownumber), cols = vars(metric_type_2), scales = "free_y", labeller = label_wrap_gen(width=10)) +
+  geom_blank(aes(y = y_min)) +
+  geom_blank(aes(y = y_max)) +
+  scale_x_discrete(labels = label_wrap(10)) + 
+#  scale_y_continuous(expand = expansion()) +
+  scale_fill_manual("Forest Type", values = c("dark green", "green"), labels = c("seasonal semi-deciduous forest (PE Rio Doce)", "broadleaf evergreen forest (REBIO Sooretama)")) +
+  theme_bw() +
+       xlab("Study Site (Park)") +
+       ylab("Seasonality metric") +
+       ggtitle(paste0(str_to_title(hnum), " Harmonic Model")) +
+       theme(legend.position = "top", axis.text.x = element_text(size = 10, angle = 45, vjust = 0.5),
+             axis.line.x.bottom=element_line(size=0.8),
+             strip.text.x = element_text(size = 8, face = "italic"),
+             strip.text.y = element_text(size = 8, face = "italic", angle = 90),
+             strip.background = element_blank(), 
+             panel.grid.major.x = element_blank(),
+             panel.grid.minor.x = element_blank(), 
+             panel.border = element_blank(), panel.spacing.x = unit(0.3,"line"))
+
+  grid.newpage()
+  q <- ggplotGrob(plot_original)
+  lg <- linesGrob(x=unit(c(0,1),"npc"), y=unit(c(0,0),"npc"),gp=gpar(lwd=0.8))
+  for (k in grep("strip-t",q$layout$name)) {
+    q$grobs[[k]]$grobs[[1]]$children[[1]] <- lg
+  }
+  grid.draw(q)
+```
+
+```{r}
+metrics_means %>% kable
+```
+
+B. Alternate Plot (Amplitude Only - Multiple Harmonic)
+```{r summary plot alternate ampl. only multiple}
+metrics_means <- metrics_means[1:4]
+labels <- rep("Amplitude", 4)
+metrics_means$metric_type_3 <- labels
+metrics_means$metric_type_3 <- factor(labels, levels=metrics_means$metric_type_3, labels = labels)
+metrics_means$ftype_abbr <- factor(metrics_means$ftype_abbr, levels = c("SS", "EB"))
+
+# set y-axis limits
+metrics_means[metric_type == "S1_Ampl",y_max := 0.15]
+metrics_means[metric_type == "S2_Ampl",y_max := 0.3]
+
+plot_alt <- ggplot(data = metrics_means) +
+  geom_col(aes(y=value, x=ftype_abbr, fill=ftype_abbr), position="dodge", size=0.8) +
+  geom_errorbar(aes(ymin=value-value_spread1, ymax=value+value_spread1, x=ftype_abbr), width=0.3) +
+  scale_color_manual("Forest Type", values= c(rep(c("dark green", "green")))) +
+  facet_grid(rows = vars(rownumber), cols = vars(metric_type_3), scales = "free_y", labeller = label_wrap_gen(width=10)) +
+  geom_blank(aes(y = y_max)) +
+  #scale_y_continuous(limits = c(0,0.3)) + # for the upper plot
+  # scale_y_continuous(limits = c(0,0.15)) + # for the bottom plot
+  scale_fill_manual("Forest Type", values = c("green", "dark green"), labels = c("seasonal semi-deciduous forest (PE Rio Doce)", "broadleaf evergreen forest (REBIO Sooretama)")) +
+  theme_minimal() +
+       xlab("") +
+       ylab("") + 
+   theme(legend.position = "top",
+             axis.text.x = element_text(size = 12, angle = 45, vjust = 0.5),
+             axis.text.y = element_text(size = 12),
+             axis.line.x.bottom=element_line(size=0.8),
+             strip.text.x = element_text(size = 8, face = "italic"),
+             strip.text.y = element_text(size = 8, face = "italic", angle = 90),
+             strip.background = element_blank(), 
+             panel.grid.major.x = element_blank(),
+             panel.grid.minor.x = element_blank(), 
+             panel.border = element_blank(), 
+             panel.spacing.x = unit(0.3,"line"))
+
+
+grid.newpage()
+q <- ggplotGrob(plot_alt)
+lg <- linesGrob(x = unit(c(0, 1), "npc"), y = unit(c(1, 1), "npc"), gp = gpar(lwd = 2, col = "black"))  # Updated line thickness and color
+for (k in grep("strip-t",q$layout$name)) {
+  q$grobs[[k]]$grobs[[1]]$children[[1]] <- lg
+}
+grid.draw(q)
+```
+
+B. Alternate Plot (Season Start Only - Multiple Harmonic)
+```{r summary plot alternate seas start only multiple}
+metrics_means <- metrics_means[9:12] # use radians but convert back to DOY
+labels <- rep("Season Start", 4)
+metrics_means$metric_type_3 <- labels
+metrics_means$metric_type_3 <- factor(labels, levels=metrics_means$metric_type_3, labels = labels)
+
+metrics_means <- metrics_means %>% mutate(metric_type = c(rep("S1_Season_Start", 2), rep("S2_Season_Start", 2)), value = value*365/(2*pi), value_spread = value_spread*365/(2*pi), rownumber = c(rep("RVI Phase (Day of Year)", 2), rep("EVI2 Phase (Day of Year)", 2)), value_spread1 = value_spread1*365/(2*pi), y_min = y_min*365/(2*pi), y_max = y_max*365/(2*pi))
+
+plot_alt <- ggplot(data = metrics_means) +
+  geom_col(aes(y=value, x=study_site, fill=ftype), position="dodge", size=1) +
+  geom_errorbar(aes(ymin=value-value_spread1, ymax=value+value_spread1, x=study_site), width=0.3) +
+  scale_color_manual("Forest Type", values= c(rep(c("dark green", "green")))) +
+  facet_grid(rows = vars(rownumber), cols = vars(metric_type_3), scales = "free_y", labeller = label_wrap_gen(width=10)) +
+  geom_blank(aes(y = y_min)) +
+  geom_blank(aes(y = y_max)) +
+  scale_x_discrete(labels = label_wrap(10)) + 
+  scale_fill_manual("Forest Type", values = c(rep(c("dark green", "green")))) +
+  theme_bw() +
+       xlab("") +
+       ylab("") +
+       theme(legend.position = "top", axis.text.x = element_text(size = 10, angle = 45, vjust = 0.5),
+             axis.line.x.bottom=element_line(size=0.8),
+             strip.text.x = element_text(size = 8, face = "italic"),
+             strip.text.y = element_text(size = 8, face = "italic", angle = 90),
+             strip.background = element_blank(), 
+             panel.grid.major.x = element_blank(),
+             panel.grid.minor.x = element_blank(), 
+             panel.border = element_blank(), panel.spacing.x = unit(1,"line"))
+
+grid.newpage()
+q <- ggplotGrob(plot_alt)
+lg <- linesGrob(x=unit(c(0,1),"npc"), y=unit(c(0,0),"npc"),gp=gpar(lwd=0.8))
+for (k in grep("strip-t",q$layout$name)) {
+  q$grobs[[k]]$grobs[[1]]$children[[1]] <- lg
+}
+grid.draw(q)
+```
+
+B. Alternate Plot (Phase Season Midpoint Only - Multiple Harmonic)
+```{r summary plot alternate phase seas only multiple}
+metrics_means <- metrics_means[5:8]
+labels <- rep("Season Mid-Point Phase", 4)
+metrics_means$metric_type_3 <- labels
+metrics_means$metric_type_3 <- factor(labels, levels=metrics_means$metric_type_3, labels = labels)
+
+plot_alt <- ggplot(data = metrics_means) +
+  geom_col(aes(y=value, x=study_site, fill=ftype), position="dodge", size=1) +
+  geom_errorbar(aes(ymin=value-value_spread1, ymax=value+value_spread1, x=study_site), width=0.3) +
+  scale_color_manual("Forest Type", values= c(rep(c("dark green", "green")))) +
+  facet_grid(rows = vars(rownumber), cols = vars(metric_type_3), scales = "free_y", labeller = label_wrap_gen(width=10)) +
+  geom_blank(aes(y = y_min)) +
+  geom_blank(aes(y = y_max)) +
+  scale_x_discrete(labels = label_wrap(10)) + 
+  scale_fill_manual("Forest Type", values = c(rep(c("dark green", "green")))) +
+  theme_bw() +
+       xlab("") +
+       ylab("") +
+       theme(legend.position = "top", axis.text.x = element_text(size = 10, angle = 45, vjust = 0.5),
+             axis.line.x.bottom=element_line(size=0.8),
+             strip.text.x = element_text(size = 8, face = "italic"),
+             strip.text.y = element_text(size = 8, face = "italic", angle = 90),
+             strip.background = element_blank(), 
+             panel.grid.major.x = element_blank(),
+             panel.grid.minor.x = element_blank(), 
+             panel.border = element_blank(), panel.spacing.x = unit(1,"line"))
+
+grid.newpage()
+q <- ggplotGrob(plot_alt)
+lg <- linesGrob(x=unit(c(0,1),"npc"), y=unit(c(0,0),"npc"),gp=gpar(lwd=0.8))
+for (k in grep("strip-t",q$layout$name)) {
+  q$grobs[[k]]$grobs[[1]]$children[[1]] <- lg
+}
+grid.draw(q)
+```
+
+B. Alternate Plot (Season Midpoint Lag - Multiple Harmonic)
+```{r summary plot alternate seas lag multiple}
+metrics_means <- metrics_means[6:7] # Select season midpoint metric
+labels <- rep("Season Midpoint Lag", 2)
+metrics_means$metric_type_3 <- labels
+metrics_means$metric_type_3 <- factor(labels, levels=metrics_means$metric_type_3, labels = labels)
+
+plot_alt <- ggplot(data = metrics_means) +
+  geom_col(aes(y=value, x=study_site, fill=ftype), position="dodge", size=1) +
+  geom_errorbar(aes(ymin=value-value_spread1, ymax=value+value_spread1, x=study_site), width=0.3) +
+  scale_color_manual("Forest Type", values= c(rep(c("dark green", "green")))) +
+ # facet_grid(rows = vars(rownumber), cols = vars(metric_type_3), scales = "free_y", labeller = label_wrap_gen(width=10)) +
+  geom_blank(aes(y = y_min)) +
+  geom_blank(aes(y = y_max)) +
+  scale_x_discrete(labels = label_wrap(10)) + 
+  scale_fill_manual("Forest Type", values = c(rep(c("dark green", "green")))) +
+  theme_bw() +
+       xlab("") +
+       ylab("Time Lag (Days)") +
+       theme(legend.position = "top", axis.text.x = element_text(size = 10, angle = 45, vjust = 0.5),
+             axis.line.x.bottom=element_line(size=0.8),
+             strip.text.x = element_text(size = 8, face = "italic"),
+             strip.text.y = element_text(size = 8, face = "italic", angle = 90),
+             strip.background = element_blank(), 
+             panel.grid.major.x = element_blank(),
+             panel.grid.minor.x = element_blank(), 
+             panel.border = element_blank(), panel.spacing.x = unit(1,"line"))
+
+grid.newpage()
+q <- ggplotGrob(plot_alt)
+lg <- linesGrob(x=unit(c(0,1),"npc"), y=unit(c(0,0),"npc"),gp=gpar(lwd=0.8))
+for (k in grep("strip-t",q$layout$name)) {
+  q$grobs[[k]]$grobs[[1]]$children[[1]] <- lg
+}
+grid.draw(q)
+```
+
+```{r}
+metrics_means %>% kable()
+```
+
+Save plot
+```{r save summary plot single}
+ggsave(paste0("Summary_Seasonality_Comparison_SouthSites_multiple_harmonic_v5.png"), units="in", width=12, height=6, dpi=300, device = 'png')
+```
+
+B. Plot Summary Seasonality - rescaled (Multiple Harmonic)
+```{r summary plot multiple - rescaled}
+#rescale means
+metrics_scaled <- tapply(metrics_means$value, metrics_means$mID, scale) 
+metrics_scaled_df <- metrics_scaled %>% data.frame() ; names(metrics_scaled_df) <- "metric_type" ; 
+metrics_scaled <- metrics_scaled_df$metric_type %>% bind_cols() ; names(metrics_scaled) <- metric_type_names
+metrics_scaled <- metrics_scaled %>% pivot_longer(cols = all_of(metric_type_names),  names_to = "metric_type", values_to = "value")
+metrics_scaled <- metrics_scaled %>% mutate(orderID = IDs) %>% relocate(orderID)
+
+m_s_vals <- c() ; m_c_vals <- c() 
+for (metric in 1:length(metric_type_names)) {
+  m_scale <- metrics_scaled_df$metric_type[[metric]] %>% attr(., "scaled:scale")
+  m_center <- metrics_scaled_df$metric_type[[metric]] %>% attr(., "scaled:center")
+  m_s_vals <- c(m_s_vals, m_scale) ; m_c_vals <- c(m_c_vals, m_center) 
+}
+
+metrics_scaled <- metrics_scaled %>% mutate(study_site = rep(metrics$study_site, each=length(metric_type_names)))
+metrics_scaled <- metrics_scaled %>% mutate(scale = rep(m_s_vals, length(site.list))) %>%
+                            mutate(center = rep(m_c_vals, length(site.list))) %>% arrange(orderID)
+
+#rescale annual variation (for error bars) 
+metric_spread_names <- names(metrics_spread)[-1]
+metrics_spread <- metrics_spread %>% pivot_longer(cols = all_of(metric_spread_names),  names_to = "metric_type", values_to = "value") %>% mutate(mID=rep(seq(1,length(metric_spread_names)), length(site.list)))
+metrics_scaled_spread <- tapply(metrics_spread$value, metrics_spread$mID, scale) 
+
+metrics_scaled_spread_df <- metrics_scaled_spread %>% data.frame() ; names(metrics_scaled_spread_df) <- "metric_type"
+metrics_scaled_spread <- metrics_scaled_spread_df$metric_type %>% bind_cols() ; names(metrics_scaled_spread) <- metric_spread_names
+metrics_scaled_spread <- metrics_scaled_spread %>% pivot_longer(cols = all_of(metric_spread_names),  names_to = "metric_type", values_to = "value")
+metrics_scaled_spread <- metrics_scaled_spread %>% mutate(orderID = IDs) %>% relocate(orderID)
+
+m_s_s_vals <- c() ; m_c_s_vals <- c() 
+for (metric in 1:length(metric_type_names)) {
+  m_scale <- metrics_scaled_spread_df$metric_type[[metric]] %>% attr(., "scaled:scale")
+  m_center <- metrics_scaled_spread_df$metric_type[[metric]] %>% attr(., "scaled:center")
+  m_s_s_vals <- c(m_s_s_vals, m_scale) ; m_c_s_vals <- c(m_c_s_vals, m_center) 
+}
+
+metrics_scaled_spread <- metrics_scaled_spread %>% arrange(orderID) 
+metrics_scaled <- metrics_scaled %>% mutate(value_spread = metrics_scaled_spread$value) %>% mutate(scale_spread = rep(m_s_s_vals, each=length(site.list))) %>% mutate(center_spread = rep(m_c_s_vals, each=length(site.list)))
+
+metrics_scaled$study_site <- as.factor(metrics_scaled$study_site)
+metrics_scaled <- metrics_scaled %>% mutate(ftype=rep(foresttype,length(metric_type_names))) 
+metrics_scaled$metric_type_1 <- factor(metrics_scaled$metric_type, levels=metrics_scaled$metric_type, labels = rep(labels,each=length(site.list)))
+
+plot_rescaled <- ggplot(data = metrics_scaled) +
+  geom_col(aes(y=value+2, x=study_site, fill=ftype), position="dodge", size=2) +
+  geom_errorbar(aes(ymin=value+2-value_spread, ymax=value+2+value_spread, x=study_site), width=0.3) +
+  scale_color_manual("Forest Type", values= c(rep(c("dark green", "green")))) +
+  facet_wrap(~ metric_type_1, nrow=1, labeller = label_wrap_gen()) +
+  scale_x_discrete(labels = park.list) +
+  scale_fill_manual("Forest Type", values = c(rep(c("dark green", "green")))) +
+  theme_bw() +
+       xlab("Study Site (Park)") +
+       ylab("Seasonality metric (rescaled)") +
+       theme(legend.position = "top", axis.text.x = element_text(size = 10, angle = 90),
+             axis.line.x.bottom=element_line(size=0.8),
+             strip.text.x = element_text(size = 9, face = "italic"),
+             strip.text.y = element_text(size = 9, face = "italic"),
+             strip.background = element_rect(fill = "white"), 
+             panel.border = element_blank(), panel.spacing.x = unit(0.3,"lines"))
+
+  grid.newpage()
+  q <- ggplotGrob(plot_rescaled)
+  lg <- linesGrob(x=unit(c(0,1),"npc"), y=unit(c(0,0),"npc"),gp=gpar(lwd=0.8))
+  for (k in grep("strip-t",q$layout$name)) {
+    q$grobs[[k]]$grobs[[1]]$children[[1]] <- lg
+  }
+  grid.draw(q)
+```
+
+Save plot
+```{r save summary plot multple}
+ggsave(paste0("Summary_Seasonality_Comparison_SouthSites_multiple_harmonic_rescaled.png"), units="in", width=12, height=6, dpi=300, device = 'png')
+```
+
+A. Prep data for statistical analysis by circular statistics (Single Harmonic)
+```{r circ prep single, echo=FALSE}
+# Read in fitted data from harmonic analysis (S1)
+wd <- ("/Users/brbell01/Documents/git/atlantic_forest_phenology/R")
+S1_season <- list() ; S2_season <- list() 
+
+# Define the columns to convert for each date
+orig_cols <- c("season_start_date", "season_end_date", "peak_date")
+new_cols <- c("st", "end", "peak")
+
+for (site in site.list) {
+    # Read in seasonality file - single harmonic
+    study_siteID <- match(site,studyarea_bases)  # study site defined above
+    S1_path <- "/raw/s1/1ha/harmonic" ; S2_path <- "/raw/s2/1ha/harmonic"
+    S1_files <- dir(paste0(wd, S1_path), full.names = T, pattern = paste0(S1_band, "_seasonality_processed.csv")) %>% map(read.csv, header=T)
+    S2_files <- dir(paste0(wd, S2_path), full.names = T, pattern = paste0(S2_band, "_seasonality_processed.csv")) %>% map(read.csv, header=T)
+    S1_season[[study_siteID]] <- S1_files[[study_siteID]]
+    S2_season[[study_siteID]] <- S2_files[[study_siteID]]
+    S1_season[[study_siteID]] <- convert_to_radians(S1_season[[study_siteID]])
+    S2_season[[study_siteID]] <- convert_to_radians(S2_season[[study_siteID]])
+}
+```
+
+B. Prep data for statistical analysis by circular statistics (Multiple Harmonic)
+```{r circ. prep multiple, echo=FALSE}
+# Read in fitted data from harmonic analysis (S1). 
+  S1_season <- list() ; S2_season <- list() 
+
+# Define the columns to convert for each date
+orig_cols <- c("season_start_date", "season_end_date", "peak_date", "season_half_date", "season_ensemble_date")
+new_cols <- c("st", "end", "peak", "seashalf", "seasens")
+
+for (site in site.list) {
+    # Read in seasonality file - multiple harmonic
+    study_siteID <- match(site,studyarea_bases)  # study site defined above
+    S1_path <- "/timesat/output/third_run/S1/" ; S2_path <- "/timesat/output/third_run/S2/" 
+    S1_files <- dir(paste0(wd, S1_path), full.names = T, pattern = paste0(S1_band, "_seasonality_processed.csv")) %>% map(read.csv, header=T)
+    S2_files <- dir(paste0(wd, S2_path), full.names = T, pattern = paste0(S2_band, "_seasonality_processed.csv")) %>% map(read.csv, header=T)
+    S1_season[[study_siteID]] <- S1_files[[study_siteID]]
+    S2_season[[study_siteID]] <- S2_files[[study_siteID]]
+    S1_season[[study_siteID]] <- convert_to_radians(S1_season[[study_siteID]])
+    S2_season[[study_siteID]] <- convert_to_radians(S2_season[[study_siteID]])
+}
+```
+
+A. Circular plot setup (Single Harmonic)
+```{r circ plot setup single, echo=FALSE}
+#Define study site
+site <-"sooretama" # "sooretama" # "rio_doce" # "monte_pascoal" # "mata_escura"
+rad_spacing <- 0.005 # increment for visualization of circular sectors
+study_siteID <- match(site,studyarea_bases)
+park_name <- all_parks[[study_siteID]]
+S1_season[[study_siteID]] -> S1
+S2_season[[study_siteID]] -> S2
+
+if (site == "rio_doce" | site == "mata_escura") {foresttype <- foresttypes[1]
+} else if (site == "monte_pascoal" | site == "sooretama") {foresttype <- foresttypes[2]
+} else {foresttype <- "NA"}
+
+vec.expr <- c(0, pi/6, pi/3, pi/2, 2*pi/3, 5*pi/6, pi, 7*pi/6, 4*pi/3, 3*pi/2, 5*pi/3, 11*pi/6)
+vec.rev <- vec.expr %>% rev
+months <- as.Date(paste0("2001-", seq(1:12), "-01")) %>% format("%b")
+months2 <- paste0(months,"-01")
+
+S1start <- S1$straddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+S1end <- S1$endraddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+S2start <- S2$straddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+S2end <- S2$endraddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+S1_mean_peak_rad <- S1$peakraddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+S2_mean_peak_rad <- S2$peakraddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+
+S1season_length <- date_seq(S1start, S1end)
+S2season_length <- date_seq(S2start, S2end)
+
+S1season_length_rad <- S1season_length %>% to_radians()
+S2season_length_rad <- S2season_length %>% to_radians()
+
+S1_S2_season_start_shift <- c(S1start,S2start)
+S1_S2_season_start_shift <- c(seq(S1_S2_season_start_shift[[1]], 2*pi,rad_spacing), seq(0,S1_S2_season_start_shift[[2]],rad_spacing))
+
+S1_S2_peak_shift <- c(S1_mean_peak_rad,S2_mean_peak_rad)
+S1_S2_peak_shift <- c(seq(S1_S2_peak_shift[[1]], 2*pi,rad_spacing), seq(0,S1_S2_peak_shift[[2]],rad_spacing))
+```
+
+A. Circular Plot single harmonic type 1: season peaks 
+```{r circ plot single: peaks, echo=TRUE}
+S1refraddoy <- S1$peakraddoy
+S2refraddoy <- S2$peakraddoy
+plabel <- S2_mean_peak_rad - S1_mean_peak_rad + 2*pi ; plabel <- plabel[[1]] %>% doy_convert() %>% round
+
+par(mar = c(3,2,2,1))
+
+#first plot S1 peaks
+plot(circular(S1refraddoy, type = "angles", units = "radians", rotation = "clock")
+          , tol=0.5, pch = 8, cex = 0.9, col="blue", stack = FALSE, axes = FALSE, template = NULL, start.sep=0
+          , control.circle=circle.control(col="grey70", lty=3))
+# add S2 peaks
+points.circular(circular(S2refraddoy, type = "angles", units = "radians", zero=2*pi/3, rotation = "clock"), pch = 8, cex = 0.9, col="#00B437", start.sep=0)
+# add S1 season length (connect from start date to end date)
+points.circular(circular(S1season_length_rad, type = "angles", units = "radians", zero=2*pi/3, rotation = "clock"), pch = 16, cex = 3.5, col= alpha("blue",0.2) , start.sep=-0.15)
+# add S2 season length
+points.circular(circular(S2season_length_rad, type = "angles", units = "radians", zero=2*pi/3, rotation = "clock"), pch = 16, cex = 3.5, col=alpha("green",0.2), start.sep=-0.35)
+#phase shift method 2
+points.circular(circular(S1_S2_peak_shift, type = "angles", units = "radians", zero=2*pi/3, rotation = "clock"), pch = 16, cex = 1.2, col=alpha("orange",0.5), start.sep=0.2)
+#add calendar dates to axis
+axis.circular(at=circular(vec.rev, zero=2*pi/3), labels=months2, tcl.text=-0.1, cex=1.2)
+#add arrows to indicate S1 mean peak values 
+arrows.circular(lwd = 2, shrink=1, col= "blue", S1_mean_peak_rad, zero=2*pi/3)
+#add arrows to indicate S2 mean peak values 
+arrows.circular(lwd = 2, shrink=1, col= "#00B437", S2_mean_peak_rad, zero=2*pi/3)
+title(main = paste0("Multi-year seasonality summary (", hnum, " harmonic) of remote sensing indices \n(Sentinel-1 ", S1_band, " & Sentinel-2 ", S2_band, ") \n", park_name, " (", foresttype, ")"), cex.main=1.5, line = -2)
+legend("right", title="Phase Shift Type", c("Peak"), fill=c("orange"), cex=1.2, bty = "n", shape="circle")
+text(x=-1, y=1, labels = paste0(plabel, " days"), cex=1.2, col="orange")
+```
+
+A. Circular Plot (single harmonic separate plots: start of season OR season midpoint, 4 plots total)
+```{r circ plot single separate plots: season start or peaks/season midpoint, echo=TRUE}
+#setup
+hnum <- "single"
+vec.expr <- c(0, pi/6, pi/3, pi/2, 2*pi/3, 5*pi/6, pi, 7*pi/6, 4*pi/3, 3*pi/2, 5*pi/3, 11*pi/6)
+vec.rev <- vec.expr %>% rev
+months <- as.Date(paste0("2001-", seq(1:12), "-01")) %>% format("%b")
+months2 <- paste0(months," 1st")
+
+site <-"rio_doce" # "sooretama" # "rio_doce" # "monte_pascoal" # "mata_escura"
+if (site == "rio_doce" | site == "mata_escura") {foresttype1 <- foresttypes[1]
+} else if (site == "monte_pascoal" | site == "sooretama") {foresttype1 <- foresttypes[2]
+} else {foresttype1 <- "NA"}
+study_site1ID <- match(site,studyarea_bases)
+park_name_1 <- all_parks[[study_site1ID]]
+S1_season[[study_site1ID]] -> S1_site1
+S2_season[[study_site1ID]] -> S2_site1
+S1_site1_mean_start_rad <- S1_site1$straddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+S2_site1_mean_start_rad <- S2_site1$straddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+S1_site1_mean_peak_rad <- S1_site1$peakraddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+S2_site1_mean_peak_rad <- S2_site1$peakraddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+
+site <-"sooretama" # "sooretama" # "rio_doce" # "monte_pascoal" # "mata_escura"
+if (site == "rio_doce" | site == "mata_escura") {foresttype2 <- foresttypes[1]
+} else if (site == "monte_pascoal" | site == "sooretama") {foresttype2 <- foresttypes[2]
+} else {foresttype2 <- "NA"}
+study_site2ID <- match(site,studyarea_bases)
+park_name_2 <- all_parks[[study_site2ID]]
+S1_season[[study_site2ID]] -> S1_site2
+S2_season[[study_site2ID]] -> S2_site2
+S1_site2_mean_start_rad <- S1_site2$straddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+S2_site2_mean_start_rad <- S2_site2$straddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+S1_site2_mean_peak_rad <- S1_site2$peakraddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+S2_site2_mean_peak_rad <- S2_site2$peakraddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+
+
+# set circular plot reference to season start
+S1_site1refraddoy <- S1_site1$straddoy
+S2_site1refraddoy <- S2_site1$straddoy
+S1_site2refraddoy <- S1_site2$straddoy
+S2_site2refraddoy <- S2_site2$straddoy
+
+S1_site1arrow <- S1_site1_mean_start_rad
+S2_site1arrow <- S2_site1_mean_start_rad
+S1_site2arrow <- S1_site2_mean_start_rad
+S2_site2arrow <- S2_site2_mean_start_rad
+
+# OR set circular plot reference to season peak
+# S1_site1refraddoy <- S1_site1$peakraddoy
+# S2_site1refraddoy <- S2_site1$peakraddoy
+# S1_site2refraddoy <- S1_site2$peakraddoy
+# S2_site2refraddoy <- S2_site2$peakraddoy
+
+# S1_site1arrow <- S1_site1_mean_peak_rad
+# S2_site1arrow <- S2_site1_mean_peak_rad
+# S1_site2arrow <- S1_site2_mean_peak_rad
+# S2_site2arrow <- S2_site2_mean_peak_rad
+
+#initialize circular plot with 4 sections
+par(mfrow = c(2, 2), mar = rep(0,4))
+#plot S1 peaks site one
+plot(circular(S1_site1refraddoy, type = "angles", units = "radians", zero=pi/2, rotation = "clock")
+          , tol=0.5, pch = 16, cex = 0.9, col="blue", stack = FALSE, axes = FALSE, template = NULL, start.sep=0
+          , control.circle=circle.control(col="grey70", lty=3))
+#add arrows to indicate S1 mean peak site one values 
+arrows.circular(lwd = 2, shrink=0.9, col= "blue", S1_site1arrow, zero=pi/2)
+#add calendar dates to axis
+axis.circular(at=circular(vec.rev, zero=2*pi/3), labels=months2, tcl.text=-0.25, tcl=0.09, cex = 0.9)
+
+#new plot S2 peaks site one
+plot(circular(S2_site1refraddoy, type = "angles", units = "radians", zero=pi/2, rotation = "clock")
+          , tol=0.5, pch = 16, cex = 0.9, col="#00B437", stack = FALSE, axes = FALSE, template = NULL, start.sep=0
+          , control.circle=circle.control(col="grey70", lty=3))
+#add arrows to indicate S2 mean peak site two values 
+arrows.circular(lwd = 2, shrink=0.9, col= "#00B437", S2_site1arrow, zero=pi/2)
+#add calendar dates to axis
+axis.circular(at=circular(vec.rev, zero=2*pi/3), labels=months2,  tcl.text=-0.25, tcl=0.09, cex = 0.9)
+
+#new plot S1 peaks site two
+#add arrows to indicate S1 mean peak site two values
+plot(circular(vec.rev, type = "angles", units = "radians", zero=pi/2, rotation = "clock")
+          , tol=0.5, pch = 16, cex = 0.9, col=alpha("red",0), stack = FALSE, axes = FALSE, template = NULL, start.sep=0
+          , control.circle=circle.control(col="grey70", lty=3))
+arrows.circular(lwd = 2, lty = 2, shrink=0.9, col= "blue", S1_site2arrow, zero=pi/2, rotation = "clock")
+#add peaks but using tick marks
+axis.circular(at=circular(S1_site2refraddoy, zero=pi/2, rotation = "clock"), cex=1.2, lwd=2.5, col="blue", labels=rep("", length(S1_site2refraddoy)))
+#add calendar dates to axis
+axis.circular(at=circular(vec.rev, zero=2*pi/3), labels=months2, tcl.text=-0.25, tcl=0.15, cex = 0.9)
+
+#new plot S2 peaks site two
+#add arrows to indicate S2 mean peak site two values
+plot(circular(vec.rev, type = "angles", units = "radians", zero=pi/2, rotation = "clock")
+          , tol=0.5, pch = 16, cex = 0.9, col=alpha("red",0), stack = FALSE, axes = FALSE, template = NULL, start.sep=0
+          , control.circle=circle.control(col="grey70", lty=3))
+arrows.circular(lwd = 2, lty = 2, shrink=0.9, col= "#00B437", S2_site2arrow, zero=pi/2, rotation = "clock")
+#add peaks but using tick marks
+axis.circular(at=circular(S2_site2refraddoy, zero=pi/2, rotation = "clock"), cex=1.2, lwd=2.5, col="#00B437", labels=rep("", length(S2_site2refraddoy)))
+#add calendar dates to axis
+axis.circular(at=circular(vec.rev, zero=2*pi/3), labels=months2, tcl.text=-0.25, tcl=0.15, cex = 0.9)
+
+#title(main = paste0("Multi-year seasonality summary (", hnum, " harmonic) of remote sensing indices \n(Sentinel-1 ", S1_band, " & Sentinel-2 ", S2_band, ") \n", park_name_1, " (", foresttype1, ")", " &\n", park_name_1, " (", foresttype2, ")"), cex.main=1.5, line = -3.5)
+
+plot.new()
+par(mfrow = c(1, 1))
+title <- title(main=list("season \nmidpoint \nvalues      annual mean", cex=0.75), line=-5, adj=0)
+points <- legend("center", legend = rep(NA, 4), col = rep(c("blue","#00B437"),2), pch = c(16,16,124,124), inset=1, ncol = 1, bty = "n", pt.cex = 1, x.intersp=2, y.intersp=0.9,  cex = 1, text.col = "black", horiz = F)
+            
+arrowhead <- legend(x = points$rect$left+0.05, y = points$rect$top, legend = rep(NA, 4), col = rep(c("blue","#00B437"),2), pch = rep(60,4), inset=1, ncol = 1, bty = "n", pt.cex = 1, x.intersp=1, y.intersp=0.9, cex = 1, text.col = "black", horiz = F)
+
+legend(x = points$rect$left+0.05, y = points$rect$top,
+  legend = c(paste0(S1_band, ", ", park_name_1), 
+             paste0(S2_band, ", ", park_name_1), 
+             paste0(S1_band, ", ", park_name_2),
+             paste0(S2_band, ", ", park_name_2)), 
+  col = rep(c("blue","#00B437"),2), lty = c(1,1,2,2), lwd = 2, ncol = 1, bty = "n", pt.cex = 1, x.intersp = 0.9, y.intersp=0.9, bg = NA, cex = 1, text.col = "black", horiz = F, title = title, title.adj=1)
+```
+
+Create a new plot for the legend
+```{legend for circular plot r}
+# Create a new plot for the legend
+plot.new()
+par(mfrow = c(1, 1))
+title("season midpoint values    annual mean", line=-18)
+points <- legend("center", legend = rep(NA, 4), col = rep(c("blue","#00B437"),2), pch = c(16,16,124,124), inset=1, ncol = 1, bty = "n", pt.cex = 1, x.intersp=2, y.intersp=0.75,  cex = 1, text.col = "black", horiz = F)
+            
+arrowhead <- legend(x = points$rect$left+0.05, y = points$rect$top, legend = rep(NA, 4), col = rep(c("blue","#00B437"),2), pch = rep(60,4), inset=1, ncol = 1, bty = "n", pt.cex = 1, x.intersp=1, y.intersp=0.75, cex = 1, text.col = "black", horiz = F)
+
+legend(x = points$rect$left+0.05, y = points$rect$top,
+  legend = c(paste0(S1_band, ", ", park_name_1), 
+             paste0(S2_band, ", ", park_name_1), 
+             paste0(S1_band, ", ", park_name_2),
+             paste0(S2_band, ", ", park_name_2)), 
+  col = rep(c("blue","#00B437"),2), lty = c(1,1,2,2), lwd = 2, ncol = 1, bty = "n", pt.cex = 1, x.intersp = 0.25, y.intersp=0.75, bg = NA, cex = 1, text.col = "black", horiz = F)
+```
+
+A. Circular Plot (single harmonic two sites compared: start of season OR season midpoint, 2 plots total)
+```{r circ plot single two sites compared: seas. or midpoint, 2 plots total}
+#setup
+hnum <- "single"
+vec.expr <- c(0, pi/6, pi/3, pi/2, 2*pi/3, 5*pi/6, pi, 7*pi/6, 4*pi/3, 3*pi/2, 5*pi/3, 11*pi/6)
+vec.rev <- vec.expr %>% rev
+months <- as.Date(paste0("2001-", seq(1:12), "-01")) %>% format("%b")
+months2 <- paste0(months,"-01")
+rad_spacing <- 0.005 # increment for visualization of circular sectors
+
+site <-"rio_doce" # "sooretama" # "rio_doce" # "monte_pascoal" # "mata_escura"
+if (site == "rio_doce" | site == "mata_escura") {foresttype1 <- foresttypes[1]
+} else if (site == "monte_pascoal" | site == "sooretama") {foresttype1 <- foresttypes[2]
+} else {foresttype1 <- "NA"}
+study_site1ID <- match(site,studyarea_bases)
+park_name_1 <- all_parks[[study_site1ID]]
+S1_season[[study_site1ID]] -> S1_site1
+S2_season[[study_site1ID]] -> S2_site1
+S1_site1_mean_start_rad <- S1_site1$straddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+S2_site1_mean_start_rad <- S2_site1$straddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+S1_site1_mean_peak_rad <- S1_site1$peakraddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+S2_site1_mean_peak_rad <- S2_site1$peakraddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+
+site <-"sooretama" # "sooretama" # "rio_doce" # "monte_pascoal" # "mata_escura"
+if (site == "rio_doce" | site == "mata_escura") {foresttype2 <- foresttypes[1]
+} else if (site == "monte_pascoal" | site == "sooretama") {foresttype2 <- foresttypes[2]
+} else {foresttype2 <- "NA"}
+study_site2ID <- match(site,studyarea_bases)
+park_name_2 <- all_parks[[study_site2ID]]
+S1_season[[study_site2ID]] -> S1_site2
+S2_season[[study_site2ID]] -> S2_site2
+S1_site2_mean_start_rad <- S1_site2$straddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+S2_site2_mean_start_rad <- S2_site2$straddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+S1_site2_mean_peak_rad <- S1_site2$peakraddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+S2_site2_mean_peak_rad <- S2_site2$peakraddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+
+# set circular plot reference to season start
+S1_S2_site1_start_shift <- seq(S1_site1_mean_start_rad[[1]],S2_site1_mean_start_rad[[1]], rad_spacing)
+S1_S2_site2_start_shift <- seq(S1_site2_mean_start_rad[[1]],S2_site2_mean_start_rad[[1]], rad_spacing)
+
+plabel_site1 <- S2_site1_mean_start_rad - S1_site1_mean_start_rad ; plabel_site1 <- plabel_site1[[1]] %>% doy_convert() %>% round
+plabel_site2 <- S2_site2_mean_start_rad - S1_site2_mean_start_rad ; plabel_site2 <- plabel_site2[[1]] %>% doy_convert() %>% round
+S1_site1arrow <- S1_site1_mean_start_rad
+S2_site1arrow <- S2_site1_mean_start_rad
+S1_site2arrow <- S1_site2_mean_start_rad
+S2_site2arrow <- S2_site2_mean_start_rad
+
+# OR set circular plot reference to season peak
+# S1_S2_site1_peak_shift <- c(S1_site1_mean_peak_rad,S2_site1_mean_peak_rad)
+# S1_S2_site1_peak_shift <- c(seq(S1_S2_site1_peak_shift[[1]], 2*pi,rad_spacing), seq(0,S1_S2_site1_peak_shift[[2]],rad_spacing))
+# 
+# S1_S2_site2_peak_shift <- c(S1_site2_mean_peak_rad,S2_site2_mean_peak_rad)
+# S1_S2_site2_peak_shift <- c(seq(S1_S2_site2_peak_shift[[1]], 2*pi,rad_spacing), seq(0,S1_S2_site2_peak_shift[[2]],rad_spacing))
+
+# plabel_site1 <- S2_site1_mean_peak_rad - S1_site1_mean_peak_rad + 2*pi ; plabel_site1 <- plabel_site1[[1]] %>% doy_convert() %>% round
+# plabel_site2 <- S2_site2_mean_peak_rad - S1_site2_mean_peak_rad + 2*pi ; plabel_site2 <- plabel_site2[[1]] %>% doy_convert() %>% round
+# S1_site1refraddoy <- S1_site1$peakraddoy
+# S2_site1refraddoy <- S2_site1$peakraddoy
+# S1_site2refraddoy <- S1_site2$peakraddoy
+# S2_site2refraddoy <- S2_site2$peakraddoy
+
+
+
+# Create a plot for site 1
+par(mfrow = c(1, 1))
+# plot S1 annual refs site 1
+plot(circular(S1_site1refraddoy, type = "angles", units = "radians", zero=pi/2, rotation = "clock")
+          , tol=0.5, pch = 16, cex = 0.9, col="blue", stack = FALSE, axes = FALSE, template = NULL, start.sep=0
+          , control.circle=circle.control(col="grey70", lty=3))
+#plot S2 annual refs site 1
+points.circular(circular(S2_site1refraddoy, type = "angles", units = "radians", zero=pi/2, rotation = "clock"), pch = 16, cex = 0.9, col="#00B437", start.sep=0)
+#add arrows to indicate S1 mean ref site 1 values 
+arrows.circular(lwd = 2, shrink=0.9, col= "blue", S1_site1arrow, zero=pi/2)
+#add arrows to indicate S2 mean ref site 1 values 
+arrows.circular(lwd = 2, shrink=0.9, col= "#00B437", S2_site1arrow, zero=pi/2)
+#indicate lag for site 1
+points.circular(circular(S1_S2_site1_start_shift, type = "angles", units = "radians", zero=pi/2, rotation = "clock"), pch = 16, cex = 0.4, col=alpha("grey70",0.5), start.sep=-0.5)
+#add calendar dates to axis
+axis.circular(at=circular(vec.rev, zero=2*pi/3), labels=months2, tcl.text=-0.1, tcl=0.09)
+#phase annotation
+text(x=-0.35, y=-0.55, labels = paste0(plabel_site1, " days"), cex=1.2, col="grey60")
+#text(x=-2, y=2, labels = paste0(plabel_site2, " days"), cex=1.2, col="grey60")
+title(main = paste0("Multi-year seasonality summary (", hnum, " harmonic) of remote sensing indices \n(Sentinel-1 ", S1_band, " & Sentinel-2 ", S2_band, ") \n", park_name_1, " (", foresttype1, ")"), cex.main=1.5, line = -3.5)
+
+# Create a new plot for site 2
+plot.new()
+par(mfrow = c(1, 1))
+#plot S1 annual refs site 2
+plot(circular(S1_site2refraddoy, type = "angles", units = "radians", zero=pi/2, rotation = "clock")
+          , tol=0.5, pch = 16, cex = 0.9, col="blue", stack = FALSE, axes = FALSE, template = NULL, start.sep=0
+          , control.circle=circle.control(col="grey70", lty=3))
+#plot S2 annual refs site 2
+points.circular(circular(S2_site2refraddoy, type = "angles", units = "radians", zero=pi/2, rotation = "clock"), pch = 16, cex = 0.9, col="#00B437", start.sep=0)
+#add arrows to indicate S1 mean ref site 2 values 
+arrows.circular(lwd = 2, shrink=0.9, col= "blue", S1_site2arrow, zero=pi/2)
+#add arrows to indicate S2 mean ref site 2 values 
+arrows.circular(lwd = 2, shrink=0.9, col= "#00B437", S2_site2arrow, zero=pi/2)
+title(main = paste0("Multi-year seasonality summary (", hnum, " harmonic) of remote sensing indices \n(Sentinel-1 ", S1_band, " & Sentinel-2 ", S2_band, ") \n", park_name_2, " (", foresttype2, ")"), cex.main=1.5, line = -3.5)
+#indicate lag for site 2
+points.circular(circular(S1_S2_site2_start_shift, type = "angles", units = "radians", zero=pi/2, rotation = "clock"), pch = 16, cex = 0.4, col=alpha("grey70",0.5), start.sep=-0.5)
+#add calendar dates to axis
+axis.circular(at=circular(vec.rev, zero=2*pi/3), labels=months2, tcl.text=-0.1, tcl=0.09)
+#phase annotation
+text(x=-0.35, y=-0.55, labels = paste0(plabel_site2, " days"), cex=1.2, col="grey60")
+
+# # Combined legend
+# plot.new()
+# par(mfrow = c(1, 1))
+# title <- title(main=list("season \nmidpoint \nvalues      annual mean", cex=0.75), line=-5, adj=0)
+# points <- legend("center", legend = rep(NA, 4), col = rep(c("blue","#00B437"),2), pch = c(16,16,124,124), inset=1, ncol = 1, bty = "n", pt.cex = 1, x.intersp=2, y.intersp=0.9,  cex = 1, text.col = "black", horiz = F)
+#             
+# arrowhead <- legend(x = points$rect$left+0.05, y = points$rect$top, legend = rep(NA, 4), col = rep(c("blue","#00B437"),2), pch = rep(60,4), inset=1, ncol = 1, bty = "n", pt.cex = 1, x.intersp=1, y.intersp=0.9, cex = 1, text.col = "black", horiz = F)
+# 
+# legend(x = points$rect$left+0.05, y = points$rect$top,
+#   legend = c(paste0(S1_band, ", ", park_name_1), 
+#              paste0(S2_band, ", ", park_name_1), 
+#              paste0(S1_band, ", ", park_name_2),
+#              paste0(S2_band, ", ", park_name_2)), 
+#   col = rep(c("blue","#00B437"),2), lty = c(1,1,2,2), lwd = 2, ncol = 1, bty = "n", pt.cex = 1, x.intersp = 0.9, y.intersp=0.9, bg = NA, cex = 1, text.col = "black", horiz = F, title = title, title.adj=1)
+```
+
+B. Circular plot setup (Multiple Harmonic)
+```{r circ plot setup multiple, echo=FALSE}
+#Define study site
+site <-"rio_doce" # "sooretama" # "rio_doce" # "monte_pascoal" # "mata_escura"
+rad_spacing <- 0.005 # increment for visualization of circular sectors
+study_siteID <- match(site,studyarea_bases)
+park_name <- all_parks[[study_siteID]]
+
+#Import Data 
+S1_season[[study_siteID]] -> S1
+S2_season[[study_siteID]] -> S2
+
+if (site == "rio_doce" | site == "mata_escura") {foresttype <- foresttypes[1]
+} else if (site == "monte_pascoal" | site == "sooretama") {foresttype <- foresttypes[2]
+} else {foresttype <- "NA"}
+
+#circular axis formatting
+vec.expr <- c(0, pi/6, pi/3, pi/2, 2*pi/3, 5*pi/6, pi, 7*pi/6, 4*pi/3, 3*pi/2, 5*pi/3, 11*pi/6)
+vec.rev <- vec.expr %>% rev
+months <- as.Date(paste0("2001-", seq(1:12), "-01")) %>% format("%b")
+months2 <- paste0(months,"-01")
+
+#summary statistics for circular data
+S1start <- S1$straddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+S1end <- S1$endraddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+S2start <- S2$straddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+S2end <- S2$endraddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+S1_mean_peak_rad <- S1$peakraddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+S1_mean_season_rad <- S1$seashalfraddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+S1_mean_ensemble_rad <- S1$seasensraddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+S2_mean_peak_rad <- S2$peakraddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+S2_mean_season_rad <- S2$seashalfraddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+S2_mean_ensemble_rad <- S2$seasensraddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+
+#added circular plot features: season length ribbon, lag ribbons
+S1season_length <- date_seq(S1start, S1end)
+S2season_length <- date_seq(S2start, S2end)
+
+S1season_length_rad <- S1season_length %>% to_radians()
+S2season_length_rad <- S2season_length %>% to_radians()
+
+S1_S2_peak_shift <- seq(S1start, S2start, rad_spacing)
+S1_S2_peak_shift <- c(S1_mean_peak_rad,S2_mean_peak_rad)
+S1_S2_peak_shift <- c(seq(S1_S2_peak_shift[[1]], 2*pi,rad_spacing), seq(0,S1_S2_peak_shift[[2]],rad_spacing))
+S1_S2_seas_shift <- c(S1_mean_season_rad,S2_mean_season_rad)
+S1_S2_seas_shift <- c(seq(S1_S2_seas_shift[[1]], 2*pi,rad_spacing), seq(0,S1_S2_seas_shift[[2]],rad_spacing))
+S1_S2_ensemble_shift <- c(S1_mean_ensemble_rad,S2_mean_ensemble_rad)
+S1_S2_ensemble_shift <- c(seq(S1_S2_ensemble_shift[[1]], 2*pi,rad_spacing), seq(0,S1_S2_ensemble_shift[[2]],rad_spacing))
+```
+
+B. Circular plot multiple harmonic type 1: season peaks 
+```{r circ plot multiple: peaks}
+S1refraddoy <- S1$peakraddoy
+S2refraddoy <- S2$peakraddoy
+plabel <- S2_mean_peak_rad - S1_mean_peak_rad + 2*pi ; plabel <- plabel[[1]] %>% doy_convert() %>% round
+par(mar = c(3,2,2,1))
+
+plot(circular(S1refraddoy, type = "angles", units = "radians", zero=2*pi/3, rotation = "clock")
+          , tol=0.5, pch = 8, cex = 0.9, col="blue", stack = FALSE, axes = FALSE, template = NULL, start.sep=0
+          , control.circle=circle.control(col="grey70", lty=3))
+# add S2 peaks
+points.circular(circular(S2refraddoy, type = "angles", units = "radians", zero=pi/2, rotation = "clock"), pch = 8, cex = 0.9, col="#00B437", start.sep=0)
+# add S1 season length (connect from start date to end date)
+points.circular(circular(S1season_length_rad, type = "angles", units = "radians", zero=pi/2, rotation = "clock"), pch = 16, cex = 3.5, col= alpha("blue",0.2) , start.sep=-0.15)
+# add S2 season length
+points.circular(circular(S2season_length_rad, type = "angles", units = "radians", zero=pi/2, rotation = "clock"), pch = 16, cex = 3.5, col=alpha("green",0.2), start.sep=-0.35)
+#phase shift method 1
+points.circular(circular(S1_S2_peak_shift, type = "angles", units = "radians", zero=pi/2, rotation = "clock"), pch = 16, cex = 1.2, col=alpha("orange",0.5), start.sep=0.2)
+#add calendar dates to axis
+axis.circular(at=circular(vec.rev, zero=2*pi/3), labels=months2, tcl.text=-0.1, cex=1.2)
+#add arrows to indicate S1 mean peak values 
+arrows.circular(lwd = 2, shrink=1, col= "blue", S1_mean_peak_rad, zero=pi/2)
+#add arrows to indicate S2 mean peak values 
+arrows.circular(lwd = 2, shrink=1, col= "#00B437", S2_mean_peak_rad, zero=pi/2)
+title(main = paste0("Multi-year seasonality summary (", hnum, " harmonic) of remote sensing indices \n(Sentinel-1 ", S1_band, " & Sentinel-2 ", S2_band, ") \n", park_name, " (", foresttype, ")"), cex.main=1.5, line = -2)
+legend("right", title="Phase Shift Type", c("Peak"), fill=c("orange"), cex=0.8, bty = "n", shape="circle")
+text(x=-1, y=1, labels = paste0(plabel, " days"), cex=1.2, col="orange")
+```
+
+B. Circular plot multiple harmonic type 2: season midpoint-based 
+```{r circ plot multiple: season mid-point}
+S1refraddoy <- S1$seashalfraddoy
+S2refraddoy <- S2$seashalfraddoy
+plabel <- S2_mean_season_rad - S1_mean_season_rad + 2*pi ; plabel <- plabel[[1]] %>% doy_convert() %>% round
+
+plot(circular(S1refraddoy, type = "angles", units = "radians", zero=pi/2, rotation = "clock")
+          , tol=0.5, pch = 8, cex = 0.9, col="blue", stack = FALSE, axes = FALSE, template = NULL, start.sep=0
+          , control.circle=circle.control(col="grey70", lty=3))
+# add S2 peaks
+points.circular(circular(S2refraddoy, type = "angles", units = "radians", zero=pi/2, rotation = "clock"), pch = 8, cex = 0.9, col="#00B437", start.sep=0)
+# add S1 season length (connect from start date to end date)
+points.circular(circular(S1season_length_rad, type = "angles", units = "radians", zero=pi/2, rotation = "clock"), pch = 16, cex = 3.5, col= alpha("blue",0.2) , start.sep=-0.15)
+# add S2 season length
+points.circular(circular(S2season_length_rad, type = "angles", units = "radians", zero=pi/2, rotation = "clock"), pch = 16, cex = 3.5, col=alpha("green",0.2), start.sep=-0.35)
+#phase shift method 1
+points.circular(circular(S1_S2_seas_shift, type = "angles", units = "radians", zero=pi/2, rotation = "clock"), pch = 16, cex = 1.2, col=alpha("pink",0.5), start.sep=0.2)
+#add calendar dates to axis
+axis.circular(at=circular(vec.rev, zero=2*pi/3), labels=months2, tcl.text=-0.1, cex=1.2)
+#add arrows to indicate S1 mean peak values 
+arrows.circular(lwd = 2, shrink=1, col= "blue", circular(median(S1refraddoy), type = "angles", units = "radians", rotation = "clock"), zero=pi/2)
+#add arrows to indicate S2 mean peak values 
+arrows.circular(lwd = 2, shrink=1, col= "#00B437", circular(median(S2refraddoy), type = "angles", units = "radians", rotation = "clock"), zero=pi/2)
+title(main = paste0("Multi-year seasonality summary (", hnum, " harmonic) of remote sensing indices \n(Sentinel-1 ", S1_band, " & Sentinel-2 ", S2_band, ") \n", site, " (", foresttype, ")"), cex.main=1.5, line = -2)
+legend("right", title="Phase Shift Type", c("Season Midpoint"), fill=c("pink"), cex=0.8, bty = "n", shape="circle")
+text(x=-1, y=1, labels = paste0(plabel, " days"), cex=1.2, col="pink")
+```
+
+B. Circular plot multiple harmonic type 3: season ensemble
+```{r circ plot multiple: ensemble}
+S1refraddoy <- S1$seasensraddoy
+S2refraddoy <- S2$seasensraddoy
+plabel <- S2_mean_ensemble_rad - S1_mean_ensemble_rad + 2*pi ; plabel <- plabel[[1]] %>% doy_convert() %>% round
+
+plot(circular(S1refraddoy, type = "angles", units = "radians", zero=pi/2, rotation = "clock")
+          , tol=0.5, pch = 8, cex = 0.9, col="blue", stack = FALSE, axes = FALSE, template = NULL, start.sep=0
+          , control.circle=circle.control(col="grey70", lty=3))
+# add S2 peaks
+points.circular(circular(S2refraddoy, type = "angles", units = "radians", zero=pi/2, rotation = "clock"), pch = 8, cex = 0.9, col="#00B437", start.sep=0)
+# add S1 season length (connect from start date to end date)
+points.circular(circular(S1season_length_rad, type = "angles", units = "radians", zero=pi/2, rotation = "clock"), pch = 16, cex = 3.5, col= alpha("blue",0.2) , start.sep=-0.15)
+# add S2 season length
+points.circular(circular(S2season_length_rad, type = "angles", units = "radians", zero=pi/2, rotation = "clock"), pch = 16, cex = 3.5, col=alpha("green",0.2), start.sep=-0.35)
+#phase shift method 1
+points.circular(circular(S1_S2_ensemble_shift, type = "angles", units = "radians", zero=pi/2, rotation = "clock"), pch = 16, cex = 1.2, col=alpha("purple",0.5), start.sep=0.2)
+#add calendar dates to axis
+axis.circular(at=circular(vec.rev, zero=2*pi/3), labels=months2, tcl.text=-0.1, cex=1.2)
+#add arrows to indicate S1 mean peak values 
+arrows.circular(lwd = 2, shrink=1, col= "blue", circular(median(S1refraddoy), type = "angles", units = "radians", rotation = "clock"), zero=pi/2)
+#add arrows to indicate S2 mean peak values 
+arrows.circular(lwd = 2, shrink=1, col= "#00B437", circular(median(S2refraddoy), type = "angles", units = "radians", rotation = "clock"), zero=pi/2)
+title(main = paste0("Multi-year seasonality summary (", hnum, " harmonic) of remote sensing indices \n(Sentinel-1 ", S1_band, " & Sentinel-2 ", S2_band, ") \n", studyarea, " (", foresttype, ")"), cex.main=1.5, line = -2)
+legend("right", title="Phase Shift Type", c("Season Ensemble"), fill=c("purple"), cex=0.8, bty = "n", shape="circle")
+text(x=-1, y=1, labels = paste0(plabel, " days"), cex=1.2, col="purple")
+```
+
+B. Circular Plot (multiple harmonic separate plots: season midpoint, 4 plots total)
+```{r circ plot single separate plots: season midpoint, echo=TRUE}
+#setup
+hnum <- "multiple"
+vec.expr <- c(0, pi/6, pi/3, pi/2, 2*pi/3, 5*pi/6, pi, 7*pi/6, 4*pi/3, 3*pi/2, 5*pi/3, 11*pi/6)
+vec.rev <- vec.expr %>% rev
+months <- as.Date(paste0("2001-", seq(1:12), "-01")) %>% format("%b")
+months2 <- paste0(months," 1st")
+
+site <-"rio_doce" # "sooretama" # "rio_doce" # "monte_pascoal" # "mata_escura"
+if (site == "rio_doce" | site == "mata_escura") {foresttype1 <- foresttypes[1]
+} else if (site == "monte_pascoal" | site == "sooretama") {foresttype1 <- foresttypes[2]
+} else {foresttype1 <- "NA"}
+study_site1ID <- match(site,studyarea_bases)
+park_name_1 <- all_parks[[study_site1ID]]
+S1_season[[study_site1ID]] -> S1_site1
+S2_season[[study_site1ID]] -> S2_site1
+S1_site1_mean_seas_rad <- S1_site1$seashalfraddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+S2_site1_mean_seas_rad <- S2_site1$seashalfraddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+
+site <-"sooretama" # "sooretama" # "rio_doce" # "monte_pascoal" # "mata_escura"
+if (site == "rio_doce" | site == "mata_escura") {foresttype2 <- foresttypes[1]
+} else if (site == "monte_pascoal" | site == "sooretama") {foresttype2 <- foresttypes[2]
+} else {foresttype2 <- "NA"}
+study_site2ID <- match(site,studyarea_bases)
+park_name_2 <- all_parks[[study_site2ID]]
+S1_season[[study_site2ID]] -> S1_site2
+S2_season[[study_site2ID]] -> S2_site2
+S1_site2_mean_seas_rad <- S1_site2$seashalfraddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+S2_site2_mean_seas_rad <- S2_site2$seashalfraddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+
+S1_site1refraddoy <- S1_site1$seashalfraddoy
+S2_site1refraddoy <- S2_site1$seashalfraddoy
+S1_site2refraddoy <- S1_site2$seashalfraddoy
+S2_site2refraddoy <- S2_site2$seashalfraddoy
+
+
+#initialize circular plot with 4 sections
+par(mfrow = c(2, 2), mar = rep(0,4))
+#plot S1 peaks site one
+plot(circular(S1_site1refraddoy, type = "angles", units = "radians", zero=pi/2, rotation = "clock")
+          , tol=0.5, pch = 16, cex = 0.9, col="blue", stack = FALSE, axes = FALSE, template = NULL, start.sep=0
+          , control.circle=circle.control(col="grey70", lty=3))
+#add arrows to indicate S1 mean peak site one values 
+arrows.circular(lwd = 2, shrink=0.9, col= "blue", S1_site1_mean_seas_rad, zero=pi/2)
+#add calendar dates to axis
+axis.circular(at=circular(vec.rev, zero=2*pi/3), labels=months2, tcl.text=-0.25, tcl=0.09, cex = 0.9)
+
+#new plot S2 peaks site one
+plot(circular(S2_site1refraddoy, type = "angles", units = "radians", zero=pi/2, rotation = "clock")
+          , tol=0.5, pch = 16, cex = 0.9, col="#00B437", stack = FALSE, axes = FALSE, template = NULL, start.sep=0
+          , control.circle=circle.control(col="grey70", lty=3))
+#add arrows to indicate S2 mean peak site two values 
+arrows.circular(lwd = 2, shrink=0.9, col= "#00B437", S2_site1_mean_seas_rad, zero=pi/2)
+#add calendar dates to axis
+axis.circular(at=circular(vec.rev, zero=2*pi/3), labels=months2,  tcl.text=-0.25, tcl=0.09, cex = 0.9)
+
+#new plot S1 peaks site two
+#add arrows to indicate S1 mean peak site two values
+plot(circular(vec.rev, type = "angles", units = "radians", zero=pi/2, rotation = "clock")
+          , tol=0.5, pch = 16, cex = 0.9, col=alpha("red",0), stack = FALSE, axes = FALSE, template = NULL, start.sep=0
+          , control.circle=circle.control(col="grey70", lty=3))
+arrows.circular(lwd = 2, lty = 2, shrink=0.9, col= "blue", S1_site2_mean_seas_rad, zero=pi/2, rotation = "clock")
+#add peaks but using tick marks
+axis.circular(at=circular(S1_site2refraddoy, zero=pi/2, rotation = "clock"), cex=1.2, lwd=2.5, col="blue", labels=rep("", length(S1_site2refraddoy)))
+#add calendar dates to axis
+axis.circular(at=circular(vec.rev, zero=2*pi/3), labels=months2, tcl.text=-0.25, tcl=0.15, cex = 0.9)
+
+#new plot S2 peaks site two
+#add arrows to indicate S2 mean peak site two values
+plot(circular(vec.rev, type = "angles", units = "radians", zero=pi/2, rotation = "clock")
+          , tol=0.5, pch = 16, cex = 0.9, col=alpha("red",0), stack = FALSE, axes = FALSE, template = NULL, start.sep=0
+          , control.circle=circle.control(col="grey70", lty=3))
+arrows.circular(lwd = 2, lty = 2, shrink=0.9, col= "#00B437", S2_site2_mean_seas_rad, zero=pi/2, rotation = "clock")
+#add peaks but using tick marks
+axis.circular(at=circular(S2_site2refraddoy, zero=pi/2, rotation = "clock"), cex=1.2, lwd=2.5, col="#00B437", labels=rep("", length(S2_site2refraddoy)))
+#add calendar dates to axis
+axis.circular(at=circular(vec.rev, zero=2*pi/3), labels=months2, tcl.text=-0.25, tcl=0.15, cex = 0.9)
+
+#title(main = paste0("Multi-year seasonality summary (", hnum, " harmonic) of remote sensing indices \n(Sentinel-1 ", S1_band, " & Sentinel-2 ", S2_band, ") \n", park_name_1, " (", foresttype1, ")", " &\n", park_name_1, " (", foresttype2, ")"), cex.main=1.5, line = -3.5)
+
+plot.new()
+par(mfrow = c(1, 1))
+title <- title(main=list("season \nmidpoint \nvalues      annual mean", cex=0.75), line=-5, adj=0)
+points <- legend("center", legend = rep(NA, 4), col = rep(c("blue","#00B437"),2), pch = c(16,16,124,124), inset=1, ncol = 1, bty = "n", pt.cex = 1, x.intersp=2, y.intersp=0.9,  cex = 1, text.col = "black", horiz = F)
+            
+arrowhead <- legend(x = points$rect$left+0.05, y = points$rect$top, legend = rep(NA, 4), col = rep(c("blue","#00B437"),2), pch = rep(60,4), inset=1, ncol = 1, bty = "n", pt.cex = 1, x.intersp=1, y.intersp=0.9, cex = 1, text.col = "black", horiz = F)
+
+legend(x = points$rect$left+0.05, y = points$rect$top,
+  legend = c(paste0(S1_band, ", ", park_name_1), 
+             paste0(S2_band, ", ", park_name_1), 
+             paste0(S1_band, ", ", park_name_2),
+             paste0(S2_band, ", ", park_name_2)), 
+  col = rep(c("blue","#00B437"),2), lty = c(1,1,2,2), lwd = 2, ncol = 1, bty = "n", pt.cex = 1, x.intersp = 0.9, y.intersp=0.9, bg = NA, cex = 1, text.col = "black", horiz = F, title = title, title.adj=1)
+```
+
+B. Circular Plot (multiple harmonic separate plots: start of season, 4 plots total)
+```{r circ plot single separate plots: season midpoint, echo=TRUE}
+#setup
+hnum <- "multiple"
+vec.expr <- c(0, pi/6, pi/3, pi/2, 2*pi/3, 5*pi/6, pi, 7*pi/6, 4*pi/3, 3*pi/2, 5*pi/3, 11*pi/6)
+vec.rev <- vec.expr %>% rev
+months <- as.Date(paste0("2001-", seq(1:12), "-01")) %>% format("%b")
+months2 <- paste0(months," 1st")
+
+site <-"rio_doce" # "sooretama" # "rio_doce" # "monte_pascoal" # "mata_escura"
+if (site == "rio_doce" | site == "mata_escura") {foresttype1 <- foresttypes[1]
+} else if (site == "monte_pascoal" | site == "sooretama") {foresttype1 <- foresttypes[2]
+} else {foresttype1 <- "NA"}
+study_site1ID <- match(site,studyarea_bases)
+park_name_1 <- all_parks[[study_site1ID]]
+S1_season[[study_site1ID]] -> S1_site1
+S2_season[[study_site1ID]] -> S2_site1
+S1_site1_mean_start_rad <- S1_site1$straddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+S2_site1_mean_start_rad <- S2_site1$straddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+
+site <-"sooretama" # "sooretama" # "rio_doce" # "monte_pascoal" # "mata_escura"
+if (site == "rio_doce" | site == "mata_escura") {foresttype2 <- foresttypes[1]
+} else if (site == "monte_pascoal" | site == "sooretama") {foresttype2 <- foresttypes[2]
+} else {foresttype2 <- "NA"}
+study_site2ID <- match(site,studyarea_bases)
+park_name_2 <- all_parks[[study_site2ID]]
+S1_season[[study_site2ID]] -> S1_site2
+S2_season[[study_site2ID]] -> S2_site2
+S1_site2_mean_start_rad <- S1_site2$straddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+S2_site2_mean_start_rad <- S2_site2$straddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+
+S1_site1refraddoy <- S1_site1$straddoy
+S2_site1refraddoy <- S2_site1$straddoy
+S1_site2refraddoy <- S1_site2$straddoy
+S2_site2refraddoy <- S2_site2$straddoy
+
+
+#initialize circular plot with 4 sections
+par(mfrow = c(2, 2), mar = rep(0,4))
+#plot S1 start of season site one
+plot(circular(S1_site1refraddoy, type = "angles", units = "radians", zero=pi/2, rotation = "clock")
+          , tol=0.5, pch = 16, cex = 0.9, col="blue", stack = FALSE, axes = FALSE, template = NULL, start.sep=0
+          , control.circle=circle.control(col="grey70", lty=3))
+#add arrows to indicate S1 mean start of season site one values 
+arrows.circular(lwd = 2, shrink=0.9, col= "blue", S1_site1_mean_start_rad, zero=pi/2)
+#add calendar dates to axis
+axis.circular(at=circular(vec.rev, zero=2*pi/3), labels=months2, tcl.text=-0.25, tcl=0.09, cex = 0.9)
+
+#new plot S2 start of season site one
+plot(circular(S2_site1refraddoy, type = "angles", units = "radians", zero=pi/2, rotation = "clock")
+          , tol=0.5, pch = 16, cex = 0.9, col="#00B437", stack = FALSE, axes = FALSE, template = NULL, start.sep=0
+          , control.circle=circle.control(col="grey70", lty=3))
+#add arrows to indicate S2 mean start of season site two values 
+arrows.circular(lwd = 2, shrink=0.9, col= "#00B437", S2_site1_mean_start_rad, zero=pi/2)
+#add calendar dates to axis
+axis.circular(at=circular(vec.rev, zero=2*pi/3), labels=months2,  tcl.text=-0.25, tcl=0.09, cex = 0.9)
+
+#new plot S1 peaks site two
+#add arrows to indicate S1 mean start of season site two values
+plot(circular(vec.rev, type = "angles", units = "radians", zero=pi/2, rotation = "clock")
+          , tol=0.5, pch = 16, cex = 0.9, col=alpha("red",0), stack = FALSE, axes = FALSE, template = NULL, start.sep=0
+          , control.circle=circle.control(col="grey70", lty=3))
+arrows.circular(lwd = 2, lty = 2, shrink=0.9, col= "blue", S1_site2_mean_start_rad, zero=pi/2, rotation = "clock")
+#add S1 start of season values using tick marks
+axis.circular(at=circular(S1_site2refraddoy, zero=pi/2, rotation = "clock"), cex=1.2, lwd=2.5, col="blue", labels=rep("", length(S1_site2refraddoy)))
+#add calendar dates to axis
+axis.circular(at=circular(vec.rev, zero=2*pi/3), labels=months2, tcl.text=-0.25, tcl=0.15, cex = 0.9)
+
+#new plot S2 start of season site two
+#add arrows to indicate S2 mean start of season site two values
+plot(circular(vec.rev, type = "angles", units = "radians", zero=pi/2, rotation = "clock")
+          , tol=0.5, pch = 16, cex = 0.9, col=alpha("red",0), stack = FALSE, axes = FALSE, template = NULL, start.sep=0
+          , control.circle=circle.control(col="grey70", lty=3))
+arrows.circular(lwd = 2, lty = 2, shrink=0.9, col= "#00B437", S2_site2_mean_start_rad, zero=pi/2, rotation = "clock")
+#add S2 start of season values using tick marks
+axis.circular(at=circular(S2_site2refraddoy, zero=pi/2, rotation = "clock"), cex=1.2, lwd=2.5, col="#00B437", labels=rep("", length(S2_site2refraddoy)))
+#add calendar dates to axis
+axis.circular(at=circular(vec.rev, zero=2*pi/3), labels=months2, tcl.text=-0.25, tcl=0.15, cex = 0.9)
+
+#title(main = paste0("Multi-year seasonality summary (", hnum, " harmonic) of remote sensing indices \n(Sentinel-1 ", S1_band, " & Sentinel-2 ", S2_band, ") \n", park_name_1, " (", foresttype1, ")", " &\n", park_name_1, " (", foresttype2, ")"), cex.main=1.5, line = -3.5)
+
+plot.new()
+par(mfrow = c(1, 1))
+title <- title(main=list("season \nstart of season \nvalues      annual mean", cex=0.75), line=-5, adj=0)
+points <- legend("center", legend = rep(NA, 4), col = rep(c("blue","#00B437"),2), pch = c(16,16,124,124), inset=1, ncol = 1, bty = "n", pt.cex = 1, x.intersp=2, y.intersp=0.9,  cex = 1, text.col = "black", horiz = F)
+            
+arrowhead <- legend(x = points$rect$left+0.05, y = points$rect$top, legend = rep(NA, 4), col = rep(c("blue","#00B437"),2), pch = rep(60,4), inset=1, ncol = 1, bty = "n", pt.cex = 1, x.intersp=1, y.intersp=0.9, cex = 1, text.col = "black", horiz = F)
+
+legend(x = points$rect$left+0.05, y = points$rect$top,
+  legend = c(paste0(S1_band, ", ", park_name_1), 
+             paste0(S2_band, ", ", park_name_1), 
+             paste0(S1_band, ", ", park_name_2),
+             paste0(S2_band, ", ", park_name_2)), 
+  col = rep(c("blue","#00B437"),2), lty = c(1,1,2,2), lwd = 2, ncol = 1, bty = "n", pt.cex = 1, x.intersp = 0.9, y.intersp=0.9, bg = NA, cex = 1, text.col = "black", horiz = F, title = title, title.adj=1)
+```
+
+B. Create a new plot for the legend
+```{legend for circular plot r}
+# Create a new plot for the legend
+plot.new()
+par(mfrow = c(1, 1))
+title("season midpoint values    annual mean", line=-18)
+points <- legend("center", legend = rep(NA, 4), col = rep(c("blue","#00B437"),2), pch = c(16,16,124,124), inset=1, ncol = 1, bty = "n", pt.cex = 1, x.intersp=2, y.intersp=0.75,  cex = 1, text.col = "black", horiz = F)
+            
+arrowhead <- legend(x = points$rect$left+0.05, y = points$rect$top, legend = rep(NA, 4), col = rep(c("blue","#00B437"),2), pch = rep(60,4), inset=1, ncol = 1, bty = "n", pt.cex = 1, x.intersp=1, y.intersp=0.75, cex = 1, text.col = "black", horiz = F)
+
+legend(x = points$rect$left+0.05, y = points$rect$top,
+  legend = c(paste0(S1_band, ", ", park_name_1), 
+             paste0(S2_band, ", ", park_name_1), 
+             paste0(S1_band, ", ", park_name_2),
+             paste0(S2_band, ", ", park_name_2)), 
+  col = rep(c("blue","#00B437"),2), lty = c(1,1,2,2), lwd = 2, ncol = 1, bty = "n", pt.cex = 1, x.intersp = 0.25, y.intersp=0.75, bg = NA, cex = 1, text.col = "black", horiz = F)
+```
+
+B. Circular Plot (multiple harmonic two sites compared: start of season OR season midpoint, 2 plots total)
+```{r circ plot multiple two sites compared: seas. or midpoint, 2 plots total}
+#setup
+hnum <- "multiple"
+vec.expr <- c(0, pi/6, pi/3, pi/2, 2*pi/3, 5*pi/6, pi, 7*pi/6, 4*pi/3, 3*pi/2, 5*pi/3, 11*pi/6)
+vec.rev <- vec.expr %>% rev
+months <- as.Date(paste0("2001-", seq(1:12), "-01")) %>% format("%b")
+months2 <- paste0(months,"-01")
+rad_spacing <- 0.005 # increment for visualization of circular sectors
+
+circ_mean <- function(data) {
+  circular_data <- data %>% circular(rotation = "clock")
+  mean_value <- mean(circular_data, na.rm = TRUE)
+  fixed_value <- circular_negative_fixed(mean_value)
+  fixed_value
+}
+
+site <-"rio_doce" # "sooretama" # "rio_doce" # "monte_pascoal" # "mata_escura"
+if (site == "rio_doce" | site == "mata_escura") {foresttype1 <- foresttypes[1]
+} else if (site == "monte_pascoal" | site == "sooretama") {foresttype1 <- foresttypes[2]
+} else {foresttype1 <- "NA"}
+study_site1ID <- match(site,studyarea_bases)
+park_name_1 <- all_parks[[study_site1ID]]
+S1_season[[study_site1ID]] -> S1_site1
+S2_season[[study_site1ID]] -> S2_site1
+S1_site1_mean_start_rad <- S1_site1$straddoy %>% circ_mean()
+S2_site1_mean_start_rad <- S2_site1$straddoy %>% circ_mean()
+S1_site1_mean_peak_rad <- S1_site1$peakraddoy %>% circ_mean()
+S2_site1_mean_peak_rad <- S2_site1$peakraddoy %>% circ_mean()
+
+site <-"sooretama" # "sooretama" # "rio_doce" # "monte_pascoal" # "mata_escura"
+if (site == "rio_doce" | site == "mata_escura") {foresttype2 <- foresttypes[1]
+} else if (site == "monte_pascoal" | site == "sooretama") {foresttype2 <- foresttypes[2]
+} else {foresttype2 <- "NA"}
+study_site2ID <- match(site,studyarea_bases)
+park_name_2 <- all_parks[[study_site2ID]]
+S1_season[[study_site2ID]] -> S1_site2
+S2_season[[study_site2ID]] -> S2_site2
+S1_site2_mean_start_rad <- S1_site2$straddoy %>% circ_mean()
+S2_site2_mean_start_rad <- S2_site2$straddoy %>% circ_mean()
+S1_site2_mean_peak_rad <- S1_site2$peakraddoy %>% circ_mean()
+S2_site2_mean_peak_rad <- S2_site2$peakraddoy %>% circ_mean()
+
+# set circular plot reference to season start
+S1_S2_site1_start_shift <- seq(S1_site1_mean_start_rad[[1]],S2_site1_mean_start_rad[[1]], rad_spacing)
+S1_S2_site2_start_shift <- seq(S1_site2_mean_start_rad[[1]],S2_site2_mean_start_rad[[1]], rad_spacing)
+
+plabel_site1 <- S2_site1_mean_start_rad - S1_site1_mean_start_rad ; plabel_site1 <- plabel_site1[[1]] %>% doy_convert() %>% round
+plabel_site2 <- S2_site2_mean_start_rad - S1_site2_mean_start_rad ; plabel_site2 <- plabel_site2[[1]] %>% doy_convert() %>% round
+
+S1_site1arrow <- S1_site1_mean_start_rad
+S2_site1arrow <- S2_site1_mean_start_rad
+S1_site2arrow <- S1_site2_mean_start_rad
+S2_site2arrow <- S2_site2_mean_start_rad
+
+S1_site1refraddoy <- S1_site1$straddoy
+S2_site1refraddoy <- S2_site1$straddoy
+S1_site2refraddoy <- S1_site2$straddoy
+S2_site2refraddoy <- S2_site2$straddoy
+
+# OR set circular plot reference to season peak
+# S1_S2_site1_peak_shift <- c(S1_site1_mean_peak_rad,S2_site1_mean_peak_rad)
+# S1_S2_site1_peak_shift <- c(seq(S1_S2_site1_peak_shift[[1]], 2*pi,rad_spacing), seq(0,S1_S2_site1_peak_shift[[2]],rad_spacing))
+
+# S1_S2_site2_peak_shift <- c(S1_site2_mean_peak_rad,S2_site2_mean_peak_rad)
+# S1_S2_site2_peak_shift <- c(seq(S1_S2_site2_peak_shift[[1]], 2*pi,rad_spacing), seq(0,S1_S2_site2_peak_shift[[2]],rad_spacing))
+
+# plabel_site1 <- S2_site1_mean_peak_rad - S1_site1_mean_peak_rad + 2*pi ; plabel_site1 <- plabel_site1[[1]] %>% doy_convert() %>% round
+# plabel_site2 <- S2_site2_mean_peak_rad - S1_site2_mean_peak_rad + 2*pi ; plabel_site2 <- plabel_site2[[1]] %>% doy_convert() %>% round
+
+# S1_site1arrow <- S1_site1_mean_peak_rad
+# S2_site1arrow <- S2_site1_mean_peak_rad
+# S1_site2arrow <- S1_site2_mean_peak_rad
+# S2_site2arrow <- S2_site2_mean_peak_rad
+
+# S1_site1refraddoy <- S1_site1$peakraddoy
+# S2_site1refraddoy <- S2_site1$peakraddoy
+# S1_site2refraddoy <- S1_site2$peakraddoy
+# S2_site2refraddoy <- S2_site2$peakraddoy
+
+
+# Create a plot for site 1
+plot.new()
+par(mfrow = c(1, 1))
+# plot S1 annual refs site 1
+plot(circular(S1_site1refraddoy, type = "angles", units = "radians", zero=pi/2, rotation = "clock")
+          , tol=0.5, pch = 16, cex = 0.9, col="blue", stack = FALSE, axes = FALSE, template = NULL, start.sep=0
+          , control.circle=circle.control(col="grey70", lty=3))
+#plot S2 annual refs site 1
+points.circular(circular(S2_site1refraddoy, type = "angles", units = "radians", zero=pi/2, rotation = "clock"), pch = 16, cex = 0.9, col="#00B437", start.sep=0)
+#add arrows to indicate S1 mean ref site 1 values 
+arrows.circular(lwd = 2, shrink=0.9, col= "blue", S1_site1arrow, zero=pi/2)
+#add arrows to indicate S2 mean ref site 1 values 
+arrows.circular(lwd = 2, shrink=0.9, col= "#00B437", S2_site1arrow, zero=pi/2)
+#indicate lag for site 1
+points.circular(circular(S1_S2_site1_start_shift, type = "angles", units = "radians", zero=pi/2, rotation = "clock"), pch = 16, cex = 0.4, col=alpha("grey70",0.5), start.sep=-0.5)
+#add calendar dates to axis
+axis.circular(at=circular(vec.rev, zero=2*pi/3), labels=months2, tcl.text=-0.1, tcl=0.09)
+#phase annotation
+text(x=-0.7, y=0, labels = paste0(plabel_site1, "\ndays"), cex=1.2, col="grey60")
+#text(x=-2, y=2, labels = paste0(plabel_site2, " days"), cex=1.2, col="grey60")
+title(main = paste0("Multi-year seasonality summary (", hnum, " harmonic) of remote sensing indices \n(Sentinel-1 ", S1_band, " & Sentinel-2 ", S2_band, ") \n", park_name_1, " (", foresttype1, ")"), cex.main=1.5, line = -3.5)
+
+# Create a new plot for site 2
+plot.new()
+par(mfrow = c(1, 1))
+#plot S1 annual refs site 2
+plot(circular(S1_site2refraddoy, type = "angles", units = "radians", zero=pi/2, rotation = "clock")
+          , tol=0.5, pch = 16, cex = 0.9, col="blue", stack = FALSE, axes = FALSE, template = NULL, start.sep=0
+          , control.circle=circle.control(col="grey70", lty=3))
+#plot S2 annual refs site 2
+points.circular(circular(S2_site2refraddoy, type = "angles", units = "radians", zero=pi/2, rotation = "clock"), pch = 16, cex = 0.9, col="#00B437", start.sep=0)
+#add arrows to indicate S1 mean ref site 2 values 
+arrows.circular(lwd = 2, shrink=0.9, col= "blue", S1_site2arrow, zero=pi/2)
+#add arrows to indicate S2 mean ref site 2 values 
+arrows.circular(lwd = 2, shrink=0.9, col= "#00B437", S2_site2arrow, zero=pi/2)
+title(main = paste0("Multi-year seasonality summary (", hnum, " harmonic) of remote sensing indices \n(Sentinel-1 ", S1_band, " & Sentinel-2 ", S2_band, ") \n", park_name_2, " (", foresttype2, ")"), cex.main=1.5, line = -3.5)
+#indicate lag for site 2
+points.circular(circular(S1_S2_site2_start_shift, type = "angles", units = "radians", zero=pi/2, rotation = "clock"), pch = 16, cex = 0.4, col=alpha("grey70",0.5), start.sep=-0.5)
+#add calendar dates to axis
+axis.circular(at=circular(vec.rev, zero=2*pi/3), labels=months2, tcl.text=-0.1, tcl=0.09)
+#phase annotation
+text(x=-0.7, y=0, labels = paste0(plabel_site2, "\ndays"), cex=1.2, col="grey60")
+
+# # Combined legend
+# plot.new()
+# par(mfrow = c(1, 1))
+# title <- title(main=list("season \nmidpoint \nvalues      annual mean", cex=0.75), line=-5, adj=0)
+# points <- legend("center", legend = rep(NA, 4), col = rep(c("blue","#00B437"),2), pch = c(16,16,124,124), inset=1, ncol = 1, bty = "n", pt.cex = 1, x.intersp=2, y.intersp=0.9,  cex = 1, text.col = "black", horiz = F)
+#             
+# arrowhead <- legend(x = points$rect$left+0.05, y = points$rect$top, legend = rep(NA, 4), col = rep(c("blue","#00B437"),2), pch = rep(60,4), inset=1, ncol = 1, bty = "n", pt.cex = 1, x.intersp=1, y.intersp=0.9, cex = 1, text.col = "black", horiz = F)
+# 
+# legend(x = points$rect$left+0.05, y = points$rect$top,
+#   legend = c(paste0(S1_band, ", ", park_name_1), 
+#              paste0(S2_band, ", ", park_name_1), 
+#              paste0(S1_band, ", ", park_name_2),
+#              paste0(S2_band, ", ", park_name_2)), 
+#   col = rep(c("blue","#00B437"),2), lty = c(1,1,2,2), lwd = 2, ncol = 1, bty = "n", pt.cex = 1, x.intersp = 0.9, y.intersp=0.9, bg = NA, cex = 1, text.col = "black", horiz = F, title = title, title.adj=1)
+```
+
+B. Circular Plot (multiple harmonic two sites compared: season midpoint)
+```{r}
+#setup
+hnum <- "multiple"
+vec.expr <- c(0, pi/6, pi/3, pi/2, 2*pi/3, 5*pi/6, pi, 7*pi/6, 4*pi/3, 3*pi/2, 5*pi/3, 11*pi/6)
+vec.rev <- vec.expr %>% rev
+months <- as.Date(paste0("2001-", seq(1:12), "-01")) %>% format("%b")
+months2 <- paste0(months,"-01")
+rad_spacing <- 0.005 # increment for visualization of circular sectors
+
+site <-"rio_doce" # "sooretama" # "rio_doce" # "monte_pascoal" # "mata_escura"
+if (site == "rio_doce" | site == "mata_escura") {foresttype1 <- foresttypes[1]
+} else if (site == "monte_pascoal" | site == "sooretama") {foresttype1 <- foresttypes[2]
+} else {foresttype1 <- "NA"}
+study_site1ID <- match(site,studyarea_bases)
+park_name_1 <- all_parks[[study_site1ID]]
+S1_season[[study_site1ID]] -> S1_site1
+S2_season[[study_site1ID]] -> S2_site1
+S1_site1_mean_seashalf_rad <- S1_site1$seashalfraddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+S2_site1_mean_seashalf_rad <- S2_site1$seashalfraddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+
+site <-"sooretama" # "sooretama" # "rio_doce" # "monte_pascoal" # "mata_escura"
+if (site == "rio_doce" | site == "mata_escura") {foresttype2 <- foresttypes[1]
+} else if (site == "monte_pascoal" | site == "sooretama") {foresttype2 <- foresttypes[2]
+} else {foresttype2 <- "NA"}
+study_site2ID <- match(site,studyarea_bases)
+park_name_2 <- all_parks[[study_site2ID]]
+S1_season[[study_site2ID]] -> S1_site2
+S2_season[[study_site2ID]] -> S2_site2
+S1_site2_mean_seashalf_rad <- S1_site2$seashalfraddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+S2_site2_mean_seashalf_rad <- S2_site2$seashalfraddoy %>% circular(rotation = "clock") %>% mean(na.rm=T) %>% circular_negative_fixed()
+
+
+S1_S2_site1_seashalf_shift <- c(S1_site1_mean_seashalf_rad,S2_site1_mean_seashalf_rad)
+S1_S2_site1_seashalf_shift <- c(seq(S1_S2_site1_seashalf_shift[[1]], 2*pi,rad_spacing), seq(0,S1_S2_site1_seashalf_shift[[2]],rad_spacing))
+
+S1_S2_site2_seashalf_shift <- c(S1_site2_mean_seashalf_rad,S2_site2_mean_seashalf_rad)
+S1_S2_site2_seashalf_shift <- c(seq(S1_S2_site2_seashalf_shift[[1]], 2*pi,rad_spacing), seq(0,S1_S2_site2_seashalf_shift[[2]],rad_spacing))
+S1_S2_site2_seashalf_shift <- S1_S2_site2_seashalf_shift[c(rep(FALSE, 20), TRUE)]
+
+#make dashed lines for site 2
+#dashstart <- S1_S2_site2_peak_shift[c(rep(FALSE, 50), TRUE)]
+#seq <- dashstart; for (i in 1:25) {seq[i+1] <- seq[i] + rad_spacing ; S1_S2_site2_peak_shift <- c(S1_S2_site2_peak_shift, seq[i+1])}
+
+#circular plot
+plabel_site1 <- S2_site1_mean_seashalf_rad - S1_site1_mean_seashalf_rad + 2*pi ; plabel_site1 <- plabel_site1[[1]] %>% doy_convert() %>% round
+plabel_site2 <- S2_site2_mean_seashalf_rad - S1_site2_mean_seashalf_rad + 2*pi ; plabel_site2 <- plabel_site2[[1]] %>% doy_convert() %>% round
+S1_site1refraddoy <- S1_site1$seashalfraddoy
+S2_site1refraddoy <- S2_site1$seashalfraddoy
+S1_site2refraddoy <- S1_site2$seashalfraddoy
+S2_site2refraddoy <- S2_site2$seashalfraddoy
+par(mfrow = c(1, 1))
+
+#plot S1 peaks site one
+plot(circular(S1_site1refraddoy, type = "angles", units = "radians", zero=2*pi/3, rotation = "clock")
+          , tol=0.5, pch = 16, cex = 0.9, col="blue", stack = FALSE, axes = FALSE, template = NULL, start.sep=0
+          , control.circle=circle.control(col="grey70", lty=3))
+#plot S2 peaks site one
+points.circular(circular(S2_site1refraddoy, type = "angles", units = "radians", zero=2*pi/3, rotation = "clock"), pch = 16, cex = 0.9, col="#00B437", start.sep=0)
+#plot S1 peaks site two
+axis.circular(at=circular(S1_site2refraddoy, zero=2*pi/3, rotation = "clock"), cex=1.2, lwd=2.5, col="blue", labels=rep("", length(S1_site2refraddoy)))
+#plot S2 peaks site two
+axis.circular(at=circular(S2_site2refraddoy, zero=2*pi/3, rotation = "clock"), cex=1.2, lwd=2.5, col="#00B437", labels=rep("", length(S2_site2refraddoy)))
+#add arrows to indicate S1 mean peak site one values 
+arrows.circular(lwd = 2, shrink=0.9, col= "blue", S1_site1_mean_seashalf_rad, zero=2*pi/3)
+#add arrows to indicate S2 mean peak site two values 
+arrows.circular(lwd = 2, shrink=0.9, col= "#00B437", S2_site1_mean_seashalf_rad, zero=2*pi/3)
+#add arrows to indicate S1 mean peak site two values 
+arrows.circular(lwd = 2, lty = 2, shrink=0.9, col= "blue", S1_site2_mean_seashalf_rad, zero=2*pi/3)
+#add arrows to indicate S2 mean peak values 
+arrows.circular(lwd = 2, lty = 2, shrink=0.9, col= "#00B437", S2_site2_mean_seashalf_rad, zero=2*pi/3)
+title(main = paste0("Multi-year seasonality summary (", hnum, " harmonic) of remote sensing indices \n(Sentinel-1 ", S1_band, " & Sentinel-2 ", S2_band, ") \n", park_name_1, " (", foresttype1, ")", " &\n", park_name_1, " (", foresttype2, ")"), cex.main=1.5, line = -3.5)
+#indicate phase shift for sites 1 and 2
+points.circular(circular(S1_S2_site1_seashalf_shift, type = "angles", units = "radians", zero=2*pi/3, rotation = "clock"), pch = 16, cex = 0.4, col=alpha("grey70",0.5), start.sep=-0.5)
+points.circular(circular(S1_S2_site2_seashalf_shift, type = "angles", units = "radians", zero=2*pi/3, rotation = "clock"), pch = 16, cex = 0.4, col=alpha("grey70",0.5), start.sep=-0.7)
+#add calendar dates to axis
+axis.circular(at=circular(vec.rev, zero=2*pi/3), labels=months2, tcl.text=-0.1, tcl=0.09)
+#phase annotation
+text(x=-0.25, y=0.48, labels = paste0(plabel_site1, " days\n\n                ", plabel_site2, " days"), cex=1.2, col="grey60")
+#text(x=-2, y=2, labels = paste0(plabel_site2, " days"), cex=1.2, col="grey60")
+
+# Create a new plot for the legend
+plot.new()
+par(mfrow = c(1, 1))
+title <- title(main=list("season \nmidpoint \nvalues      annual mean", cex=0.75), line=-5, adj=0)
+points <- legend("center", legend = rep(NA, 4), col = rep(c("blue","#00B437"),2), pch = c(16,16,124,124), inset=1, ncol = 1, bty = "n", pt.cex = 1, x.intersp=2, y.intersp=0.9,  cex = 1, text.col = "black", horiz = F)
+            
+arrowhead <- legend(x = points$rect$left+0.05, y = points$rect$top, legend = rep(NA, 4), col = rep(c("blue","#00B437"),2), pch = rep(60,4), inset=1, ncol = 1, bty = "n", pt.cex = 1, x.intersp=1, y.intersp=0.9, cex = 1, text.col = "black", horiz = F)
+
+legend(x = points$rect$left+0.05, y = points$rect$top,
+  legend = c(paste0(S1_band, ", ", park_name_1), 
+             paste0(S2_band, ", ", park_name_1), 
+             paste0(S1_band, ", ", park_name_2),
+             paste0(S2_band, ", ", park_name_2)), 
+  col = rep(c("blue","#00B437"),2), lty = c(1,1,2,2), lwd = 2, ncol = 1, bty = "n", pt.cex = 1, x.intersp = 0.9, y.intersp=0.9, bg = NA, cex = 1, text.col = "black", horiz = F, title = title, title.adj=1)
+```
+
+save plot (not working)
+```{r save circular plot}
+png(paste0(wd, "/", study_site, "_circular_seasonality_peak_", hnum, "_harmonic.png"), units="in", width=12, height=12, res=300)
+```
+
+Additional Plotting: raw vs fitted time series
+```{r}
+#read in data
+S1_single_dir <- "/raw/s1/1ha/harmonic/"
+S2_single_dir <- "/raw/s2/1ha/harmonic/"
+S1_timesat_dir <- "/timesat/output/third_run/S1/"
+S2_timesat_dir <- "/timesat/output/third_run/S2/"
+S1_start_date <- as.Date("2016-01-10")
+S2_start_date <- as.Date("2018-12-17")
+
+#Choose indices and sites
+S1_band <- "RVI" ; S2_band <- "EVI2" 
+site_1 <- "mata_escura" ; site_2 <- "monte_pascoal" ; site_3 <- "rio_doce" ; site_4 <- "sooretama"
+
+
+#import time series
+S1_combined_single <- dir(paste0(wd, S1_single_dir), pattern = "harmonic_model_data.csv", full.names=T) %>% map(read.csv, row.names = NULL)
+S2_combined_single <- 
+S1_combined_multiple <- read.csv(paste0(wd, S1_timesat_dir, "S1_timesat_model_combined_data.csv"))
+S2_combined_multiple <- read.csv(paste0(wd, S2_timesat_dir, "S2_timesat_model_combined_data.csv"))
+```
+
+misc plot code
+```{r}
+
+vals <- S1_raw[[1]][,2]
+fits <- S1_fits[[1]]
+rads <- S1_raw[[1]][,2]
+radlim <- c(-15, -10, -5, 0)
+
+chist(circular(S1_fits[[1]]$radday))
+
+
+radial.plot(vals,rads,rp.type="s", point.col = 2, point.symbols=46, 
+            clockwise=TRUE, start = pi/6, label.pos = vec.expr,
+            radial.lim=radlim,  labels=c("February 1","March 1",
+                                                      "April 1","May 1","June 1","July 1","August 1","September 1",
+                                                      "October 1","November 1","December 1","January 1"))
+radial.plot(fits,rads,rp.type="s", point.col = 1, point.symbols='*', 
+            clockwise=TRUE, start = pi/2, add=TRUE, radial.lim=radlim)
+
+
+radial.plot(fitted(simploess),t3old[,2],rp.type="p", line.col="blue", 
+            clockwise=TRUE, start = pi/2, add=TRUE, radial.lim=radlim)
+
+dvm = function(v, mu=0, kappa=1) # von Mises density
+  exp(kappa * cos(v - mu)) * (2 * pi * besselI(kappa, 0))^(-1)
+f = function(x) 1/3 * dvm(x, pi/4, 5) + 2/3 * dvm(x, pi, 20)
+
+cdensity(f)
+```
+
+```{r}
+#summarize by daily mean across years and samples 
+indexdata.mean <- indexdata$VH %>% 
+                  reshape::melt(id = "date") %>%
+                  mutate(doy = ymd(paste0("1901-", month(date), "-", day(date))))  %>%
+                  distinct() %>%
+                  group_by(doy) %>%
+                  summarize(mean = mean(value, na.rm = TRUE)) 
+
+#append converted days % summarize by month
+indexdata.mean <- indexdata.mean %>% 
+                  mutate("VH_13" = ifelse(mean>=-13.011, 1, 0)) %>%
+                  group_by(month(doy)) %>%
+                  count(VH_13) %>% mutate("month" = `month(doy)`, "VH_count" = n) %>%
+                  filter(VH_13==1) 
+#                  select(month, VH_count)
+
+vec.labels <- seq(ymd('2000-01-01'),ymd('2000-12-01'),by='months') %>% format('%b')
+  
+ggplot(data=indexdata.mean, aes(x=month, y=VH_count)) +
+  coord_polar(theta='x', start = 0, direction=1) +
+  geom_col(fill="light grey") +
+  theme_minimal() +
+  geom_text(aes(label = VH_count), color="blue") +
+  scale_y_continuous("Number of days/month VH greater than -13.270") +
+  scale_x_continuous(limits = c(0,12), breaks=seq(0,12), labels=c(vec.labels,".")) +
+  theme(axis.text.y = element_blank(),
+         axis.ticks.y = element_blank() )
+#        axis.title.x = element_blank(),
+#        axis.text.x = element_blank()) +
+ # annotate(geom = "text",
+#           x = 1:nrow(indexdata.mean),
+#           y = min(indexdata.mean$VH_count),
+#           label = indexdata.mean$month)
+
+ggsave(paste0(studyarea_base,"_polar1.png"), units="in", width=10, height=5, dpi=300, device = 'png')
+```
+
+```{r}
+#circular stats
+#circular mean 
+
+#circular median
+
+#circular Kappa (measure of spread) - based on Von Mises Distribution
+
+```
+
+```{r}
+#Rayleigh Test of Uniformity
+rayleigh.test((x, mu = NULL))
+## S3 method for class 'rayleigh.test'
+print(x, digits=4, ...)
+
+```
+
+```{r}
+#daily circular plot, using plot.circular
+
+#format days as integer day of year
+degree_days <- plotmeans$doy %>% format(format = "%j") %>% as.numeric()
+
+#convert day (degrees) to radians and threshold EVI values
+radian_days <- 2*pi*degree_days/365
+
+#circular plot
+
+#vec.breaks <- seq(from = pi/2, to = 2*pi, by = pi/2)
+#pi.halfs <- c(paste(expression(pi), "/2"),
+#  paste(seq(from = 3, to = 4, by = 2), "*" , expression(pi), "/2"))
+#pi.fulls <- c(paste(expression(pi)),
+#  paste(seq(from = 2, to = 2, by = 1), "*" , expression(pi)))
+#vec.expr <- parse(text = c(rbind(pi.halfs, pi.fulls)))[1:4]
+vec.expr <- c(0, pi/6, pi/3, pi/2, 2*pi/3, 5*pi/6, pi, 7*pi/6, 4*pi/3, 3*pi/2, 5*pi/3, 11*pi/6)
+
+#plot, but can't seem to place gridlines at above intervals.. 
+plot.circular(circular(plotmeans$radian_days, units="radians", template = NULL))
+```
+
+```{r}
+#circular stats
+#circular mean 
+
+#circular median
+
+#circular Kappa (measure of spread) - based on Von Mises Distribution
+
+```
+
+```{r}
+#circular linear regression modeling from S1 & S2 data
+lm.circular(..., type=c("c-c", "c-l"))
+lm.circular.cc(y, x, order = 1, level = 0.05, control.circular = list())
+lm.circular.cl(y, x, init = NULL, verbose = FALSE, tol = 1e-10, 
+  control.circular = list())
+# S3 method for lm.circular.cl
+print(x, digits = max(3, getOption("digits") - 3), 
+  signif.stars= getOption("show.signif.stars"), ...)
+```
+
+misc code
+```{r}
+S1_path <- paste0(wd, "/raw/s1/1ha/harmonic/")
+S1_files <- dir(S1_path, full.names = T, pattern = "RVI_2016_2022_harmonic.csv")
+S1_season <- S1_files %>% map(read.csv, header=T)
+
+minlist <- c(); maxlist <- c() ;
+for (site in 1:length(S1_files)) {
+  range <- range(S1_season[[site]]$fitted, na.rm=T) ; minlist <- c(minlist, range[1]) ; maxlist <- c(maxlist, range[2])
+  }
+minval <- min(minlist) ; maxval <- max(maxlist)
+breaks <- seq(minval, maxval, length.out = 10)
+
+binned <- S1_season[[1]] %>% mutate(val_bin = cut(fitted, breaks=breaks))
+
+# xts convert function
+#xts_convert <- function (table) {
+#      names(table)[1] <- "Date"
+#      table <- table %>% mutate(Date = date_parse(Date, format = "%b %d, %Y")) %>% group_by(Date) %>%
+#                         summarize_all(mean) %>% data.frame()
+#      rownames(table) <- table$Date
+#      table <- table %>% select(-c(Date)) %>% xts(order.by = as.Date(rownames(table)), "%Y-%m-%d")
+#      table
+#}
+
+#S1_season[[1]][-c(3)] %>% xts_convert  # raw
+#S1_season[[1]][-c(2)] %>% xts_convert  $ fits
+
+#loop through and extract seasonality metrics for each file
+S1_fits <- list() ; S1_raw <- list()
+for (file in 1:length(S1_season)) {
+  #fitted
+  fit_table <- S1_season[[file]] # extract table from the file, drop unnecessary columns
+  names(fit_table)[1] <- "Date"    # rename date
+  fit_table <- fit_table %>% mutate(Date = date_parse(Date, format = "%b %d, %Y")) %>% group_by(Date) %>%
+                         summarize_all(mean) %>% data.frame()
+  S1_fits[[file]] <- fit_table[-c(2)] 
+  S1_raw[[file]] <- fit_table[-c(3)]
+  
+  S1_raw[[file]][,"doy"] <- S1_raw[[file]]$Date %>% yday()
+  S1_raw[[file]][,"radday"] <- 2*pi*S1_raw[[file]]$doy/365
+  S1_fits[[file]][,"doy"] <- S1_raw[[file]]$Date %>% yday()
+  S1_fits[[file]][,"radday"] <- 2*pi*S1_raw[[file]]$doy/365
+  names <- names(fit_table[2:3])
+  S1_raw[[file]] <-  S1_raw[[file]] %>% group_by(doy) %>% summarize_all(mean, na.rm = TRUE)
+  S1_fits[[file]] <- S1_fits[[file]] %>% group_by(doy) %>% summarize_all(mean, na.rm = TRUE)
+}
+```

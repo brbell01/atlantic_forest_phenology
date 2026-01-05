@@ -1,0 +1,450 @@
+---
+title: "S2 Phenology Plotting"
+author: "J. Bruce Bell"
+date: "`r Sys.Date()`"
+---
+Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Imports
+```{r echo=FALSE}
+library(knitr)
+library(tidyr)
+library(lubridate)
+library(scales)
+library(ggthemes)
+library(ggtext)
+library(stringr)
+library(dplyr)
+library(ggplot2)
+library(purrr)
+library(data.table)
+library(tibble)
+library(geojsonio)
+library(sf)
+library(tidyquant)
+library(circular)
+```
+
+Import processed Sentinel-2 data tables
+```{r}
+#working directory
+setwd("/Users/brbell01/Google Drive/PHD/CUNY/Research/R/Phenology/raw/")
+wd <- getwd()
+
+#Parameters to be altered
+foresttype <-"Seasonal Semi-deciduous Forest" # "Seasonal Semi-deciduous Forest"; "Broadleaf Evergreen"
+studyarea <-  "PE Rio Doce"  #  "REBIO Mata Escura, MG" ; "PNH Monte Pascoal" ; "REBIO Sooretama" ; "PE Rio Doce"
+studyarea_base <- "rio_doce" # "mata_escura" ; "monte_pascoal" ; "sooretama" ; "rio_doce"
+
+#Seasonal determination from harmonic analysis for the study area
+max_doy <- 335  # Dec. 1 (Monte Pascoal) ; max_doy <- 61 #  Feb. 3 (Mata Escura)
+min_doy <- 156  # June 5 (Monte Pascoal)
+
+#import
+band.list <- c("EVI2", "EVI", "NDVI")
+indexdata <- vector(mode = "list", length = 0)
+for (band in band.list) {
+      table <- read.csv(paste0(wd, "/s2/1ha/second_run/", studyarea_base, "_s2_1ha_", band,   
+                        "_processed.csv"))
+      table <- table[,!names(table) %in% c("X")] %>% mutate(date = ymd(date))
+      indexdata[[band]] <- table
+}
+```
+
+Process plot medians
+```{r}
+indexmedians <- vector(mode = "list", length = 0)
+for (band in band.list) {
+      medians <- indexdata[[band]] %>% gather("Hectare_ID", value, -date) %>% group_by(date) %>%     
+                         filter(!grepl('sd', Hectare_ID)) %>%
+                         summarize(median(value, na.rm=TRUE)) %>% mutate(date = ymd(date))
+      names(medians)[2] <- paste0(band,"_hectare_medians")
+      indexmedians[[band]] <- medians
+}
+```
+
+Add information about data gaps
+```{r}
+#adds a column which indicates the number of images missing from time series averages
+int <- 5 #  Sentinel-2 repeat interval (days)
+indexmeans$EVI$missing %<>% indexmeans$EVI$date %>% diff() %>% divide_by(int) %>% subtract(1)
+```
+
+
+```{r}
+#define outlier function
+remove_outliers <- function(x, na.rm = TRUE, ...) {
+  qnt <- quantile(x, probs=c(.1, .9), na.rm = na.rm, ...)
+  H <- 1.5 * IQR(x, na.rm = na.rm)
+  y <- x
+  y[x < (qnt[1] - H)] <- NA
+  y[x > (qnt[2] + H)] <- NA
+  y
+}
+```
+
+```{r}
+#optional: park mean EVI values time series for overplot
+park.mean <- read.csv("/Users/brbell01/Google Drive/PHD/CUNY/Research/R/Phenology/raw/s2/Park/mata_escura_s2_Park_processed.csv")
+park.mean <- park_mean %>% select(date, EVI_Park) %>% mutate(date = ymd(date), EVI_Park) %>%
+mutate(EVI_Park = remove_outliers(EVI_Park)) %>% na.omit()
+```
+
+Plotting: Raw time series
+```{r}
+#choose which band to plot
+bandname <- "EVI2`"
+plotdata <- gather(indexdata[[bandname]], "Hectare_ID", value, -date)  %>% 
+  filter(!grepl('sd', Hectare_ID)) %>%
+  na.omit()
+plotsds <- gather(indexdata[[bandname]], "Hectare_ID", value, -date)  %>% filter(grepl('sd', Hectare_ID)) %>%
+  na.omit()
+bandmeans <- indexmeans[[bandname]]
+
+#plot time series 
+ggplot(data=plotdata, aes(x = date, y = value %>% remove_outliers())) +  
+  geom_point(aes(colour = Hectare_ID), size=0.8, alpha = 0.3) +
+  geom_line(data=bandmeans, aes(x=date, y=unlist(bandmeans[,2]) %>% remove_outliers()),
+       color = "dark green", size=0.8) +
+       theme_minimal(base_size = 14) +
+       scale_x_date(date_labels = "%b, %Y"
+               , date_breaks = "3 month"
+               , expand = expansion(add = .05) 
+                ) +
+#      scale_y_continuous(limits = ylims) +
+       xlab("Month, Year") +
+       ylab(paste0(bandname," index value")) +
+       theme(legend.position = "none"
+             ,axis.text.x = element_text(angle = 45)) +
+       ggtitle(paste0("Sentinel-2 ", bandname, " surface reflectance values \n for ", length(unique(plotdata$Hectare_ID)), 
+       " 1-ha plots over ", foresttype, ",\n", studyarea, ", Brazil"))
+```
+
+Save Plot
+```{r}
+ggsave(paste0("plotraw_s2_", bandname, ".png"), units="in", width=10, height=5, dpi=300, device = 'png')
+#dev.off()
+```
+
+Plotting: looking at within-plot variance
+```{r}
+bandname <- "EVI"
+plotsds.stats <- plotsds %>% group_by(Hectare_ID) %>%    #group and reorder ascending
+              mutate(mean = mean(value, na.rm = TRUE)) %>%
+              mutate(Hectare_ID = substring(Hectare_ID, 18)) %>%
+              ungroup()
+#ylims <- c(0,30)
+ggplot(data=plotsds.stats, aes(x = Hectare_ID, y = value^2 %>% remove_outliers())) +  
+  geom_boxplot(aes(colour = mean)) +
+ # geom_line(data=plotmeans, aes(x=date, y=unlist(plotmeans[,2]) %>% remove_outliers()),
+ #      color = "grey25", size=0.8) +
+       theme_minimal(base_size = 14) +
+       scale_y_continuous(breaks = pretty_breaks())+
+ #                         ,limits = ylims) +
+       ylab(paste0("variance in \n", bandname, " index")) +
+       theme(legend.position = "none"
+             ,axis.text.x = element_text(angle = 90, vjust=0.5), 
+             panel.grid.major.x = element_blank()) +
+       ggtitle(paste0("Plot-wise variance in Sentinel-2 ", bandname," surface reflectance values \n for ", length(unique(plotdata$Hectare_ID)), " 1 Ha plots over ", foresttype, ",\n", studyarea, ", Brazil"))
+```
+
+Save Plot
+```{r}
+ggsave(paste0("boxplots_variance_s2_", bandname, ".png"), units="in", width=10, height=5, dpi=300, device = 'png')
+#dev.off()
+```
+
+
+Variance:  alternate plotting
+```{r}
+bandname <- "EVI"
+plotsds.stats <- plotsds %>% group_by(Hectare_ID) %>%    #group and reorder ascending
+              mutate(median = median(value, na.rm = TRUE)) %>%
+              mutate(Hectare_ID = substring(Hectare_ID, 18)) %>%
+              ungroup() %>% arrange(median)
+
+plotsds.stats$Hectare_ID <- factor(plotsds.stats$Hectare_ID, levels = unique(plotsds.stats$Hectare_ID))
+
+labels <- tibble(
+   median = unique(plotsds.stats$median),
+   Hectare_ID = unique(plotsds.stats$Hectare_ID)
+)
+  
+ylims <- c(0,0.005)
+ggplot(data=plotsds.stats, aes(x = median^2, y = Hectare_ID, fill = stat(x))) +  
+      geom_density_ridges_gradient(aes(scale = 2, rel_min_height = 0.01)) +
+      theme_ridges() +
+      geom_label(data = labels, aes(y = Hectare_ID, x = median^2, alpha = 1/100), label = labels$Hectare_ID, label.size = NA) +
+      #scale_x_continuous(limits = ylims, breaks = seq(0,0.005, 0.0005)) +
+      scale_fill_viridis_c(name = "Variance \n(median within-plot)", option = "C") +
+      xlab(paste0(bandname, " variance")) +
+      theme(legend.position = "none", axis.text.y = element_blank(), axis.ticks.y = element_blank()) +
+      ggtitle(paste0("Plot-wise variance in Sentinel-2 ", bandname," surface reflectance values \n for ",  
+                     length(unique(plotdata$Hectare_ID)), " ", scale, " plots over ", foresttype, ",\n", studyarea, ", Brazil"))
+```
+Save Plot
+```{r}
+ggsave(paste0("ridges_variance_s2_", bandname, ".png"), units="in", width=15, height=7.5, dpi=300, device = 'png')
+#dev.off()
+```
+
+
+Plotting: Mean EVI2/NDVI time series
+```{r}
+bandname <- "EVI2"
+indexmedians <- data.frame(Reduce(cbind, indexmedians)) %>% 
+              select(date,paste0(band.list,"_hectare_medians")) 
+ #             pivot_longer(cols = contains("medians"), names_to = "band_name", values_to = "value", values_drop_na = TRUE) 
+
+colors <- c("all plots median EVI2"="dark green", "all plots median NDVI" = "green")
+
+#means.merged <- park.mean %>% 
+#                select(date, EVI_Park) %>%
+#                full_join(indexdata.plotmeans, by="date") 
+ylims <- c()
+#plot time series 
+ggplot(data=indexmedians, aes(x = date)) +  
+  geom_line(aes(y=EVI_hectare_medians, color = "all plots median EVI2")) +
+  geom_line(aes(y=NDVI_hectare_medians, color = "all plots median NDVI")) +
+  scale_color_manual(name = "Legend", values= colors) +
+ # scale_linetype_manual(name = "Legend", values= linetypes) +
+ # stat_summary(geom = "line", fun = "median") +
+ # stat_summary(geom = "ribbon", fun.data = "mean_cl_normal", alpha = 0.3) +
+ # geom_line(data = park_mean, aes(x=date, y=EVI_Park), linetype='dotdash', color="grey25", size=0.5) +
+       theme_minimal(base_size = 14) +
+       scale_x_date(date_labels = "%b,%Y"
+#               , limits = ymd(c("1901-11-01", "1901-12-31"))
+               , date_breaks = "3 month"
+#               , minor_breaks = "1 day"
+               , expand = expansion(add = .05) 
+                ) +
+#       scale_y_continuous(limits = ylims) +
+       xlab("Month, Year") +
+       ylab("index value") +
+       theme(legend.position = "right"
+             ,axis.text.x = element_text(angle = 45)) +
+       
+       ggtitle(paste0("Median Sentinel-2 index values (surface reflectance) \n for ", length(unique(plotdata$Hectare_ID)), 
+       " 1-ha plots over ", foresttype, ",\n", studyarea, ", Brazil"))
+```
+
+Save Plot
+```{r}
+ggsave("plot_bands_s2.png", units="in", width=10, height=5, dpi=300, device = 'png')
+#dev.off()
+```
+
+Exploration: Mean annual visualization
+```{r}
+#prep and plot annual average time series 
+ylims <- c(0.2,0.8)
+plotmeans <- plotdata %>%
+mutate(doy = ymd(paste0("1901-", month(date), "-", day(date))))  %>%
+filter(value > 0) %>% distinct() %>%
+group_by(doy) %>%
+summarize(mean = mean(value, na.rm = TRUE), stdev = sd(value, na.rm = TRUE)) %>%
+                       mutate(mean = remove_outliers(mean))
+
+color <- paste0(bandname,", 15-day \n moving average") %>% c(.= "dark green")
+
+plotmeans %>%
+ggplot(aes(x = doy, y = mean)) + 
+       geom_ribbon(aes(x=doy, ymin = mean-stdev, ymax = mean+stdev)
+                   , fill = "grey90", alpha = 0.55, color = NA) +
+       geom_ma(ma_fun = SMA, inherit.aes = TRUE, n=15, show.legend = TRUE, color = "dark green") +
+       geom_point(alpha=0.4, size = 0.7, color = "green") +
+       theme_minimal(base_size = 14) +
+       theme(panel.grid.major.x = element_line(color = "grey45", size = (0.3)),
+             panel.grid.major.y =  element_line(size = (0.1), color = "grey"),
+             panel.grid.minor = element_line(size = (0.1), color = "grey")) +
+       scale_color_manual(name = "Legend", values = color) +
+       scale_y_continuous(limits = ylims, breaks = pretty_breaks()) +
+       scale_x_date(date_labels = "%b %d"
+#               , limits = ymd(c("1901-11-01", "1901-12-31"))
+               , date_breaks = "1 month"
+#               , minor_breaks = "1 day"
+               , expand = expansion(add = .05) 
+                ) +
+       xlab(paste0("Month-Day (", year(max(indexdata.plot$date))-year(min(indexdata.plot$date)), "-yr average)")) +
+       ylab(paste0("mean ", bandname," index value")) +
+       theme(legend.position = "none"
+             ,axis.text.x = element_text(angle = 45)) +
+       ggtitle(paste0("Sentinel-2 ", bandname, " annual average surface reflectance values \n ", length(unique(plotdata$Hectare_ID)), 
+       " 1-ha plots over ", foresttype, ",\n", studyarea, ", Brazil"))
+```
+
+Save Plot
+```{r}
+ggsave("plotannual_s2.png", units="in", width=10, height=5, dpi=300, device = 'png')
+#dev.off()
+```
+
+Statistical Analysis: Significant difference between seasons? (Single Harmonic Seasonal Definition)
+```{r}
+n <- length(unique(plotdata$Hectare_ID))
+#indexdata_m <- indexdata %>% select(c(1:all_of(n)))  #break up means/stdevs
+#indexdata_sd <- indexdata %>% select(-c(2:all_of(n)))
+range <- max_doy-min_doy
+season_def <- c(0, min_doy - range/2, min_doy + range/2, 365)
+
+plotstats <- plotdata %>% 
+              mutate(day = yday(date)) %>%  #create a month factor
+              mutate(season=cut(day, #create season factor
+#           breaks=c(0, 4, 10, 12),  
+              labels=c("wet","dry","wet"))) %>%  #define seasons   
+              mutate(year = year(date)) %>%  #create a year factor
+              mutate(Hectare_ID = substring(Hectare_ID, 15))
+plotstats <- data.frame(value = indexdata.stats$value, Hectare_ID =  #rearrange
+                   factor(indexdata.stats$Hectare_ID), 
+                      season = factor(indexdata.stats$season), 
+    
+                                     year = factor(indexdata.stats$year))
+# Check Boxplots
+ylims <- c(0,1)
+colors <- c("wet" = "blue", "dry" = "orange")
+plotstats %>% 
+  #na.omit() %>% 
+  ggplot(aes(y=value, x=Hectare_ID, color = season, fill = season)) + 
+  geom_boxplot(outlier.size=0.5, outlier.colour = NULL) + 
+  scale_fill_manual(values=c("blue", "orange")) +
+  scale_color_manual(values=c("blue", "orange")) +
+  scale_y_continuous(limits = ylims) +
+  ylab(paste0("Mean ", bandname, " index value")) +
+  theme_minimal(base_size = 14) +
+  ggtitle(paste0("Plot-wise seasonal comparison of mean annual ", bandname, " values \n (Sentinel-2) for ", n, " ", scale, " plots, ",     
+  studyarea, ", Brazil"))
+```
+
+Save Plot
+```{r}
+ggsave("plot_s2_seasonal.png", units="in", width=10, height=5, dpi=300, device = 'png')
+```
+
+Statistical Analysis: ANOVA (Single Harmonic Seasonal Definition)
+```{r}
+#fit the linear model 
+fit <- lm(value ~ Hectare_ID*year*season, plotstats, 
+          contrasts = list(Hectare_ID = "contr.sum", year = "contr.poly"))
+anova(fit) %>% kable(digits = 3)
+```
+
+
+```{r}
+# Plot time series
+### Choose study site 
+study_site <-"sooretama" # "sooretama" # "rio_doce" # "monte_pascoal" # "mata_escura"
+study_siteID <- match(study_site,study_site_names)
+S2_plot <- S2_combined[[study_siteID]] %>% pivot_longer(cols = contains(S2_band)) 
+S2_plot$name <- S2_plot$name %>% sub(paste0(study_site,"_"),"", .)
+S2_plot <- S2_plot %>% group_by(name)
+S2_season_offset <- S2_int
+raw_name <- S2_band ; fit_name <- paste0(S2_band, " fit") ; trend_name <- paste0(S2_band, " trend")
+colors = c(raw_name = "blue", fit_name = "red", trend_name = "grey60")
+ylims <- c(0,1)
+rects <- data.frame(Jans = as.Date(paste0(seq(from=2019, to=2020),"-01-01")),
+                    Peaks = S2_season[[study_siteID]]$peak_date-8*S2_season_offset) %>% mutate(Diffvals = Peaks-Jans)
+
+ggplot(data=S2_plot, aes(x = Date, y=value, color = name)) + 
+  geom_line() +
+  #geom_line(aes(y = value, color = raw_name)) +
+  #geom_line(aes(y = value, color = fit_name), lwd=1.5) +
+  #geom_line(aes(y = value, color = trend_name), lwd=1.5) +
+  geom_point(data = S2_season[[study_siteID]], 
+             aes(x = season_start_date-S2_season_offset, y=`Start.val.`), color="red") +
+  geom_point(data = S2_season[[study_siteID]], 
+             aes(x = season_end_date-S2_season_offset, y=`End.val.`), color="red") +
+  geom_point(size = 1.9, data = S2_season[[study_siteID]], 
+             aes(x = peak_date-8*S2_season_offset, y=`Peak.val.`), color="purple") +
+  geom_rect(data=rects, inherit.aes=FALSE,
+            aes(xmin=Jans,xmax=Peaks,ymin=ylims[1],ymax=ylims[2]), fill = "purple", color = NA, alpha=0.2) +
+  geom_text(data=rects, inherit.aes=FALSE, color = "purple",
+            aes(label = paste0("phase = ",Diffvals), x=Jans + 150, y=0.95)) +
+  #annotate("rect",xmin=as.Date(paste0(seq(from=2016, to=2021),"-01-01")),xmax=peak_date,ymin=-Inf,ymax=Inf, alpha=0.1, fill="black") +
+  #  geom_line(aes(y = VHVV_ratio_hectare_medians, colour = "all plots median VHVVV ratio")) +
+  #  geom_line(aes(y = RVI_hectare_medians, colour = "all plots median RVI composite")) +
+  scale_color_manual(name = "Legend: \n All 1-ha plots \n (median)", values= c("blue", "red", "grey60")) +
+  # stat_summary(geom = "line", fun = "median") +
+  # stat_summary(geom = "ribbon", fun.data = "mean_cl_normal", alpha = 0.3) +
+  # geom_line(data = park_mean, aes(x=date, y=VH_Park), linetype='dotdash', color="grey25", size=0.5) +
+  theme_minimal(base_size = 14) +
+  scale_x_date(date_labels = "%b,%Y"
+               #               , limits = ymd(c("1901-11-01", "1901-12-31"))
+               , date_breaks = "3 month"
+               #               , minor_breaks = "1 day"
+               , expand = expansion(add = .05) 
+  ) +
+  scale_y_continuous(limits = ylims, breaks = breaks_pretty()) +
+  labs(x = "Month, Year", y = paste0("Sentinel-2 (", S2_band, ")")) +
+  theme(legend.position = "right"
+        , axis.text.x = element_text(angle = 45)) 
+#ggtitle(paste0("Sentinel-1 backscatter (RVI ratio), original and fitted ", 
+#               " 1-ha plots) \nover ", foresttype, ",\n", studyarea, ", Brazil"))
+```
+
+Save 
+```{r}
+ggsave(paste0(study_site, "_", S2_band, "_timesat_S2.png"), units="in", width=10, height=5, dpi=300, device = 'png')
+#dev.off()
+```
+
+Prep data for statistical analysis by circular statistics
+```{r}
+#summarize by daily mean across years and samples 
+plotmeans <- indexdata %>% reshape::melt(id = "date") %>%
+                  mutate(doy = ymd(paste0("1901-", month(date), "-", day(date))))  %>%
+                  filter(value > 0) %>% distinct() %>%
+                  group_by(doy) %>%
+                  summarize(mean = mean(value, na.rm = TRUE)) 
+
+#append converted days % summarize by month
+plotmeans <- plotmeans %>% 
+                  mutate("EVI_05" = ifelse(mean>=0.523, 1, 0)) %>%
+                  group_by(month(doy)) %>%
+                  count(EVI_05) %>% mutate("month" = `month(doy)`,       
+                  "EVI_count" = n) %>%
+                  filter(EVI_05==1) %>%
+                  select(month, EVI_count)
+
+vec.labels <- seq(ymd('2000-01-01'),ymd('2000-12-01'),by='months') %>% format('%b')
+vec.breaks <- seq(from=0, to=12, by=12)[1:12]
+  
+ggplot(data=plotmeans, aes(x=month, y=EVI_count)) +
+  coord_polar(theta='x', start = 0, direction=1) +
+  geom_col(fill="light grey") +
+  theme_minimal() +
+  geom_text(aes(label = EVI_count), color="dark green") +
+  scale_y_continuous("Number of days/month EVI greater than 0.53") +
+  scale_x_continuous(limits = c(0,12), breaks=seq(0,12), labels=c(vec.labels,".")) +
+  theme(axis.text.y = element_blank(),
+         axis.ticks.y = element_blank() )
+
+ggsave("polar2.png", units="in", width=10, height=5, dpi=300, device = 'png')
+```
+
+```{r}
+#daily circular plot, using plot.circular
+
+#format days as integer day of year
+degree_days <- plotmeans$doy %>% format(format = "%j") %>% as.numeric()
+
+#convert day (degrees) to radians and threshold EVI values
+radian_days <- 2*pi*degree_days/365
+
+#circular plot
+
+#vec.breaks <- seq(from = pi/2, to = 2*pi, by = pi/2)
+#pi.halfs <- c(paste(expression(pi), "/2"),
+#  paste(seq(from = 3, to = 4, by = 2), "*" , expression(pi), "/2"))
+#pi.fulls <- c(paste(expression(pi)),
+#  paste(seq(from = 2, to = 2, by = 1), "*" , expression(pi)))
+#vec.expr <- parse(text = c(rbind(pi.halfs, pi.fulls)))[1:4]
+vec.expr <- c(0, pi/6, pi/3, pi/2, 2*pi/3, 5*pi/6, pi, 7*pi/6, 4*pi/3, 3*pi/2, 5*pi/3, 11*pi/6)
+
+#plot, but can't seem to place gridlines at above intervals.. 
+plot.circular(circular(plotmeans$radian_days, units="radians", template = NULL))
+```
+
+

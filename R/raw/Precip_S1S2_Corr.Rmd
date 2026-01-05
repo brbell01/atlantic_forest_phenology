@@ -1,0 +1,209 @@
+---
+title: "Precip_S1S2_Corr"
+author: "J. Bruce Bell"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+packages <- c("tidyr", "knitr", "lubridate", "scales", "ggthemes", "ggtext", "stringr", "dplyr", "ggplot2", "purrr", "data.table", "tibble", "scales", "grid", "clock", "zoo", "MTS", "lmtest", "data.table", "stringdist")
+
+installed_packages <- rownames(installed.packages())
+for (package in packages) {
+  if (!(package %in% installed_packages)) {
+    install.packages(package)
+  }
+  library(package, character.only = TRUE)
+}
+```
+
+```{r}
+setwd("/Users/brbell01/Google Drive/PHD/CUNY/Research/R/Phenology/raw/")
+wd <- getwd()
+
+#parameters
+foresttype <- "Seasonal Semi-deciduous Forest" # "Evergreen Broadleaf Forest"
+studyarea <- "PE Rio Doce, MG" # "REBIO Sooretama, ES" #"PNH Monte Pascoal, BA" #  "REBIO Mata Escura, MG" 
+studyarea_base <- "rio_doce" # "monte_pascoal" rio_doce ; monte_pascoal ; sooretama
+rainfall_name <- "IMERG"
+rainfall_filename <- "Rio_Doce_IMERG_2016-2022_7day_sum.csv"
+grace_name <- "GRACE"
+grace_filename <- "Rio_Doce_IMERG_2016-2022_7day_sum.csv"
+
+#Import max. hourly rate (reported daily) rainfall data ; rainfall is raw and filtered for values 
+raintable <- read.csv(paste0(wd, "/", rainfall_name,"/", rainfall_filename), header=T)
+raintable <- raintable %>% mutate(Date = date_parse(raintable$system.time_start, format = "%b %d, %Y")) %>%                          select(-system.time_start) %>% relocate(Date)
+
+# #Import grace water storage data 
+# gracetable <- read.csv(paste0(wd, "/", grace_name,"/", grace_filename), header=T)
+# gracetable <- gracetable %>% mutate(Date = date_parse(raintable$system.time_start, format = "%b %d, %Y")) %>%                          select(-system.time_start) %>% relocate(Date)
+
+#import s1 data
+s1band.list <- c("VH", "VV", "RVI")
+s1tables <- vector(mode = "list", length = 0)
+for (band in s1band.list) {
+  table <- read.csv(paste0(wd, "/s1/1ha/second_run/", studyarea_base, "_s1_1ha_", band, "_processed.csv"))
+  table <- table[,!names(table) %in% c("X")] %>% mutate(date = ymd(date))
+  s1tables[[band]] <- table
+}
+
+#import s2 data
+s2band.list <- c("EVI2", "EVI", "NDVI")
+s2tables <- vector(mode = "list", length = 0)
+for (band in s2band.list) {
+      table <- read.csv(paste0(wd, "/s2/1ha/second_run/", studyarea_base, "_s2_1ha_", band, "_processed.csv"))
+      table <- table[,!names(table) %in% c("X")] %>% mutate(date = ymd(date))
+      s2tables[[band]] <- table
+}
+```
+
+Function to make a dataframe from each of the data elements in the imported list
+```{r}
+make_index_df <- function(df) {
+df1 <- df %>% lapply("[[",1)
+mat <- gsub("^\\[|\\]$", "", df1[2])
+mat <- gsub("^\\[|\\]$", "", mat)
+mat <- strsplit(mat, "\\], \\[")[[1]]
+mat <- data.frame(date=sub(",.*$", "", mat), VH=sub("^.*, ", "", mat), stringsAsFactors=FALSE) 
+mat$date <- ymd(mat$date)
+}
+```
+
+Process summary S1 & S2 data for all plots
+```{r}
+#get s1 summary data for all plots
+s1tablemeans <- vector(mode = "list", length = 0)
+for (band in s1band.list) {
+  means <- s1tables[[band]] %>% gather("Hectare_ID", value, -date) %>% group_by(date) %>%     
+    filter(!grepl('sd', Hectare_ID)) %>%
+    dplyr::summarize(mean(value, na.rm=TRUE)) %>% mutate(date = ymd(date))
+  names(means) <- c("date", paste0(band,"_hectare_means"))
+  s1tablemeans[[band]] <- means
+}
+s1tablemeans <- reduce(s1tablemeans, full_join, by = "date")  %>% arrange(date)
+
+#get s2 summary data for all plots
+s2tablemeans <- vector(mode = "list", length = 0)
+for (band in s2band.list) {
+  means <- s2tables[[band]] %>% gather("Hectare_ID", value, -date) %>% group_by(date) %>%     
+    filter(!grepl('sd', Hectare_ID)) %>%
+    dplyr::summarize(mean(value, na.rm=TRUE)) %>% mutate(date = ymd(date))
+  names(means) <- c("date", paste0(band,"_hectare_means"))
+  s2tablemeans[[band]] <- means
+}
+s2tablemeans <- reduce(s2tablemeans, full_join, by = "date")  %>% arrange(date)
+```
+
+Remove outliers
+```{r}
+#define outlier function
+remove_outliers <- function(x, na.rm = TRUE, ...) {
+  qnt <- quantile(x, probs=c(.1, .9), na.rm = na.rm, ...)
+  H <- 1.5 * IQR(x, na.rm = na.rm)
+  y <- x
+  y[x < (qnt[1] - H)] <- NA
+  y[x > (qnt[2] + H)] <- NA
+  y
+}
+
+s2tablemeans$EVI2_hectare_means <- s2tablemeans$EVI2_hectare_means %>% remove_outliers()
+```
+
+Plot time series before Granger Test
+```{r}
+s1bandname <- "RVI" #  "VV"  ; "VH"
+s2bandname <- "EVI2" # "NDVI" ; "EVI"
+
+names <- c("date", "VH_hectare_means", "VV_hectare_means", "RVI_hectare_means")
+
+s1index <- agrep(s1bandname, names(s1tablemeans), ignore.case = TRUE, max.distance = 0.1, value = F)
+s1data <- s1tablemeans[,c(1,s1index[[1]])] # change to select correct bandname. for some reason this agrep doesn't work
+s2index <- agrep(s2bandname, names(s2tablemeans), ignore.case = TRUE, max.distance = 0.1, value = F)
+s2data <- s2tablemeans[,c(1,s2index[[1]])] # change to select correct bandname. for some reason this agrep doesn't work
+
+s1s2data <- full_join(s1data, s2data, by="date", keep = F) %>% arrange(date) 
+
+raintable$Date <- as.Date(raintable$Date)
+rainfall_S1S2 <- merge.zoo(read.zoo(raintable), read.zoo(s1s2data), all=T)
+
+rainfall_S1S2 <- rainfall_S1S2 %>% na.approx(na.rm=F)
+
+names(rainfall_S1S2)[1] <- names(raintable)[-1]
+
+#define a function which plots vertical lines for the year
+vline_year <- function() {
+  v <- as.POSIXlt(unique(format(index(rainfall_S1S2), "%Y-01-01")))
+  abline(v = v, col = "lightgrey", lty = "solid")
+}
+
+#plot raw time series
+par(mar = rep(2.9,4), plt=c(0.1, 0.9, 0.1, 0.9))
+plot(rainfall_S1S2, type = "o", pch = 20, col = c("darkgrey", "blue", "darkgreen"), ylab="", xlab="", cex.axis = 2, main = "")
+mtext(expression(bold("Precip. (mm/Hr)")), side = 2, line = 2, col = "darkgrey", adj=1, cex = 1.3)
+#mtext(bquote(bold(.(s1bandname) * " (" * sigma * "°" * ")")), side = 2, line = 2, col = "blue" , adj=0.5, cex = 1.3)
+mtext(bquote(bold(.(s1bandname))), side = 2, line = 2, col = "blue" , adj=0.5, cex = 1.3)
+mtext(bquote(bold(.(s2bandname))), side = 2, line = 2, col = "darkgreen", adj=0.1, cex = 1.3)
+mtext("Date", side = 1, line = 2, cex = 1.8)
+#axis(1, at = time(rainfall_S1S2), labels=format(time(rainfall_S1S2), "%b")  %>% substr(.,1,1))
+#vline_year()
+```
+
+Test correlation between the rainfall, backscatter, and reflectance (Granger causality)
+```{r}
+#Granger Test S1
+grangertest(precipitationCal ~ RVI_hectare_means, order = 3, data = rainfall_S1S2, na.action = na.omit) %>% kable(digits = 5)
+#test the reverse
+grangertest(RVI_hectare_means ~ precipitationCal, order = 3, data = rainfall_S1S2, na.action = na.omit) %>% kable(digits = 5)
+
+#Granger Test S2
+grangertest(precipitationCal ~ EVI2_hectare_means, order = 3, data = rainfall_S1S2, na.action = na.omit) %>% kable(digits = 5)
+#test the reverse
+grangertest(EVI2_hectare_means ~ precipitationCal, order = 3, data = rainfall_S1S2, na.action = na.omit) %>% kable(digits = 5)
+
+```
+
+Cross-correlation
+```{r}
+library(forecast)
+# overview plot
+ggAcf(rainfall_S1S2, lag.max = 185, type = "correlation", na.action=na.pass, plot=T)  
+#ggCcf(rainfall_S1S2, lag.max = 185, type = "correlation", na.action=na.pass, plot=T)  
+
+# get values of interest
+acf <- acf(rainfall_S1S2, lag.max=185, type="correlation", na.action=na.pass, plot=F)
+#ccf <- ccf(rainfall_S1S2, lag.max=185, type="correlation", na.action=na.pass, plot=F)
+
+# find lag for highest correlation
+# only rainfall~S1index and rainfall~S2index (first two off-diagonal plots) interest us.
+maxS1corr <- acf$acf[,,2][,1] %>% max ; maxS2corr <- acf$acf[,,3][,1] %>% max
+S1acf <- acf$acf[,,2][,1] %>% data.frame ; S1acf$lag <- S1acf %>% rownames()
+S2acf <- acf$acf[,,3][,1] %>% data.frame ; S2acf$lag <- S2acf %>% rownames()
+S1maxlag <- S1acf %>% filter(. == maxS1corr) ; S1maxlag <- S1maxlag$lag %>% as.numeric()
+S2maxlag <- S2acf %>% filter(. == maxS2corr) ; S2maxlag <- S2maxlag$lag %>% as.numeric()
+```
+
+Plot Lags
+```{r}
+#par(mfrow=c(2,1), mar=c(1,1,1,1))  # set up 2 rows and 1 column of plots
+acf$acf[,,2][,1] %>% plot(type='h', ylab="Correlation Precip vs. VV", xlab="Lags (days)", ylim=c(-0.5,0.5)) # precip vs. VV
+axis(side=1, at=seq(0, 200, by=25))
+abline(v=S1maxlag, col = "red", lwd=2)
+text(x=S1maxlag+0.3, y=par("usr")[4]*-0.2, labels=paste0(S1maxlag, " days"), col="red", cex=1.1, pos=4)
+
+acf$acf[,,3][,1] %>% plot(type='h', ylab="Correlation Precip vs. EVI2", xlab="Lags (days)", ylim=c(-0.5,0.5)) # precip vs. EVI2
+axis(side=1, at=seq(0, 200, by=25))
+axis(side=1, at=seq(0, 200, by=25))
+abline(v=S2maxlag, col = "red", lwd=2)
+text(x=S2maxlag+0.3, y=par("usr")[4]*-0.2, labels=paste0(S2maxlag, " days"), col="red", cex=1.1, pos=4)
+
+#png(file=paste0(wd, "/Rainfall_S1S2_corr_lag_plots.png"), width=800, height=1000, units="px", pointsize=12, res=100)
+#dev.off()
+```
+
+```{r}
+#get correlation matrices for all lags
+ccm(rainfall_S1S2, lags = 100, level = T, output = T)
+#ccm(rainfall_S2, lags = 100, level = T, output = T)
+```
